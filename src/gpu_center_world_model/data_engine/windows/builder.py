@@ -8,7 +8,8 @@
 """Decision-window builder (design docs D, I, R).
 
 The training/evaluation unit is the **decision window** anchored by a *pre-action
-state hash* (doc D Gold layer; contract :class:`...data_engine.contracts.DecisionWindow`).
+state hash* (doc D Gold layer; see
+``...data_engine.contracts.DecisionWindow``).
 Every window pairs:
 
 * the exact pre-action symbolic state ``X_τ`` (hashed via :func:`schema.state_hash`),
@@ -27,6 +28,7 @@ counterfactual evaluation contaminates action effects with future information.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ...schema.kpis import HORIZONS_S, QUANTILES
@@ -184,17 +186,198 @@ def temporal_split(t0_ns: int, train_end_ns: int, val_end_ns: int) -> Split:
     return Split.TEST_TEMPORAL
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Holdout splitters (doc D: four disjoint test suites)
+# ──────────────────────────────────────────────────────────────────────────────
+#: Severity bands used by the intervention / rare-event holdouts. A continuous
+#: severity in [0, 1] is bucketed into one of these labels so "unseen severity
+#: combinations" (doc D test_intervention / test_rare_events) are well-defined.
+SEVERITY_BANDS: tuple[str, ...] = ("low", "medium", "high")
+
+
+def severity_band(severity: float) -> str:
+    """Bucket a continuous severity ``∈ [0, 1]`` into a discrete band (doc D)."""
+    s = float(severity)
+    if s < 1.0 / 3.0:
+        return "low"
+    if s < 2.0 / 3.0:
+        return "medium"
+    return "high"
+
+
+@dataclass(slots=True)
+class WindowDescriptor:
+    """The family coordinates a window is classified by for holdout splitting.
+
+    Each coordinate names the *family* the held-out test suites partition on
+    (doc D splits). The decision hash is carried so the disjointness guarantee can
+    be asserted per-hash: a hash assigned to a holdout family must never also
+    appear in train.
+    """
+
+    decision_id: str
+    #: topology / flavor family (e.g. a rack family, topology domain, or flavor).
+    topology_family: str = ""
+    #: intervention family: the (action-type, severity-band) combination(s) the
+    #: window exercises (doc D: unseen action/severity combinations).
+    intervention_families: tuple[str, ...] = ()
+    #: rare-event family + severity band (doc D: withheld fault families/bands).
+    rare_event_family: str = ""
+    #: True iff the window is a "severe shift" (out-of-distribution stress) window.
+    severe_shift: bool = False
+
+
+@dataclass(slots=True)
+class HoldoutPolicy:
+    """Declarative holdout policy → one of the four disjoint test suites (doc D).
+
+    A window is routed to a TEST split iff *any* of its family coordinates is in
+    the held-out set for that suite; otherwise it is eligible for train/val. The
+    routing is a **pure function of the window's families**, so:
+
+    * the held-out family never crosses into train (a window touching a held-out
+      family is always diverted to its TEST suite — :meth:`route` checks holdouts
+      before returning train), and
+    * the four test suites are **disjoint by construction** because :meth:`route`
+      returns the *first* matching suite in a fixed priority order, and we verify
+      no decision hash lands in two suites via :func:`assert_disjoint_splits`.
+
+    Priority order (most-specific shift first): severe-shift → rare-event →
+    intervention → topology. Temporal train/val are handled separately by
+    :func:`temporal_split`; this policy only diverts the held-out families out of
+    the seen pool.
+    """
+
+    held_out_topologies: frozenset[str] = frozenset()
+    held_out_interventions: frozenset[str] = frozenset()
+    held_out_rare_events: frozenset[str] = frozenset()
+    hold_out_severe_shift: bool = False
+
+    def is_held_out(self, desc: WindowDescriptor) -> bool:
+        """True iff the window touches *any* held-out family (diverted from train)."""
+        return self.route(desc) is not None
+
+    def route(self, desc: WindowDescriptor) -> Split | None:
+        """Return the TEST suite for a held-out window, else ``None`` (seen pool).
+
+        Fixed priority order guarantees a window maps to exactly one suite, so the
+        suites are mutually disjoint.
+        """
+        if self.hold_out_severe_shift and desc.severe_shift:
+            return Split.TEST_SEVERE_SHIFT
+        rare = desc.rare_event_family
+        if rare and rare in self.held_out_rare_events:
+            return Split.TEST_RARE_EVENT
+        if any(f in self.held_out_interventions for f in desc.intervention_families):
+            return Split.TEST_INTERVENTION
+        if desc.topology_family and desc.topology_family in self.held_out_topologies:
+            return Split.TEST_TOPOLOGY
+        return None
+
+
+def descriptor_from_window(
+    window: DecisionWindow,
+    *,
+    topology_family: str = "",
+    rare_event_family: str = "",
+    severities: dict[str, float] | None = None,
+    severe_shift: bool = False,
+) -> WindowDescriptor:
+    """Build a :class:`WindowDescriptor` from a window + scenario metadata.
+
+    Intervention families are derived from the window's candidate action ids
+    (their action-type prefix) crossed with the per-action severity band; this is
+    exactly the doc-D "unseen combinations of hold/admit/place/mask-domain and
+    severity" coordinate. ``topology_family`` / ``rare_event_family`` come from the
+    scenario (rack/flavor family and fault family); ``severities`` maps an action
+    id to its severity (defaults to 0 → ``low``).
+    """
+    severities = severities or {}
+    fams: list[str] = []
+    for aid in window.candidate_action_ids:
+        atype = _action_type_of(aid)
+        band = severity_band(severities.get(aid, 0.0))
+        fams.append(f"{atype}:{band}")
+    return WindowDescriptor(
+        decision_id=window.decision_id,
+        topology_family=topology_family or window.scenario_family,
+        intervention_families=tuple(dict.fromkeys(fams)),  # dedup, keep order
+        rare_event_family=rare_event_family,
+        severe_shift=severe_shift,
+    )
+
+
+def _action_type_of(action_id: str) -> str:
+    """Extract the action-type token from a generator action id ``idx:type:...``."""
+    parts = action_id.split(":")
+    return parts[1] if len(parts) > 1 else action_id
+
+
+def assign_split(
+    desc: WindowDescriptor,
+    policy: HoldoutPolicy,
+    *,
+    t0_ns: int | None = None,
+    train_end_ns: int | None = None,
+    val_end_ns: int | None = None,
+    seen_default: Split = Split.TRAIN,
+) -> Split:
+    """Assign a window's split: holdout suites first, then temporal/seen default.
+
+    1. If the window touches a held-out family, return its TEST suite (the held-out
+       family is thereby **guaranteed never to enter train**).
+    2. Otherwise, if a temporal split window is provided, apply
+       :func:`temporal_split` over the seen pool (train/val/test_temporal).
+    3. Otherwise return ``seen_default`` (train).
+    """
+    routed = policy.route(desc)
+    if routed is not None:
+        return routed
+    if t0_ns is not None and train_end_ns is not None and val_end_ns is not None:
+        return temporal_split(t0_ns, train_end_ns, val_end_ns)
+    return seen_default
+
+
+def assert_disjoint_splits(
+    assignments: Iterable[tuple[str, Split]],
+) -> None:
+    """Assert no decision hash crosses splits (doc D disjointness invariant).
+
+    Raises ``ValueError`` if any decision id is mapped to two different splits —
+    in particular if a held-out family hash also appears in train. This is the
+    machine-checkable form of doc D's "the same decision hash never crosses
+    splits" / "held-out family never crosses into train".
+    """
+    seen: dict[str, Split] = {}
+    for decision_id, split in assignments:
+        prev = seen.get(decision_id)
+        if prev is not None and prev != split:
+            raise ValueError(
+                f"split leakage: decision '{decision_id}' assigned to both "
+                f"{prev.value} and {split.value} (a decision hash must not cross "
+                f"splits; doc D disjointness invariant)"
+            )
+        seen[decision_id] = split
+
+
 def derive_seed_bundle(master: int) -> SeedBundle:
     """Convenience: the shared exogenous seed bundle for a window's branches."""
     return SeedBundle(master=master)
 
 
 __all__ = [
+    "SEVERITY_BANDS",
+    "HoldoutPolicy",
+    "WindowDescriptor",
     "WindowFeatures",
     "assemble_features",
+    "assert_disjoint_splits",
     "assert_no_leakage",
+    "assign_split",
     "build_window",
     "derive_seed_bundle",
+    "descriptor_from_window",
     "labels_from_pack",
+    "severity_band",
     "temporal_split",
 ]

@@ -1,0 +1,10 @@
+{
+  "$id": "https://github.com/yashsharmaa/gpu-center-world-model/schema/json_schema/seed_registry.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": {
+    "type": "integer"
+  },
+  "description": "Frozen RNG seed registry: scenario_id -> integer seed bundle. Every released benchmark pack pins fixed seeds so branches are replayable (doc H Reproducibility gates; doc D seed_registry.json).",
+  "title": "seed_registry",
+  "type": "object"
+}

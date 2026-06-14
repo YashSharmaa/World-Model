@@ -57,6 +57,11 @@ class FeasibilityResult:
     feasible_domains: list[str] = field(default_factory=list)
     # the concrete integer assignment (podset -> {node: replicas}) if feasible
     assignment: dict[str, dict[str, int]] = field(default_factory=dict)
+    # True iff the bounded placement search hit its per-action time/expansion
+    # budget before a definitive answer (doc S latency_budget.live_demo_rule). On
+    # exhaustion ``feasible`` is conservatively ``False`` (abstain), never an
+    # optimistic guess — a timeout must not enlarge the safe set.
+    budget_exhausted: bool = False
 
 
 @dataclass(slots=True)

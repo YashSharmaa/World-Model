@@ -274,8 +274,10 @@ class KueueAdapter(BaseAdapter):
             pending_gpu=opt_float(cq, "pending_gpu") or 0.0,
             weighted_share=opt_float(cq, "weighted_share", "weightedShare") or 0.0,
             active_workloads=opt_int(cq, "active_workloads", "admittedWorkloads") or 0,
+            admission_check_state=self._admission_check_state(cq),
         )
         payload.symbolic.cluster_queues[name] = q
+        self._emit_admission_check_obs(name, q, payload)
 
     @staticmethod
     def _nested_quota(raw: Any) -> dict[str, dict[str, float]]:
@@ -293,6 +295,90 @@ class KueueAdapter(BaseAdapter):
                         continue
                 out[str(flavor)] = inner
         return out
+
+    def _admission_check_state(self, cq: dict[str, Any]) -> dict[str, bool]:
+        """Compile the per-flavor AdmissionCheck conjunction ``chi_qf(s)``.
+
+        Kueue admits a Workload only once *every* referenced AdmissionCheck is
+        ``READY`` (doc S, Eq. E5; doc C scheduler_state ``admission_check_state``).
+        We accept several snapshot shapes and fold them into a
+        ``{flavor_or_"*": all_required_checks_ready}`` map consumed by the exact
+        kernel's E5 screen:
+
+        * ``admission_check_state`` / ``admissionCheckState`` — an explicit
+          ``{flavor: bool}`` (or ``{flavor: "ready"|"pending"|...}``) map. The
+          synthetic key ``"*"`` is the queue-wide default.
+        * ``admission_checks`` / ``admissionChecks`` — a list of check rows, each
+          with a ``state``/``status`` and optional ``target_flavors``. A check
+          with no target applies to every flavor (the ``"*"`` default). A flavor
+          is positive iff *all* its required checks are ``READY``.
+
+        An absent/empty result means "no checks required" — the gate is vacuous
+        (``chi_qf = 1``) and admission is not held here. Mirrors a ClusterQueue
+        with no ``admissionChecks``: it admits on quota alone.
+        """
+        # Shape 1: an explicit per-flavor boolean/state map.
+        explicit = cq.get("admission_check_state", cq.get("admissionCheckState"))
+        if isinstance(explicit, dict):
+            out: dict[str, bool] = {}
+            for flavor, val in explicit.items():
+                out[str(flavor)] = self._check_value_positive(val)
+            return out
+
+        # Shape 2: a list of AdmissionCheck rows -> fold into a per-flavor AND.
+        rows = cq.get("admission_checks", cq.get("admissionChecks"))
+        if not isinstance(rows, list) or not rows:
+            return {}
+        # Accumulate, per flavor key, the AND of all required checks' readiness.
+        acc: dict[str, bool] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            required = row.get("required", row.get("isRequired", True))
+            if required is False:
+                continue
+            ready = self._check_value_positive(
+                row.get("state", row.get("status"))
+            )
+            targets = row.get("target_flavors", row.get("targetFlavors")) or []
+            keys = (
+                [str(t) for t in targets]
+                if isinstance(targets, list) and targets
+                else ["*"]
+            )
+            for k in keys:
+                acc[k] = acc.get(k, True) and ready
+        return acc
+
+    @staticmethod
+    def _check_value_positive(val: Any) -> bool:
+        """True iff a snapshot admission-check value denotes a positive (READY) gate."""
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return True  # absent disposition is treated as non-blocking
+        return str(val).strip().lower() in ("ready", "true", "positive", "passed", "1")
+
+    def _emit_admission_check_obs(
+        self, name: str, q: ClusterQueue, payload: IngestPayload
+    ) -> None:
+        """Surface ``admission_check_state`` as a scheduler observable (doc C)."""
+        if not q.admission_check_state:
+            return
+        ch: dict[str, Any] = {}
+        for flavor, positive in q.admission_check_state.items():
+            ch[f"admission_check_{flavor}"] = make_channel(
+                f"admission_check_{flavor}", 1.0 if positive else 0.0
+            )
+        payload.add_observation(
+            Observation(
+                entity_kind="cluster_queue",
+                entity_id=name,
+                family=ObservationFamily.SCHEDULER_STATE,
+                ts_event_ns=0,
+                channels=ch,
+            )
+        )
 
     # ── ResourceFlavor ────────────────────────────────────────────────────────
     def _parse_flavor(self, rf: dict[str, Any], payload: IngestPayload) -> None:

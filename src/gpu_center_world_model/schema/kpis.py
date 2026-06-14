@@ -28,7 +28,24 @@ QUANTILES: tuple[float, ...] = (0.05, 0.10, 0.50, 0.90, 0.95)
 
 
 class KPIChannel(str, Enum):
-    """Continuous KPI-delta channels (quantile heads)."""
+    """Continuous KPI-delta channels (quantile heads).
+
+    These reconcile one-to-one with the doc I generative-model ``kpi_map``
+    (``KPI_t = g_K(X_t, Z_t)``): queue-wait delta, admitted GPU-hours delta,
+    topology-fragmentation delta, rack power & thermal headroom quantiles, and
+    completion-time/slowdown quantiles. Two channels are read-model refinements
+    of that map rather than new physics:
+
+    * :attr:`CROSS_RACK_RATE` is the **fragmentation proxy** — the fraction of a
+      gang's replicas that land off its primary rack. It is the observable that
+      *drives* :attr:`TOPOLOGY_FRAGMENTATION_DELTA` (a spread gang fragments the
+      pod), so the two are folded together: ``cross_rack_rate`` is the raw rate
+      and ``topology_fragmentation_delta`` its baseline-relative KPI delta.
+    * :attr:`FAIRNESS_SHARE_DEBT_DELTA` surfaces the planner-utility fairness term
+      ``lambda_unfair * share_debt`` (doc C planner utility, step 4) as its own
+      KPI-delta channel, where ``share_debt`` is a ClusterQueue's
+      Admission-Fair-Sharing ``weightedShare`` above its entitlement.
+    """
 
     QUEUE_WAIT_DELTA_S = "queue_wait_delta_s"
     ADMITTED_GPU_HOURS_DELTA = "admitted_gpu_hours_delta"
@@ -38,6 +55,31 @@ class KPIChannel(str, Enum):
     COMPLETION_TIME_DELTA_S = "completion_time_delta_s"
     SLOWDOWN = "slowdown"
     CROSS_RACK_RATE = "cross_rack_rate"
+    # Fairness KPI delta surfacing the planner-utility term lambda_unfair*share_debt
+    # (doc C planner utility; doc V Admission Fair Sharing weightedShare).
+    FAIRNESS_SHARE_DEBT_DELTA = "fairness_share_debt_delta"
+
+
+#: Reconciliation of the doc I ``kpi_map`` contents to concrete KPI channels.
+#: Each doc-I KPI line maps to the channel(s) that realise it, so the generative
+#: model's ``KPI_t = g_K(X_t, Z_t)`` is auditable against this enum.
+KPI_MAP: dict[str, tuple[KPIChannel, ...]] = {
+    "queue_wait_delta": (KPIChannel.QUEUE_WAIT_DELTA_S,),
+    "admitted_gpu_hours_delta": (KPIChannel.ADMITTED_GPU_HOURS_DELTA,),
+    "topology_fragmentation_delta": (
+        KPIChannel.TOPOLOGY_FRAGMENTATION_DELTA,
+        KPIChannel.CROSS_RACK_RATE,  # fragmentation proxy feeding the delta
+    ),
+    "rack_power_thermal_quantiles": (
+        KPIChannel.RACK_POWER_KW,
+        KPIChannel.RACK_THERMAL_HEADROOM_C,
+    ),
+    "completion_time_slowdown": (
+        KPIChannel.COMPLETION_TIME_DELTA_S,
+        KPIChannel.SLOWDOWN,
+    ),
+    "fairness_share_debt": (KPIChannel.FAIRNESS_SHARE_DEBT_DELTA,),
+}
 
 
 class HazardChannel(str, Enum):
@@ -97,6 +139,7 @@ class KPIForecastBundle:
 
 __all__ = [
     "HORIZONS_S",
+    "KPI_MAP",
     "QUANTILES",
     "HazardChannel",
     "HazardForecast",

@@ -155,6 +155,7 @@ const CSS = `
 }
 .rec-row.blocked { border-color: var(--blocked); }
 .rec-row.recommended { border-color: var(--safe); }
+.rec-row.abstain { border-color: var(--lowconf); border-style: dashed; }
 .rec-rank { font-weight:700; width: 22px; }
 .rec-actions { display:flex; gap:6px; }
 .rec-kpis { display:grid; grid-template-columns: 1fr 1fr; gap:4px 10px; margin-top:6px; font-size:11px; color:var(--muted); }
@@ -227,6 +228,17 @@ const CSS = `
 .chip:hover { border-color: var(--accent); }
 .chip.active { background: var(--accent-soft); border-color: var(--accent); }
 .chip.danger { color: var(--blocked); border-color: rgba(255,107,122,0.4); }
+
+/* play-demo control — runs the 8-beat golden-path storyboard on demand.
+   Sits top-center under the mode tabs so it never collides with the side panels. */
+.play-demo {
+  position: absolute;
+  top: 58px; left: 50%; transform: translateX(-50%);
+  z-index: 5;
+  background: var(--accent-soft); border-color: var(--accent);
+  font-weight: 600; padding: 5px 14px;
+}
+.play-demo:hover { border-color: var(--accent); filter: brightness(1.08); }
 
 /* caption (self-captioning beat text, bottom-center top of timeline area) */
 .beat-caption {

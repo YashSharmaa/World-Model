@@ -21,15 +21,25 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .runner import TRACKS, TrackInputs, run_benchmark
+from .runner import TRACKS, TrackInputs, run_benchmark, track_inputs_from_records
 
 
 def _load_inputs(data: str | None) -> tuple[TrackInputs, str]:
-    """Best-effort load of collected per-window records from a pack directory.
+    """Load collected per-window records from a saved pack directory or JSON file.
 
     Returns ``(inputs, note)``. If ``data`` is missing or holds no evaluation
     records, returns empty ``TrackInputs`` (still a valid partial run) plus a
-    note explaining what is needed for the full data-dependent tracks.
+    note explaining what is needed for the full data-dependent tracks. When the
+    pack carries records, ``track_inputs_from_records`` deserializes every typed
+    section (safety_judgements / branch_windows / planning_windows /
+    red_team_cases / predictive / calibration / coverage / operator_cases) so the
+    full three-track scoring plus diagnostics run from the saved pack.
+
+    The pack location is resolved flexibly: ``--data`` may point at a directory
+    containing ``eval_inputs.json`` (the canonical pack file), or directly at a
+    JSON file. The JSON may be either the named-section payload mapping or a flat
+    list of ``{"kind": ...}`` records — both shapes ``track_inputs_from_records``
+    accepts.
     """
     if not data:
         return TrackInputs(), (
@@ -40,21 +50,30 @@ def _load_inputs(data: str | None) -> tuple[TrackInputs, str]:
             "counterfactual and planning tracks."
         )
     p = Path(data)
-    records = p / "eval_inputs.json"
+    records = p / "eval_inputs.json" if p.is_dir() else p
     if not records.exists():
         return TrackInputs(), (
             f"--data '{data}' has no eval_inputs.json with collected records; "
             "running the structural + certification report only."
         )
-    payload: dict[str, Any] = json.loads(records.read_text(encoding="utf-8"))
-    inputs = TrackInputs(
-        n_branches=int(payload.get("n_branches", 4)),
-        rho_pair=float(payload.get("rho_pair", 0.4)),
-        tau_mix=float(payload.get("tau_mix", 2.0)),
-        is_shift_pack=bool(payload.get("is_shift_pack", False)),
-        n_severe_shift_zero_events=int(payload.get("n_severe_shift_zero_events", 0)),
+    payload: dict[str, Any] | list[dict[str, Any]] = json.loads(
+        records.read_text(encoding="utf-8")
     )
-    return inputs, f"loaded sample-complexity inputs from {records}"
+    try:
+        inputs = track_inputs_from_records(payload)
+    except (ValueError, KeyError, TypeError) as exc:
+        return TrackInputs(), (
+            f"--data '{records}' could not be deserialized into TrackInputs "
+            f"({exc}); running the structural + certification report only."
+        )
+    counts = (
+        f"safety={len(inputs.safety_judgements)}, "
+        f"branch_windows={len(inputs.branch_windows)}, "
+        f"planning_windows={len(inputs.planning_windows)}, "
+        f"red_team={sum(len(v) for v in inputs.red_team_cases.values())}, "
+        f"operator_cases={len(inputs.operator_cases)}"
+    )
+    return inputs, f"loaded full benchmark pack from {records} ({counts})"
 
 
 def run_suite(

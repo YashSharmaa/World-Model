@@ -48,19 +48,6 @@
       "type": "admit_and_place"
     },
     {
-      "action_id": "admit_and_place:8707bf11cc3d",
-      "lex_key": [
-        0.0,
-        0.0,
-        98.4,
-        -2.0,
-        0.0,
-        0.0
-      ],
-      "rank": 3,
-      "type": "admit_and_place"
-    },
-    {
       "action_id": "hold:c0ad90776936",
       "lex_key": [
         0.0,
@@ -70,7 +57,7 @@
         0.0,
         0.0
       ],
-      "rank": 4,
+      "rank": 3,
       "type": "hold"
     }
   ],
@@ -83,5 +70,5 @@
     "nodes_per_rack": 2,
     "seed": 7
   },
-  "state_hash": "8094553c11537d42d7895e5facefa6132c445fbc766a384b3568b50214a266c1"
+  "state_hash": "fc22e3b78d5db1158e51ca212bfcde9f1542961873debd8924c3ab8add55863e"
 }

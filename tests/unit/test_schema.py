@@ -214,3 +214,98 @@ def test_hash_is_hex_sha256_length():
 def test_demo_pod_hash_is_deterministic(demo_state):
     # The real generated demo pod must also hash reproducibly.
     assert world_state_hash(demo_state) == world_state_hash(copy.deepcopy(demo_state))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BLOCKED_BY typed edge (SCHEMA-EDGE-KPI-RECONCILE, doc C typed edge set)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_blocked_by_relation_is_in_the_typed_edge_set():
+    from gpu_center_world_model.schema.topology import (
+        RELATION_ENDPOINTS,
+        RelationType,
+    )
+
+    assert RelationType.BLOCKED_BY.value == "BLOCKED_BY"
+    assert RELATION_ENDPOINTS[RelationType.BLOCKED_BY] == (
+        "candidate_action",
+        "constraint",
+    )
+
+
+def test_build_blocked_by_carries_reason_codes():
+    from gpu_center_world_model.schema.topology import RelationType, build_blocked_by
+
+    rel = build_blocked_by([(0, 2, 5.0), (0, 3, 9.0)])
+    assert rel.type is RelationType.BLOCKED_BY
+    assert len(rel) == 2
+    assert rel.src == [0, 0]
+    assert rel.dst == [2, 3]
+    assert rel.edge_feat == [[5.0], [9.0]]
+
+
+def test_build_blocked_by_empty_is_valid():
+    from gpu_center_world_model.schema.topology import build_blocked_by
+
+    rel = build_blocked_by()
+    assert len(rel) == 0
+    assert rel.src_kind == "candidate_action"
+    assert rel.dst_kind == "constraint"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KPI channel reconcile (SCHEMA-EDGE-KPI-RECONCILE, doc I kpi_map)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_kpi_channels_include_fairness_and_fragmentation_proxy():
+    from gpu_center_world_model.schema.kpis import KPIChannel
+
+    values = {c.value for c in KPIChannel}
+    assert "fairness_share_debt_delta" in values  # share_debt term surfaced
+    assert "cross_rack_rate" in values  # fragmentation proxy retained
+
+
+def test_kpi_map_folds_cross_rack_into_fragmentation():
+    from gpu_center_world_model.schema.kpis import KPI_MAP, KPIChannel
+
+    frag = KPI_MAP["topology_fragmentation_delta"]
+    assert KPIChannel.TOPOLOGY_FRAGMENTATION_DELTA in frag
+    assert KPIChannel.CROSS_RACK_RATE in frag  # proxy feeds the fragmentation delta
+    assert KPI_MAP["fairness_share_debt"] == (KPIChannel.FAIRNESS_SHARE_DEBT_DELTA,)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AdmissionCheck entity + ClusterQueue per-resource counters
+# ──────────────────────────────────────────────────────────────────────────────
+def test_admission_check_entity_and_chi_helper():
+    from gpu_center_world_model.schema.entities import (
+        AdmissionCheckState,
+        ClusterQueue,
+        admission_checks_positive,
+    )
+
+    cq = ClusterQueue(name="cq")
+    # No checks -> vacuously positive (chi_qf = 1).
+    assert admission_checks_positive(cq, "f1")
+    # A failing default gate -> chi_qf = 0.
+    cq.admission_check_state = {"*": False}
+    assert not admission_checks_positive(cq, "f1")
+    # A per-flavor positive entry overrides the default.
+    cq.admission_check_state = {"*": False, "f1": True}
+    assert admission_checks_positive(cq, "f1")
+    assert not admission_checks_positive(cq, "f2")
+    assert AdmissionCheckState.READY.is_positive
+    assert not AdmissionCheckState.PENDING.is_positive
+
+
+def test_cluster_queue_per_resource_counters_participate_in_hash():
+    s1 = _toy_state()
+    s2 = copy.deepcopy(s1)
+    # Mutating the per-(flavor, resource) reservation ledger changes the digest.
+    cq = s2.symbolic.cluster_queues.setdefault(
+        "cq",
+        __import__(
+            "gpu_center_world_model.schema.entities", fromlist=["ClusterQueue"]
+        ).ClusterQueue(name="cq"),
+    )
+    base = world_state_hash(s2)
+    cq.reserved_by_resource = {"f": {"cpu": 8.0}}
+    assert world_state_hash(s2) != base

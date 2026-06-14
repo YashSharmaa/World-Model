@@ -125,6 +125,41 @@ class LoadedScenario:
     def n_gpus(self) -> int:
         return len(self.state.symbolic.gpus)
 
+    def rollout_rare_event(self) -> dict[str, Any] | None:
+        """Translate the loader's rare-event meta into a rollout-onset spec.
+
+        Reconciles the two rare-event surfaces (doc D/R, single injection path):
+        the loader stamps the *pre-state* (initial conditions at ``t0``), while the
+        synthetic rollout schedules the *same* named event as an **onset** applied
+        through the simulator state-mutating library. This method maps the stored
+        ``{kind, severity, onset_s, params}`` into ``{name, onset_s, kwargs}`` —
+        the exact shape :func:`...synthetic.rare_event_spec_for` consumes — so a
+        scenario's t0 perturbation and its mid-rollout onset describe one
+        causally-consistent event with one severity and one onset time.
+
+        Returns ``None`` when the scenario declares no rare event.
+        """
+        if not self.rare_event:
+            return None
+        kind = str(self.rare_event.get("kind"))
+        severity = float(self.rare_event.get("severity", 0.5))
+        onset_s = float(self.rare_event.get("onset_s", 0.0))
+        params = dict(self.rare_event.get("params", {}) or {})
+        # Map the canonical severity onto each event's library kwarg (doc D
+        # rare_event_library mechanism), letting explicit params override.
+        sev_kwarg: dict[str, dict[str, Any]] = {
+            "gpu_fault_burst": {"intensity": max(0.02, 0.2 * severity)},
+            "pods_ready_timeout": {"fraction": severity},
+            "cooling_derate": {"derate_frac": severity},
+            "power_derate": {"derate_frac": severity},
+            "queue_burst": {"burst_factor": 1.0 + 2.0 * severity},
+            "maintenance_mask": {"fraction": severity},
+            "telemetry_degradation": {"fraction": severity},
+        }
+        kwargs = dict(sev_kwarg.get(kind, {}))
+        kwargs.update({k: v for k, v in params.items() if k != "targets"})
+        return {"name": kind, "onset_s": onset_s, "kwargs": kwargs}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Small typed-coercion helpers (YAML is permissive; the schema is not)

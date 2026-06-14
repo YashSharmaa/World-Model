@@ -202,7 +202,7 @@ class TabularLearnerBaseline:
 def _sorted_quantiles(qd: dict[float, float]) -> dict[float, float]:
     taus = sorted(qd)
     vals = np.maximum.accumulate([qd[t] for t in taus])
-    return {t: float(v) for t, v in zip(taus, vals)}
+    return {t: float(v) for t, v in zip(taus, vals, strict=False)}
 
 
 __all__ = ["HAS_LGB", "HAS_SKLEARN", "TabularLearnerBaseline"]

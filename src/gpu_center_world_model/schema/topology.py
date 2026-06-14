@@ -35,6 +35,12 @@ class RelationType(str, Enum):
     COOLED_BY = "COOLED_BY"  # rack -> cooling_zone
     RUNS_ON = "RUNS_ON"  # workload/podset -> node/gpu
     PARENT_OF = "PARENT_OF"  # topology_domain -> topology_domain
+    # Why-not read-model edge: a rejected candidate action is BLOCKED_BY a
+    # semantic constraint (doc C typed edge set; doc S why-not certificate). The
+    # edge feature carries the reason code (the BlockerGroup) and any deficit, so
+    # the graph read-model can render the exact blocking constraints as edges
+    # rather than only as a side-channel WhyNot ledger.
+    BLOCKED_BY = "BLOCKED_BY"  # candidate_action -> constraint
 
 
 @dataclass(slots=True)
@@ -71,6 +77,7 @@ RELATION_ENDPOINTS: dict[RelationType, tuple[str, str]] = {
     RelationType.COOLED_BY: ("rack", "cooling_zone"),
     RelationType.RUNS_ON: ("workload", "node"),
     RelationType.PARENT_OF: ("topology_domain", "topology_domain"),
+    RelationType.BLOCKED_BY: ("candidate_action", "constraint"),
 }
 
 #: Upward hierarchy sweep order for hierarchical PNA pooling (doc Q).
@@ -80,9 +87,45 @@ HIERARCHY_UP: tuple[tuple[str, str], ...] = (
     ("rack", "topology_domain"),
 )
 
+#: Synthetic constraint-node kinds for ``BLOCKED_BY`` targets. The why-not read
+#: model materialises one ``constraint`` node per semantic blocker family so a
+#: rejected candidate action can point at the exact constraints blocking it.
+CONSTRAINT_KIND = "constraint"
+CANDIDATE_ACTION_KIND = "candidate_action"
+
+
+def build_blocked_by(
+    edges: list[tuple[int, int, float]] | None = None,
+) -> Relation:
+    """Construct an empty/populated ``BLOCKED_BY`` relation (doc C read-model).
+
+    ``edges`` is a list of ``(candidate_action_index, constraint_index,
+    reason_code)`` triples, where ``reason_code`` is a numeric encoding of the
+    blocking :class:`~gpu_center_world_model.simulator.contracts.BlockerGroup`
+    (the read-model assigns each group a stable integer so the edge feature is a
+    tensor-friendly scalar). Returns a :class:`Relation` whose ``src``/``dst``
+    are the action/constraint node indices and whose ``edge_feat`` rows carry the
+    reason code. This is the typed-edge substitution for the WhyNot ledger: the
+    graph can now render blocking constraints as first-class edges.
+    """
+    rel = Relation(
+        type=RelationType.BLOCKED_BY,
+        src_kind=CANDIDATE_ACTION_KIND,
+        dst_kind=CONSTRAINT_KIND,
+    )
+    for src_idx, dst_idx, reason in edges or ():
+        rel.src.append(src_idx)
+        rel.dst.append(dst_idx)
+        rel.edge_feat.append([float(reason)])
+    return rel
+
+
 __all__ = [
+    "CANDIDATE_ACTION_KIND",
+    "CONSTRAINT_KIND",
     "HIERARCHY_UP",
     "RELATION_ENDPOINTS",
     "Relation",
     "RelationType",
+    "build_blocked_by",
 ]

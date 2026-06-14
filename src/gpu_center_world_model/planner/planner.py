@@ -36,7 +36,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..model.contracts import WorldModel
-from ..schema.actions import Action, ActionType, action_workload_uid
+from ..schema.actions import (
+    Action,
+    ActionType,
+    AdmitAndPlace,
+    Hold,
+    action_workload_uid,
+)
 from ..schema.hashing import world_state_hash
 from ..schema.kpis import KPIForecastBundle
 from ..schema.policy import PolicyConfig
@@ -49,7 +55,7 @@ from .abstain import (
     should_abstain,
 )
 from .contracts import PlannerResult, ScoredAction
-from .enumerate import enumerate_safe_candidates
+from .enumerate import action_id_for, enumerate_safe_candidates
 from .ledger import ExplanationLedger
 from .risk_gate import assess_risk
 from .score import (
@@ -58,8 +64,108 @@ from .score import (
     lex_key_components,
     scalar_embedding,
 )
+from .why_not import blockers_card, rank_card, risk_card
 
-__all__ = ["SafeRegret", "ShieldedPlanner", "safe_regret"]
+__all__ = [
+    "SafeRegret",
+    "ShieldedPlanner",
+    "enumerate_full_candidate_space",
+    "safe_regret",
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Full candidate-space enumeration (the *complete* why-not provenance surface)
+# ──────────────────────────────────────────────────────────────────────────────
+def enumerate_full_candidate_space(
+    state: WorldState,
+    workload_uid: str,
+    policy: PolicyConfig,
+) -> list[tuple[str, Action]]:
+    """Enumerate the *full* candidate action space for one queued workload.
+
+    Unlike :func:`enumerate_safe_candidates` (which returns only the kernel-safe
+    subset ``A_K(b)``), this returns the complete set of candidate commands the
+    operator could have asked about — including the ones the exact kernel will
+    later reject — so the ledger can carry a blocked why-not certificate for
+    *every* rejected member of the candidate space, not just the survivors (doc
+    F: "explanation completeness for blocked and abstained actions"; doc S, D16:
+    a why-not certificate per infeasible candidate).
+
+    The space is ``hold`` plus the cross product of admit+place over every
+    eligible ``(cluster_queue, resource_flavor)`` pair and every topology domain
+    selection: each topology domain individually (``required`` locality, the most
+    constrained form, so a single-domain infeasibility surfaces its own minimal
+    certificate) plus the unconstrained spread. ``mask_domain`` is excluded — it
+    is an exogenous guardrail, not an actor action (doc M, D2). Results are
+    deduplicated by the same stable :func:`action_id_for` identity the safe-set
+    enumeration uses, so the two sets key on identical ids.
+    """
+    x = state.symbolic
+    allowed = set(policy.allowed_actions)
+    out: list[tuple[str, Action]] = []
+    seen: set[str] = set()
+
+    def _emit(action: Action) -> None:
+        aid = action_id_for(action)
+        if aid in seen:
+            return
+        seen.add(aid)
+        out.append((aid, action))
+
+    wl = x.workloads.get(workload_uid)
+
+    # hold is always a candidate the operator can consider (and ask "why not").
+    if ActionType.HOLD.value in allowed:
+        _emit(Hold(workload_uid=workload_uid))
+
+    if wl is None or ActionType.ADMIT_AND_PLACE.value not in allowed:
+        return out
+
+    # Eligible (queue, flavor) pairs: the workload's declared queue/flavor first,
+    # then every other configured queue/flavor so impossible pairings (e.g. a
+    # flavor a queue cannot borrow) still get an exact certificate.
+    queues: list[str] = []
+    if wl.cluster_queue_id and wl.cluster_queue_id in x.cluster_queues:
+        queues.append(wl.cluster_queue_id)
+    queues.extend(q for q in sorted(x.cluster_queues) if q not in queues)
+    if not queues:
+        queues = [wl.cluster_queue_id or ""]
+
+    flavors: list[str] = []
+    if wl.admitted_flavor_id:
+        flavors.append(wl.admitted_flavor_id)
+    flavors.extend(f for f in sorted(x.flavors) if f not in flavors)
+    if not flavors:
+        flavors = [wl.admitted_flavor_id or ""]
+
+    # Topology selections mirror the *form* the kernel's safe-set enumeration
+    # uses (the workload's declared topology policy, one selection per domain),
+    # so the feasible members share an identical stable id with the safe set and
+    # the safe set is a strict subset of this space. The per-domain candidates
+    # additionally surface the *blocked* placements (e.g. a protected or too-small
+    # domain) that get a why-not certificate. The unconstrained spread is added
+    # so a "place anywhere" probe is also covered.
+    wl_policy = getattr(wl, "topology_policy", None)
+    wl_policy_val = getattr(wl_policy, "value", "preferred")
+    selections: list[tuple[str, tuple[str, ...]]] = [
+        (wl_policy_val, (dom_id,)) for dom_id in x.domains
+    ]
+    selections.append(("preferred", ()))
+
+    for q in queues:
+        for f in flavors:
+            for domain_policy, doms in selections:
+                _emit(
+                    AdmitAndPlace(
+                        workload_uid=workload_uid,
+                        cluster_queue_id=q,
+                        resource_flavor_id=f,
+                        domain_policy=domain_policy,
+                        domain_id_or_set=doms,
+                    )
+                )
+    return out
 
 
 class ShieldedPlanner:
@@ -117,6 +223,38 @@ class ShieldedPlanner:
         for aid, act in safe:
             ledger.record_enumerated(aid, act.type.value)
 
+        # 1b. BLOCKED why-not certificates for the *full* candidate space. Every
+        # candidate command the operator could ask about but that the exact
+        # kernel rejects gets a group-minimal infeasibility certificate
+        # (kernel.why_not) recorded as a `blocked` ledger entry, so explanation
+        # completeness covers the whole space, not just the survivors (doc F /
+        # doc S, D16). The rejected `blocked` ScoredActions are added to
+        # ``result.rejected`` so the serving why-not surface can render them.
+        safe_ids = {aid for aid, _ in safe}
+        full_space = enumerate_full_candidate_space(state, workload_uid, policy)
+        for aid, act in full_space:
+            if aid in safe_ids:
+                continue
+            feas = self.kernel.feasible(state, act)
+            if feas.feasible:
+                # Hard-feasible but pruned from the safe set (e.g. symmetry /
+                # dominance reduction) — not a hard block, so leave it for the
+                # risk/rank cards below; do not emit a spurious blocked card.
+                continue
+            why = self.kernel.why_not(state, act)
+            card = blockers_card(aid, why)
+            ledger.record_blocked(aid, card)
+            ledger.attach_card(card)
+            result.rejected.append(
+                ScoredAction(
+                    action_id=aid,
+                    action=act,
+                    forecast=KPIForecastBundle(action_id=aid),
+                    safe=False,
+                    passes_risk_gate=False,
+                )
+            )
+
         # Identify the baseline action (hold for this workload) — KPIs are deltas
         # relative to it (doc kpis: "deltas relative to a declared baseline").
         baseline_id = self._baseline_action_id(safe, workload_uid)
@@ -149,6 +287,9 @@ class ShieldedPlanner:
             )
 
         # 3. RISK GATE — statistical chance-constraint / CVaR tail (doc M).
+        # A risk-filtered reject is *hard-feasible* but a modeled hazard's
+        # conformal upper bound exceeded its budget; it carries a risk_card (doc
+        # F: a calibrated-probability why-not, kept distinct from a hard block).
         survivors: list[ScoredAction] = []
         for aid, sa in scored.items():
             assessment = assess_risk(sa.forecast, policy.risk, horizon_s)
@@ -158,6 +299,7 @@ class ShieldedPlanner:
             else:
                 sa.passes_risk_gate = False
                 ledger.record_risk_filtered(aid, assessment)
+                ledger.attach_card(risk_card(aid, assessment))
                 result.rejected.append(sa)
 
         # 4. LEX RANK — lexicographic ordering (lex-argmin) over survivors.
@@ -166,6 +308,17 @@ class ShieldedPlanner:
             sa.rank = rank
             ledger.record_ranked(sa.action_id, rank, sa.lex_key)
         result.candidates = survivors
+
+        # 4b. RANK why-not cards for the *out-ranked* survivors. Each survivor
+        # that lost to the lex-argmin winner gets a rank_card naming the exact
+        # lexicographic field on which it lost (doc M, E1) — completing the
+        # three-family why-not provenance (blocked / risk-filtered / out-ranked).
+        if survivors:
+            winner_key = survivors[0].lex_key
+            for sa in survivors[1:]:
+                ledger.attach_card(
+                    rank_card(sa.action_id, sa.lex_key, winner_key)
+                )
 
         # 5. ABSTAIN — window-level abstention gate.
         surviving_decisions = {
@@ -218,6 +371,118 @@ class ShieldedPlanner:
         result.abstain = False
         result.ledger = ledger.to_list()
         return result
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Serving adapter: rank() over a pre-scored safe set
+    # ──────────────────────────────────────────────────────────────────────
+    def rank(
+        self,
+        state: WorldState,
+        safe_actions: list[tuple[str, Action]],
+        forecasts: dict[str, KPIForecastBundle],
+        baseline_id: str,
+        *,
+        policy: PolicyConfig | None = None,
+        horizon_s: int | None = None,
+    ) -> tuple[list[str], bool, str | None]:
+        """Rank a pre-scored kernel-safe set, returning ``(ranking, abstain, reason)``.
+
+        This is the adapter the serving ``compare_actions`` hot path drives so an
+        injected :class:`ShieldedPlanner` is exercised *end-to-end*: serving has
+        already run the exact kernel (producing ``safe_actions``) and the learned
+        model (producing ``forecasts``), so the planner only needs to apply its
+        risk gate, lexicographic ordering, and abstention gate over that set — the
+        same layers 3-5 of :meth:`plan`, but consuming forecasts serving already
+        computed rather than re-forecasting (so there is no double scoring, doc F
+        live-demo latency).
+
+        The signature is byte-stable with the reference engine's ``rank`` so it is
+        a drop-in: serving calls ``planner.rank(state, safe_actions, forecasts,
+        baseline_id)``. ``policy`` / ``horizon_s`` are optional, defaulting to the
+        operator policy embedded in the state and the dominant forecast horizon,
+        so the existing positional call site keeps working unchanged.
+        """
+        resolved_policy = policy or self._policy_from_state(state)
+        risk = resolved_policy.risk
+        hz = horizon_s if horizon_s is not None else _dominant_horizon(forecasts)
+        source_bad = observation_integrity_bad_prob(state.source)
+
+        survivors: list[tuple[tuple[float, ...], str]] = []
+        survivor_decisions: dict[str, AbstainDecision] = {}
+        for aid, _act in safe_actions:
+            bundle = forecasts.get(aid)
+            if bundle is None:
+                continue
+            assessment = assess_risk(bundle, risk, hz)
+            if not assessment.passes:
+                # Statistical-risk reject: drop from the ranking (gate, not score).
+                continue
+            lex_key = build_lex_key(bundle, hz, hard_safety=0.0, risk=risk)
+            survivors.append((lex_key, aid))
+            survivor_decisions[aid] = should_abstain(
+                bundle, resolved_policy.abstention, source_bad
+            )
+
+        survivors.sort(key=lambda t: t[0])
+        ranking = [aid for _k, aid in survivors]
+
+        if not ranking:
+            # Every safe candidate failed the risk gate → conservative abstain.
+            return [], True, "no_candidate_passed_risk_gate"
+
+        decisions = {aid: survivor_decisions[aid] for aid in ranking}
+        window_abstain, window_reason = aggregate_abstention(
+            decisions, state, resolved_policy.abstention
+        )
+        if window_abstain:
+            return ranking, True, window_reason or "window_abstain"
+
+        winner_decision = survivor_decisions.get(ranking[0])
+        if winner_decision is not None and winner_decision.abstain:
+            return ranking, True, f"winner_flagged ({winner_decision.reason})"
+
+        return ranking, False, None
+
+    @staticmethod
+    def _policy_from_state(state: WorldState) -> PolicyConfig:
+        """Build a :class:`PolicyConfig` from the state's operator policy.
+
+        The serving ``rank`` call site does not pass an explicit policy, so the
+        thresholds come from the symbolic operator policy embedded in the live
+        snapshot (the same source the exact kernel reads its guardrails from).
+        Missing budgets fall back to the :class:`PolicyConfig` defaults.
+        """
+        from ..schema.policy import AbstentionConfig, RiskThresholds
+
+        op = getattr(state.symbolic, "operator_policy", None)
+        if op is None:
+            return PolicyConfig()
+        rt = getattr(op, "risk_thresholds", None) or {}
+        risk = RiskThresholds()
+        for chan_attr in (
+            "max_hotspot_prob",
+            "max_headroom_violation_prob",
+            "max_pods_ready_timeout_prob",
+            "max_requeue_prob",
+            "max_xid_fault_prob",
+        ):
+            if chan_attr in rt:
+                setattr(risk, chan_attr, float(rt[chan_attr]))
+        abst = AbstentionConfig()
+        if "max_epistemic_disagreement" in rt:
+            abst.max_epistemic_disagreement = float(rt["max_epistemic_disagreement"])
+        if "max_ood_score" in rt:
+            abst.max_ood_score = float(rt["max_ood_score"])
+        allowed = list(
+            getattr(op, "allowed_actions", PolicyConfig().allowed_actions)
+        )
+        return PolicyConfig(
+            policy_id=getattr(op, "policy_id", "default"),
+            allowed_actions=allowed,
+            protected_domains=list(getattr(op, "protected_domains", [])),
+            risk=risk,
+            abstention=abst,
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Internals
@@ -339,6 +604,24 @@ class ShieldedPlanner:
                         return baseline_id
                     break
         return best.action_id
+
+
+def _dominant_horizon(forecasts: dict[str, KPIForecastBundle]) -> int:
+    """Infer the horizon to gate/rank on from a set of forecast bundles.
+
+    The serving ``rank`` adapter is handed forecasts already produced at one
+    horizon (compare snaps to a single nearest horizon). We read it back off the
+    bundles rather than re-deriving it, falling back to the canonical 30-minute
+    planning horizon when no quantile/hazard carries one.
+    """
+    for bundle in forecasts.values():
+        for q in bundle.quantiles:
+            if q.horizon_s:
+                return int(q.horizon_s)
+        for h in bundle.hazards:
+            if h.horizon_s:
+                return int(h.horizon_s)
+    return 1800
 
 
 # ──────────────────────────────────────────────────────────────────────────────

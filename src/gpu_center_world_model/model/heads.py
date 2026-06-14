@@ -59,6 +59,9 @@ KPI_QUERY_ENTITY: dict[KPIChannel, str] = {
     KPIChannel.COMPLETION_TIME_DELTA_S: "workload",
     KPIChannel.SLOWDOWN: "workload",
     KPIChannel.CROSS_RACK_RATE: "switch",
+    # Fairness share-debt delta (doc V lambda_unfair*share_debt) is a
+    # cluster-queue / cohort quantity → read it from the queue latent block.
+    KPIChannel.FAIRNESS_SHARE_DEBT_DELTA: "queue",
 }
 
 # Hazard channels: which entity, and whether the event is a competing-risk

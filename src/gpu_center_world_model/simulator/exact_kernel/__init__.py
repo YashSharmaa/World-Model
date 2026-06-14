@@ -52,35 +52,35 @@ from .topology_masks import (
 from .why_not import certificate, deletion_filter
 
 __all__ = [
+    "UNCONSTRAINED_DOMAIN_ID",
     # kernel
     "ExactSymbolicKernel",
-    # feasibility
-    "evaluate",
-    "flavor_eligible",
-    "place_gang",
-    "feasibility",
-    # quota
-    "QuotaDecision",
-    "quota_check",
-    "cohort_headroom",
-    "workload_demand",
-    "resolve_cohort",
-    "quota",
-    # topology
-    "TopologyIndex",
-    "build_topology_index",
-    "candidate_selections",
-    "selection_label",
-    "UNCONSTRAINED_DOMAIN_ID",
-    "topology_masks",
     # health
     "HealthMasks",
+    # quota
+    "QuotaDecision",
+    # topology
+    "TopologyIndex",
     "build_health_masks",
-    "node_is_schedulable",
-    "healthy_gpu_count",
-    "health_masks",
+    "build_topology_index",
+    "candidate_selections",
     # why-not
     "certificate",
+    "cohort_headroom",
     "deletion_filter",
+    # feasibility
+    "evaluate",
+    "feasibility",
+    "flavor_eligible",
+    "health_masks",
+    "healthy_gpu_count",
+    "node_is_schedulable",
+    "place_gang",
+    "quota",
+    "quota_check",
+    "resolve_cohort",
+    "selection_label",
+    "topology_masks",
     "why_not",
+    "workload_demand",
 ]

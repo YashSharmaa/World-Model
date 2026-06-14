@@ -1,0 +1,75 @@
+{
+  "$id": "https://github.com/yashsharmaa/gpu-center-world-model/schema/json_schema/decision_window.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A decision-centric training/evaluation record anchored by a pre-action state hash (docs D/I/O). The unit of training and evaluation; each window pairs a pre-action state with candidate actions and points back to its generator for reproducibility.",
+  "properties": {
+    "candidate_action_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "counterfactual_pack_uri": {
+      "type": "string"
+    },
+    "decision_id": {
+      "type": "string"
+    },
+    "generator_commit": {
+      "type": "string"
+    },
+    "label_pack_id": {
+      "type": "string"
+    },
+    "observational_context_uri": {
+      "type": "string"
+    },
+    "provenance_uri": {
+      "type": "string"
+    },
+    "realized_horizon_uri": {
+      "type": "string"
+    },
+    "scenario_family": {
+      "type": "string"
+    },
+    "seed_bundle": {
+      "type": "integer"
+    },
+    "source_mix": {
+      "enum": [
+        "real",
+        "sim_observational",
+        "sim_counterfactual"
+      ],
+      "type": "string"
+    },
+    "split": {
+      "enum": [
+        "train",
+        "val",
+        "test_temporal",
+        "test_topology",
+        "test_intervention",
+        "test_rare_event",
+        "test_severe_shift"
+      ],
+      "type": "string"
+    },
+    "state_hash": {
+      "type": "string"
+    },
+    "t0_ns": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "decision_id",
+    "seed_bundle",
+    "state_hash",
+    "t0_ns"
+  ],
+  "title": "decision_window",
+  "type": "object"
+}

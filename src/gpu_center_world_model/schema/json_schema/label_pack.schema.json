@@ -1,0 +1,53 @@
+{
+  "$id": "https://github.com/yashsharmaa/gpu-center-world-model/schema/json_schema/label_pack.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A label pack: an array of multi-task, intervention-aware labels for the (decision, action) pairs of one decision window (doc D Gold layer).",
+  "items": {
+    "additionalProperties": false,
+    "description": "One multi-task, intervention-aware (decision, action) label.",
+    "properties": {
+      "action_id": {
+        "type": "string"
+      },
+      "decision_id": {
+        "type": "string"
+      },
+      "explanation_tags": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "feasible": {
+        "type": "boolean"
+      },
+      "hazards": {
+        "additionalProperties": {
+          "type": "number"
+        },
+        "type": "object"
+      },
+      "horizon_s": {
+        "type": "integer"
+      },
+      "kpi_quantiles": {
+        "additionalProperties": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "type": "object"
+        },
+        "type": "object"
+      }
+    },
+    "required": [
+      "action_id",
+      "decision_id",
+      "horizon_s"
+    ],
+    "title": "label_pack_record",
+    "type": "object"
+  },
+  "title": "label_pack",
+  "type": "array"
+}

@@ -52,9 +52,18 @@ class ExplanationLedger:
     the pipeline (enumerate → score → risk-gate → rank → abstain/recommend). It
     exposes typed ``record_*`` helpers so the planner never hand-builds an entry
     with an off-vocabulary ``kind`` or a malformed evidence dict.
+
+    Alongside the flat ``entries`` stream it keeps a registry of structured
+    :class:`~.why_not.WhyNotCard` objects — the rich, render-ready why-not
+    provenance the serving layer can show verbatim. A blocked, risk-filtered, or
+    out-ranked action attaches its composed card here (keyed by ``action_id``) so
+    every rejected/losing member of the candidate space carries a complete,
+    non-LLM explanation (doc F explanation completeness; doc S certificates).
     """
 
     entries: list[LedgerEntry] = field(default_factory=list)
+    #: action_id -> the latest composed why-not card for that action.
+    cards: dict[str, WhyNotCard] = field(default_factory=dict)
 
     # ── generic append ─────────────────────────────────────────────────────
     def _append(
@@ -152,6 +161,26 @@ class ExplanationLedger:
             "recommended (lex-argmin over safe set)",
             {"lex_key": keyed, "scalar_score": float(scalar)},
         )
+
+    # ── why-not card registry ────────────────────────────────────────────────
+    def attach_card(self, card: WhyNotCard) -> WhyNotCard:
+        """Register a composed why-not card for an action (keyed by action_id).
+
+        Used by the planner to carry the rich, render-ready explanation for a
+        blocked (hard-infeasible), risk-filtered (over budget), or out-ranked
+        candidate alongside the flat ledger stream. The serving why-not surface
+        can render the card verbatim — no free-text generation in the loop.
+        """
+        self.cards[card.action_id] = card
+        return card
+
+    def card_for(self, action_id: str) -> WhyNotCard | None:
+        """Return the composed why-not card for an action, if one was attached."""
+        return self.cards.get(action_id)
+
+    def why_not_cards(self) -> list[WhyNotCard]:
+        """All attached why-not cards (for the evaluation completeness check)."""
+        return list(self.cards.values())
 
     # ── views ──────────────────────────────────────────────────────────────
     def by_kind(self, kind: str) -> list[LedgerEntry]:

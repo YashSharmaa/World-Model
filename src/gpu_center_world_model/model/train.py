@@ -63,7 +63,7 @@ from ..schema.entities import (
     WorkloadStatus,
 )
 from ..schema.state import SymbolicState, WorldState
-from .architecture import ArchConfig, TensorState
+from .architecture import ArchConfig, TensorState, kernel_state_summary
 from .backend import Backend, get_backend
 from .jepa import (
     LOSS_GROUPS,
@@ -146,6 +146,14 @@ class TrainConfig:
     # rollout horizon schedule (doc J C2: grow toward 12 slow steps)
     warmup_horizon: int = 2
     rollout_horizon: int = 6  # demo-scale cap (full v1 grows to 12)
+    # horizon curriculum (doc J B2): H grows from ``curriculum_h_start`` to
+    # ``curriculum_h_end`` across the action-conditioned (rollout/rare_event)
+    # steps so optimization difficulty rises gradually under pure free-running.
+    curriculum_h_start: int = 2
+    curriculum_h_end: int = 12  # H_slow (doc J B3 T_slow cap)
+    # truncated BPTT (doc J B3): detach the carried latent every K slow steps.
+    bptt_detach_every: int = 4
+    h_slow: int = 12  # outer BPTT clock length (doc J B3)
     # EMA decay schedule (doc J C1/C4)
     ema_start: float = 0.99
     ema_end: float = 0.9995
@@ -320,9 +328,22 @@ def _trainable_arrays(model: ResidualWorldModel) -> list[tuple[object, str]]:
         handles += [(enc, "W"), (enc, "b")]
     for core in (bb.fast_core, bb.slow_core):
         handles += [(core, "Wz"), (core, "Wr"), (core, "Wh")]
-    for d in bb.relation_msg.values():
+    # typed per-relation message blocks (doc Q D2): W_r^src / W_r^dst / φ_r / η_r
+    for d in bb.rel_src.values():
+        handles += [(d, "W"), (d, "b")]
+    for d in bb.rel_dst.values():
+        handles += [(d, "W"), (d, "b")]
+    for d in bb.rel_phi.values():
+        handles += [(d, "W"), (d, "b")]
+    for d in bb.rel_gate.values():
         handles += [(d, "W"), (d, "b")]
     handles.append((bb, "action_embed"))
+    # world-transition predictor P_θ — the deployed recursive core (doc J D6).
+    if bb.predictor is not None:
+        for cell in bb.predictor.cells.values():
+            handles += [(cell, "Wz"), (cell, "Wr"), (cell, "Wh")]
+        for d in bb.predictor.psi_proj.values():
+            handles += [(d, "W"), (d, "b")]
     return handles
 
 
@@ -343,6 +364,44 @@ def _encode_targets(
     return {k: np.asarray(be.to_numpy(be.stop_gradient(v))) for k, v in z.items()}
 
 
+def _exogenous_vector(w: DecisionWindow, u_dim: int, be: Backend) -> np.ndarray:
+    """Exogenous context ``u_h`` for the predictor (doc J D6 missingness/staleness).
+
+    A small, fixed vector of context indicators: whether a labelled future exists
+    (staleness proxy), whether the window is a rare-event / real sample, and a
+    branch indicator. These are constants in the predictor gradient (exogenous),
+    matching doc J D6's ``u_h`` (missingness/staleness/context features).
+    """
+    feats = [
+        1.0 if w.future_state is None else 0.0,  # missing-future / staleness flag
+        1.0 if w.is_rare_event else 0.0,
+        1.0 if w.is_real else 0.0,
+        1.0 if w.branch_action is not None else 0.0,
+    ]
+    vec = np.zeros((u_dim,), dtype=np.float32)
+    vec[: min(u_dim, len(feats))] = feats[:u_dim]
+    return be.from_numpy(vec)
+
+
+def _curriculum_horizon(
+    stage: str, step: int, total_steps: int, cfg: TrainConfig
+) -> int:
+    """Free-running rollout horizon under the doc J B2 curriculum.
+
+    Warmup uses the short ``warmup_horizon``; the action-conditioned stages grow
+    ``H`` linearly from ``curriculum_h_start`` to ``curriculum_h_end`` (capped at
+    ``h_slow``) across the run, preserving pure free-running training while
+    controlling optimization difficulty (doc J B2 — no scheduled sampling).
+    """
+    if stage == "warmup":
+        return cfg.warmup_horizon
+    h0, h1 = cfg.curriculum_h_start, min(cfg.curriculum_h_end, cfg.h_slow)
+    if total_steps <= 1:
+        return h1
+    frac = min(1.0, max(0.0, step / max(1, total_steps - 1)))
+    return round(h0 + (h1 - h0) * frac)
+
+
 def stage_loss(
     model: ResidualWorldModel,
     batch: Sequence[DecisionWindow],
@@ -351,6 +410,8 @@ def stage_loss(
     jcfg: JEPAConfig,
     logvars: GroupLogVars,
     target_model: ResidualWorldModel | None = None,
+    step: int = 0,
+    total_steps: int = 1,
 ) -> tuple[float, dict[str, float]]:
     """Total uncertainty-weighted loss for a micro-batch at ``stage`` (doc J Eq.19).
 
@@ -359,6 +420,14 @@ def stage_loss(
     add the action-conditioned ``rollout`` group with the branch-difference term;
     survival/quantile/abstention are folded in as light auxiliaries so the head
     geometry is exercised. Returns ``(total, group_losses)``.
+
+    The action-conditioned ``rollout`` group drives a **genuine free-running
+    recursion** through the transition predictor ``P_θ`` (:meth:`backbone.rollout`)
+    rather than replicating the one-step encoding: each step is conditioned on the
+    action embedding, the stop-gradient exact kernel-state summary ``ψ(s^K_{h+1})``
+    and the exogenous context ``u_h``, with truncated BPTT (detach every
+    ``cfg.bptt_detach_every`` slow steps) and a horizon curriculum H: 2→12
+    (doc J D6/Eq. 8–10, B1–B4). ``step``/``total_steps`` drive that curriculum.
 
     ``target_model`` is the **EMA teacher** (doc J Eq. 1, ∇ξ = 0): the targets
     are encoded by its frozen weights so the latent prediction loss has a genuine,
@@ -370,7 +439,7 @@ def stage_loss(
     group: dict[str, float] = {g: 0.0 for g in LOSS_GROUPS}
     n = max(len(batch), 1)
 
-    horizon = cfg.warmup_horizon if stage == "warmup" else cfg.rollout_horizon
+    horizon = _curriculum_horizon(stage, step, total_steps, cfg)
     for w in batch:
         caps = None
         ts = model.feature_builder.build(w.state, caps)
@@ -387,17 +456,45 @@ def stage_loss(
 
         # --- action-conditioned rollout group G2 (doc J Eqs. 8–10) -------- #
         if stage in ("rollout", "rare_event"):
-            pred_traj = [online for _ in range(horizon)]
+            # Genuine free-running rollout: ẑ_1..ẑ_H are distinct, produced by the
+            # predictor P_θ recursing on its own output (doc J D6, no teacher
+            # forcing). Condition each step on the stop-grad exact kernel state.
+            psi = model.backbone.predictor and kernel_state_summary(target_state, be)
+            kstates = [be.stop_gradient(psi)] * horizon if psi is not None else None
+            uvec = _exogenous_vector(w, model.backbone.cfg.u_dim, be)
+            exo = [uvec] * horizon
+            pred_traj = model.backbone.rollout(
+                online,
+                w.action.type.value,
+                ts.masks,
+                kernel_states=kstates,
+                exogenous=exo,
+                horizon=horizon,
+                detach_every=cfg.bptt_detach_every,
+            )
             tgt_traj = [tgt_be for _ in range(horizon)]
             group["rollout"] += rollout_loss(pred_traj, tgt_traj, None, jcfg, be)
             if w.branch_action is not None:
-                bp = model.backbone.encode(ts, w.branch_action.type.value)
+                bp0 = model.backbone.encode(ts, w.branch_action.type.value)
                 bf = w.branch_future_state or w.state
-                tb = {k: be.from_numpy(v) for k, v in tgt.items()}
+                # paired-branch free-running rollouts for the action-fidelity term
+                bpsi = model.backbone.predictor and kernel_state_summary(bf, be)
+                bk = [be.stop_gradient(bpsi)] * horizon if bpsi is not None else None
+                bp_traj = model.backbone.rollout(
+                    bp0,
+                    w.branch_action.type.value,
+                    ts.masks,
+                    kernel_states=bk,
+                    exogenous=exo,
+                    horizon=horizon,
+                    detach_every=cfg.bptt_detach_every,
+                )
+                tb = [tgt_be for _ in range(horizon)]
                 tbp_np = _encode_targets(tgt_enc, bf, w.branch_action.type.value, caps)
-                tbp = {k: be.from_numpy(v) for k, v in tbp_np.items()}
+                tbp_be = {k: be.from_numpy(v) for k, v in tbp_np.items()}
+                tbp = [tbp_be for _ in range(horizon)]
                 group["rollout"] += jcfg.lambda_delta * rollout_branch_diff_loss(
-                    [online], [bp], [tb], [tbp], be=be
+                    pred_traj, bp_traj, tb, tbp, be=be
                 )
 
         # --- light survival / quantile / abstention auxiliaries ----------- #
@@ -561,9 +658,21 @@ def train(
             step_loss = 0.0
             for mb in accum:
 
-                def _loss(_mb: list[DecisionWindow] = mb, _stage: str = stage) -> float:
+                def _loss(
+                    _mb: list[DecisionWindow] = mb,
+                    _stage: str = stage,
+                    _step: int = global_step,
+                ) -> float:
                     val, _ = stage_loss(
-                        model, _mb, _stage, cfg, jcfg, logvars, target_model
+                        model,
+                        _mb,
+                        _stage,
+                        cfg,
+                        jcfg,
+                        logvars,
+                        target_model,
+                        step=_step,
+                        total_steps=total_steps,
                     )
                     return val
 

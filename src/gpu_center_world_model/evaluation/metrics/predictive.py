@@ -179,6 +179,22 @@ def precision_recall_at_budget(
 # ──────────────────────────────────────────────────────────────────────────────
 # Aggregated, horizon-sliced report object
 # ──────────────────────────────────────────────────────────────────────────────
+#: The doc-F discrete hazard channels scored by Brier + alert-budget precision/
+#: recall ("Brier score and alert-budget precision-recall for hotspot,
+#: PodsReadyTimeout, requeue, NodeFailures, and GPU fault hazard").
+HAZARD_CHANNELS: tuple[str, ...] = (
+    "hotspot",
+    "pods_ready_timeout",
+    "requeue",
+    "node_failure",
+    "xid_fault",
+)
+
+#: The realistic operator alert budgets (top-k fractions) the PR metrics are
+#: reported at (doc F "realistic alert budgets" — operators have finite attention).
+ALERT_BUDGETS: tuple[float, ...] = (0.01, 0.05, 0.10)
+
+
 @dataclass(slots=True)
 class PredictiveReport:
     """All factual-replay predictive metrics for one (channel, horizon) slice."""
@@ -194,6 +210,9 @@ class PredictiveReport:
     coverage_90: float = float("nan")
     sharpness_90: float = float("nan")
     brier: float = float("nan")
+    # PR-at-budget for the discrete hazard channels (doc F): one entry per alert
+    # budget, mapping ``budget -> {"precision", "recall", "threshold"}``.
+    pr_at_budget: dict[float, dict[str, float]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -208,6 +227,9 @@ class PredictiveReport:
             "coverage_90": self.coverage_90,
             "sharpness_90": self.sharpness_90,
             "brier": self.brier,
+            "pr_at_budget": {
+                str(k): dict(v) for k, v in self.pr_at_budget.items()
+            },
         }
 
 
@@ -248,7 +270,39 @@ def score_quantile_channel(
     return rep
 
 
+def score_hazard_channel(
+    channel: str,
+    horizon_s: int,
+    prob: ArrayLike,
+    label: ArrayLike,
+    *,
+    alert_budgets: tuple[float, ...] = ALERT_BUDGETS,
+) -> PredictiveReport:
+    """Score one *discrete* hazard channel with Brier + PR-at-budget (doc F).
+
+    Doc F requires, for the binary hazard channels (hotspot, PodsReadyTimeout,
+    requeue, NodeFailure, XID fault), "Brier score and alert-budget
+    precision-recall". This emits one :class:`PredictiveReport` carrying the
+    Brier score plus precision/recall/threshold at each realistic alert budget
+    (top-k fraction), so the report shows the operator-grade trade-off rather
+    than a single AUC number.
+    """
+    p, y = _as_array(prob), _as_array(label)
+    rep = PredictiveReport(channel=channel, horizon_s=horizon_s, n=int(p.size))
+    rep.brier = brier_score(p, y)
+    pr: dict[float, dict[str, float]] = {}
+    for budget in alert_budgets:
+        if not 0.0 < budget <= 1.0:
+            continue
+        prec, rec, thr = precision_recall_at_budget(p, y, budget)
+        pr[budget] = {"precision": prec, "recall": rec, "threshold": thr}
+    rep.pr_at_budget = pr
+    return rep
+
+
 __all__ = [
+    "ALERT_BUDGETS",
+    "HAZARD_CHANNELS",
     "PredictiveReport",
     "brier_score",
     "coverage_gap",
@@ -259,6 +313,7 @@ __all__ = [
     "pinball_loss",
     "precision_recall_at_budget",
     "rmse",
+    "score_hazard_channel",
     "score_quantile_channel",
     "wape",
 ]

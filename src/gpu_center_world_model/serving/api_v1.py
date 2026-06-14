@@ -57,6 +57,7 @@ from ..simulator.contracts import (
 )
 from ..version import API_VERSION, SCHEMA_VERSION, __version__
 from . import dto
+from .cache import ScoringGraph, ServingCache, shape_bucket_key
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -301,19 +302,29 @@ def _freshness(state: WorldState) -> dict[str, Any]:
 # POST /api/v1/actions/compare
 # ──────────────────────────────────────────────────────────────────────────────
 def compare_actions(
-    state: WorldState, req: dto.CompareRequest, engine: EngineBundle
+    state: WorldState,
+    req: dto.CompareRequest,
+    engine: EngineBundle,
+    *,
+    cache: ServingCache | None = None,
 ) -> dto.CompareResponse:
     """Rank candidate actions and return branch rollouts (the core hot path).
 
     Sequence (the spine, in order):
       1. exact kernel feasibility per candidate  →  ``safe`` + ``exact_blockers``;
-      2. learned forecasts over the *safe* subset only  →  ``delta_kpis`` +
+      2. learned forecasts over the *safe* subset only, via a *prepared scoring
+         closure cached per shape bucket* so back-to-back compares incur no
+         recompile churn (doc F live_demo_runtime)  →  ``delta_kpis`` +
          ``uncertainty`` + rollout points;
       3. abstention / lexicographic ranking  →  recommended_action_id.
 
     The baseline is always ``hold`` (doc kpis: deltas are relative to a declared
     baseline action, typically hold). The response candidate count is kept
     shape-stable at :data:`dto.DEFAULT_BRANCHES` for the public demo.
+
+    ``cache`` (when supplied by the app) backs the one compiled scoring endpoint:
+    the prepared scoring closure for the request's shape bucket is built at most
+    once and reused on every subsequent compare in the same bucket.
     """
     kernel = engine.kernel
     assert kernel is not None  # filled by EngineBundle.__post_init__
@@ -344,10 +355,18 @@ def compare_actions(
             safe_actions.append((creq.action_id, action))
 
     # --- learned forecasts over the kernel-certified safe set only -----------
-    forecasts: dict[str, KPIForecastBundle] = {}
-    for action_id, action in safe_actions:
-        bundle = _forecast(engine, state, action, horizon_s)
-        forecasts[action_id] = bundle
+    # Score through the prepared/compiled scoring closure for this shape bucket
+    # so the model's compile() is warmed once per (arity, horizon, pod-shape)
+    # bucket and reused (doc G/F: no compile churn on back-to-back serving calls).
+    scoring = _scoring_graph(engine, state, len(safe_actions), horizon_s, cache)
+    safe_action_list = [a for _aid, a in safe_actions]
+    safe_bundles = scoring.score_actions(state, safe_action_list, horizon_s)
+    forecasts: dict[str, KPIForecastBundle] = {
+        action_id: bundle
+        for (action_id, _action), bundle in zip(
+            safe_actions, safe_bundles, strict=False
+        )
+    }
 
     # baseline bundle (hold) for delta normalisation
     base_bundle = forecasts.get(baseline_id)
@@ -499,6 +518,75 @@ def _forecast(
     if model is not None and hasattr(model, "forecast"):
         return model.forecast(state, action, horizon_s)
     return engine.reference.forecast(state, action, horizon_s)
+
+
+def _build_scoring_graph(
+    engine: EngineBundle, bucket_key: str, candidate_count: int, horizon_s: int
+) -> ScoringGraph:
+    """Prepare (and warm) one scoring closure for a shape bucket.
+
+    The closure binds the injected model's batched ``score_actions`` hot path
+    (the single compiled scoring endpoint the serving layer drives) when the
+    model exposes it, degrading to per-action ``forecast`` otherwise. Building
+    this closure is where a real MLX backend's ``compile()`` is first triggered
+    for the shape; because the ``ServingCache`` caches the closure per bucket,
+    that compile happens at most once per bucket (doc F: no compile churn).
+    """
+    model = engine.model
+
+    def score_actions(
+        s: WorldState, actions: list[Action], hz: int
+    ) -> list[KPIForecastBundle]:
+        if model is not None and hasattr(model, "score_actions"):
+            try:
+                bundles = model.score_actions(s, actions, hz)
+            except (NotImplementedError, AttributeError):
+                bundles = None
+            if bundles is not None and len(bundles) == len(actions):
+                return list(bundles)
+        return [_forecast(engine, s, a, hz) for a in actions]
+
+    def forecast(s: WorldState, action: Action, hz: int) -> KPIForecastBundle:
+        return _forecast(engine, s, action, hz)
+
+    return ScoringGraph(
+        bucket_key=bucket_key,
+        forecast=forecast,
+        score_actions=score_actions,
+        candidate_count=candidate_count,
+        horizon_s=horizon_s,
+    )
+
+
+def _scoring_graph(
+    engine: EngineBundle,
+    state: WorldState,
+    candidate_count: int,
+    horizon_s: int,
+    cache: ServingCache | None,
+) -> ScoringGraph:
+    """Return the prepared scoring closure for this compare's shape bucket.
+
+    Keyed on the quantities that change a scoring-graph shape or arity: candidate
+    count, horizon, and the pod's domain/node counts (doc G shape contract). With
+    a ``ServingCache`` present the closure is fetched via
+    ``scoring_graphs.get_or_compute`` so it is built once per bucket and reused;
+    without a cache (e.g. a direct unit-test call) a fresh closure is prepared.
+    """
+    x = state.symbolic
+    bucket = shape_bucket_key(
+        candidate_count=candidate_count,
+        horizon_s=horizon_s,
+        n_domains=len(x.domains),
+        n_nodes=len(x.nodes),
+        model_version=engine.model_version,
+    )
+    if cache is None:
+        return _build_scoring_graph(engine, bucket, candidate_count, horizon_s)
+    return cache.prepared_scoring_graph(
+        bucket,
+        lambda: _build_scoring_graph(engine, bucket, candidate_count, horizon_s),
+    )
 
 
 def _rank(
@@ -877,11 +965,35 @@ class ReferenceEngine:
             qf(KPIChannel.SLOWDOWN, 1.0 + occ, 0.1),
         ]
 
-        # Hazards rise with occupancy and with admitting more load.
+        # Hazards rise with occupancy and with admitting more load. All six
+        # modeled hazard channels (doc F predictive_accuracy: hotspot,
+        # PodsReadyTimeout, requeue, XID/GPU fault, node failure, headroom) are
+        # emitted from simple *monotone* closed forms so the planner risk gate,
+        # the why-not predicted-risk surface, and the compare uncertainty ribbon
+        # can all reason over the same hazard families the learned model targets.
+        # Each form is monotone non-decreasing in the load / occupancy / horizon
+        # quantities that physically raise that hazard, and HOLD (no new load)
+        # always carries strictly lower hazard than an admit/place, which is what
+        # makes "prefer hold when warranted" (doc F PodsReady scenario) emerge.
         load = 0.0 if action.type == ActionType.HOLD else (gpu_demand / 64.0)
+        # Horizon factor: a longer exposure window can only raise event hazards
+        # (discrete-time survival: 1 - (1-rate)^t is increasing in t). Normalised
+        # so the 30-minute reference horizon is ~1.0.
+        hz_factor = horizon_s / 1800.0
         hotspot_p = _clip(0.04 + 0.30 * occ + 0.10 * load)
         timeout_p = _clip(0.05 + 0.15 * (1.0 - locality) + 0.05 * load)
         headroom_p = _clip(0.02 + 0.20 * occ * load)
+        # requeue follows the PodsReady timeout loop (a timeout drives an
+        # eviction + backoff requeue), so it is monotone in the timeout hazard
+        # and grows with the horizon (more windows = more backoff exposure).
+        requeue_p = _clip((0.40 * timeout_p + 0.05 * load) * (0.5 + 0.5 * hz_factor))
+        # XID / device-fault hazard rises with sustained device occupancy and the
+        # exposure horizon (more GPU-hours under load = more fault opportunity).
+        xid_p = _clip((0.01 + 0.06 * occ + 0.04 * load) * (0.5 + 0.5 * hz_factor))
+        # node-failure hazard is the rarest; it is monotone in the device-fault
+        # hazard (a node fails at least as rarely as any single device on it) and
+        # in occupancy, scaled below the XID rate (doc U severity ordering).
+        node_fail_p = _clip(0.25 * xid_p + 0.02 * occ * hz_factor)
         hazards = [
             HazardForecast(
                 HazardChannel.HOTSPOT,
@@ -900,6 +1012,24 @@ class ReferenceEngine:
                 horizon_s,
                 headroom_p,
                 conformal_upper=_clip(headroom_p * 1.5 + 0.02),
+            ),
+            HazardForecast(
+                HazardChannel.REQUEUE,
+                horizon_s,
+                requeue_p,
+                conformal_upper=_clip(requeue_p * 1.5 + 0.03),
+            ),
+            HazardForecast(
+                HazardChannel.XID_FAULT,
+                horizon_s,
+                xid_p,
+                conformal_upper=_clip(xid_p * 1.6 + 0.02),
+            ),
+            HazardForecast(
+                HazardChannel.NODE_FAILURE,
+                horizon_s,
+                node_fail_p,
+                conformal_upper=_clip(node_fail_p * 1.6 + 0.01),
             ),
         ]
 

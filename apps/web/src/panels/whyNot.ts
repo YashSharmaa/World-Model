@@ -33,9 +33,20 @@ export function createWhyNotCard(
   async function render(actionId: string, s: StoreState): Promise<void> {
     if (!s.snapshot) return;
     if (actionId !== lastActionId || !cache) {
+      // Recover the EXACT command (type + params: target domain, policy, gang)
+      // that was submitted to /actions/compare for this action, so the why-not
+      // certificate is computed for the real rejected action instead of an empty
+      // placeholder. Falls back to the stored compare candidate or a minimal
+      // admit_and_place if the map is somehow empty.
+      const candidate =
+        store.candidateAction(actionId) ?? {
+          action_id: actionId,
+          type: "admit_and_place" as const,
+          params: { workload_uid: s.focusedWorkload ?? undefined },
+        };
       cache = await client.whyNot({
         state_hash: s.snapshot.state_hash,
-        candidate_action: { action_id: actionId, type: "admit_and_place", params: {} },
+        candidate_action: candidate,
       });
       lastActionId = actionId;
     }

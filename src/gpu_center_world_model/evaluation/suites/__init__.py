@@ -23,6 +23,8 @@ from .redteam import (
     ScenarioResult,
     evaluate_red_team,
     evaluate_scenario,
+    generate_red_team_suite,
+    make_red_team_case,
 )
 
 __all__ = [
@@ -34,4 +36,6 @@ __all__ = [
     "ScenarioResult",
     "evaluate_red_team",
     "evaluate_scenario",
+    "generate_red_team_suite",
+    "make_red_team_case",
 ]

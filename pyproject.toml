@@ -53,6 +53,8 @@ dev = [
   "ruff>=0.5",
   "pyright>=1.1.370",
   "mkdocs-material>=9.5",
+  # JSON-schema validation of released contracts (doc H static checks).
+  "jsonschema>=4.21",
 ]
 all = [
   "gpu-center-world-model[serve,data,baselines]",

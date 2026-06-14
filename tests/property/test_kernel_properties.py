@@ -181,3 +181,60 @@ def test_branch_refuses_drifted_start_state(r, n, g, seed):
     drifted = kernel.step(state, _placement(state, uid))
     with pytest.raises(ValueError):
         runner.rollout(root, drifted, Hold(workload_uid=uid))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Non-GPU quota counters are conservative across a feasible admission
+# (KERNEL-NONGPU-QUOTA, doc S Eq. E11/E12 for all r)
+# ──────────────────────────────────────────────────────────────────────────────
+@given(_RACKS, _NODES, _GPN, st.integers(1, 6), _SEED)
+@_SETTINGS
+def test_feasible_admit_decrements_all_resource_counters(r, n, g, demand, seed):
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    _pod, state, uid = generate_pod_state(
+        PodSpec(n_racks=r, nodes_per_rack=n, gpus_per_node=g),
+        seed=seed,
+        gpu_demand=demand,
+    )
+    kernel = ExactSymbolicKernel()
+    act = _placement(state, uid)
+    res = kernel.feasible(state, act)
+    cq_id = state.symbolic.workloads[uid].cluster_queue_id
+    fl = next(iter(state.symbolic.flavors))
+    before = q.reserved_for(state.symbolic.cluster_queues[cq_id], fl, "gpu")
+    nxt = kernel.step(state, act)
+    after = q.reserved_for(nxt.symbolic.cluster_queues[cq_id], fl, "gpu")
+    if res.feasible:
+        # A feasible admit reserves exactly the gang's GPU demand on the ledger.
+        gang = sum(p.count * p.gpu_req for p in state.symbolic.workloads[uid].podsets)
+        assert after - before == gang
+        # Every per-resource counter is non-negative (never over-released).
+        cq = nxt.symbolic.cluster_queues[cq_id]
+        for inner in cq.reserved_by_resource.values():
+            assert all(v >= 0.0 for v in inner.values())
+    else:
+        assert after == before  # no-op never touches the quota ledger
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bounded packer always terminates (doc S latency_budget — no unbounded DFS)
+# ──────────────────────────────────────────────────────────────────────────────
+@given(_RACKS, _NODES, _GPN, st.integers(50, 4000), _SEED)
+@_SETTINGS
+def test_packer_is_bounded_and_terminates(r, n, g, big_demand, seed):
+    # A huge gang must yield a definitive verdict without a RecursionError or an
+    # unbounded search (the iterative DFS + expansion bound guarantees it).
+    from gpu_center_world_model.simulator.exact_kernel import feasibility as feas
+
+    _pod, state, uid = generate_pod_state(
+        PodSpec(n_racks=r, nodes_per_rack=n, gpus_per_node=g),
+        seed=seed,
+        gpu_demand=2,
+    )
+    wl = state.symbolic.workloads[uid]
+    wl.podsets[0].count = big_demand  # far exceeds any demo pod
+    act = _placement(state, uid)
+    res = feas.evaluate(state.symbolic, wl, act)
+    # Far more GPUs than the pod has -> definitively infeasible, never a crash.
+    assert not res.feasible

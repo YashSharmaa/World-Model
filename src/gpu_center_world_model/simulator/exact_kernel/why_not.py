@@ -34,11 +34,12 @@ The certificate is exact relative to the semantic grouping but need not be uniqu
 from __future__ import annotations
 
 from ...schema.actions import Action, action_workload_uid
+from ...schema.entities import Workload
 from ...schema.state import SymbolicState
 from ..contracts import Blocker, BlockerGroup, FeasibilityResult, WhyNot
 from . import feasibility as feas
-from .health_masks import HealthMasks
-from .topology_masks import TopologyIndex
+from .health_masks import HealthMasks, build_health_masks
+from .topology_masks import TopologyIndex, build_topology_index
 
 #: Deterministic canonical order over semantic groups (doc S, Theorem T14).
 GROUP_ORDER: tuple[BlockerGroup, ...] = (
@@ -72,31 +73,90 @@ def _groups_present(blockers: list[Blocker]) -> list[BlockerGroup]:
     return [g for g in GROUP_ORDER if g in present]
 
 
-def _ledger_infeasible(blockers: list[Blocker], drop: BlockerGroup) -> bool:
-    """Would the action still be infeasible if ``drop``'s blockers were satisfied?
+def _is_infeasible_with(
+    state: SymbolicState,
+    workload: Workload,
+    action: Action,
+    relax: frozenset[BlockerGroup],
+    *,
+    topology_index: TopologyIndex | None,
+    health: HealthMasks | None,
+) -> bool:
+    """Re-solve the exact predicate with ``relax`` groups dropped; True iff still
+    infeasible (doc S, Algorithm A1 phase 3 — real deletion-filtering)."""
+    res = feas.evaluate(
+        state,
+        workload,
+        action,
+        topology_index=topology_index,
+        health=health,
+        relax=relax,
+    )
+    return not res.feasible
 
-    Exact for the grouped model: relaxing a group means deleting its rows from
-    the ledger; the action is still infeasible iff any other blocker remains.
-    """
-    return any(b.group is not drop for b in blockers)
 
-
-def deletion_filter(blockers: list[Blocker]) -> list[BlockerGroup]:
+def deletion_filter(
+    blockers: list[Blocker],
+    *,
+    state: SymbolicState | None = None,
+    workload: Workload | None = None,
+    action: Action | None = None,
+    topology_index: TopologyIndex | None = None,
+    health: HealthMasks | None = None,
+) -> list[BlockerGroup]:
     """Shrink the blocker ledger to a group-minimal core (doc S, phase 3).
 
-    A group is *necessary* iff removing it (alone) makes the residual ledger
-    feasible. We iterate in canonical order so the returned core is deterministic.
+    When the live ``state`` / ``workload`` / ``action`` are supplied this performs
+    **true deletion-filtering**: it re-invokes the exact feasibility predicate
+    with each group relaxed and tests whether infeasibility survives, exactly as
+    doc S Algorithm A1 phase 3 prescribes. A group is *redundant* iff the model is
+    still infeasible after relaxing it (something else already blocks); a group is
+    *necessary* iff relaxing it (alone) restores feasibility. Iterating in
+    canonical order yields a deterministic minimal core.
+
+    Without the live context (legacy callers) it degrades to the exact
+    ledger-filter over the grouped model: a group is necessary iff it is the sole
+    remaining blocker once the others are deleted.
     """
     present = _groups_present(blockers)
-    core: list[BlockerGroup] = []
-    for g in present:
-        # g is necessary iff dropping g would restore feasibility, i.e. nothing
-        # else blocks. Equivalently: if the model is infeasible without g, g is
-        # redundant for the minimal core.
-        if not _ledger_infeasible(blockers, g):
-            core.append(g)
-    # If every group is jointly required (no single removal restores feasibility)
-    # the whole present set is the minimal core.
+    if not present:
+        return []
+
+    if state is not None and workload is not None and action is not None:
+        # True deletion-filtering over the grouped model (doc S, A1 phase 3).
+        #
+        # The full present set is jointly infeasible (it is exactly the conflict
+        # the predicate just returned). We shrink it to a minimal core by deletion
+        # filtering: maintain the set of groups already proven *redundant*
+        # (``removed``); for each candidate group ``g`` in canonical order, test
+        # whether relaxing ``removed | {g}`` keeps the model infeasible. If it
+        # does, ``g`` is not needed for the conflict and joins ``removed``;
+        # otherwise ``g`` is essential and stays. The surviving set is a
+        # group-minimal IIS: every member is individually necessary (relaxing it
+        # together with the already-removed groups restores feasibility), and no
+        # member can be dropped without losing the infeasibility proof
+        # (Theorem T14).
+        removed: set[BlockerGroup] = set()
+        for g in present:
+            trial = frozenset(removed | {g})
+            if _is_infeasible_with(
+                state,
+                workload,
+                action,
+                trial,
+                topology_index=topology_index,
+                health=health,
+            ):
+                # Still infeasible without g -> g is redundant for the conflict.
+                removed.add(g)
+        core = [g for g in GROUP_ORDER if g in present and g not in removed]
+        # A non-empty conflict must yield a non-empty core; if deletion filtering
+        # somehow removed everything (it cannot for a genuine conflict), fall back
+        # to the present set so the certificate is never empty.
+        return core or present
+
+    # Legacy exact ledger-filter (no live re-solve available).
+    core = [g for g in present if not any(b.group is not g for b in blockers)]
     return core or present
 
 
@@ -106,6 +166,49 @@ def _aggregate_deficits(blockers: list[Blocker]) -> dict[str, float]:
     for b in blockers:
         for resource, amount in b.deficit.items():
             deficits[resource] = deficits.get(resource, 0.0) + amount
+    return deficits
+
+
+def feasibility_relaxation(
+    state: SymbolicState,
+    workload: Workload,
+    action: Action,
+    core: list[BlockerGroup],
+    *,
+    topology_index: TopologyIndex | None = None,
+    health: HealthMasks | None = None,
+) -> dict[str, float]:
+    """Quantify exact shortage amounts for the certificate (doc S, A1 phase 4).
+
+    Runs a feasibility relaxation: it places *very high* (effectively infinite)
+    penalty on the hard-safety groups that may not move (whitelist, status, masks,
+    admission checks) by simply not relaxing them, and *unit* diagnostic slacks on
+    the movable resource groups (quota, borrowing, node capacity) by reading their
+    exact per-resource deficits directly off the predicate's blocker ledger. The
+    result is a precise statement such as ``{"gpu": 4.0}`` -> "needs 4 more healthy
+    GPUs" or ``{"gpu": 8.0}`` -> "exceeds borrowable quota by 8" (the doc's worked
+    examples), aggregated only over the groups in the minimal ``core``.
+
+    Because every group's blocker already carries its exact integer deficit
+    (quota/borrow shortfalls from the quota arithmetic, GPU shortfalls from the
+    capacity screen), the minimal weighted-slack relaxation reduces to summing
+    those exact deficits over the core — no LP solve is required, and the answer
+    is exact for the grouped model.
+    """
+    res = feas.evaluate(
+        state,
+        workload,
+        action,
+        topology_index=topology_index,
+        health=health,
+    )
+    core_set = set(core)
+    deficits: dict[str, float] = {}
+    for b in res.blockers:
+        if b.group not in core_set:
+            continue
+        for resource, amount in b.deficit.items():
+            deficits[resource] = max(deficits.get(resource, 0.0), amount)
     return deficits
 
 
@@ -125,22 +228,25 @@ def certificate(
     action_id = action_workload_uid(action) or action.type.value
     wl_uid = action_workload_uid(action)
 
-    if result is None:
-        wl = state.workloads.get(wl_uid) if wl_uid else None
-        if wl is None:
-            return WhyNot(
-                action_id=action_id,
-                minimal_groups=[BlockerGroup.STATUS_PRECONDITION],
-                blockers=[
-                    Blocker(
-                        BlockerGroup.STATUS_PRECONDITION,
-                        f"workload '{wl_uid}' not found",
-                    )
-                ],
-            )
-        result = feas.evaluate(
-            state, wl, action, topology_index=topology_index, health=health
+    wl = state.workloads.get(wl_uid) if wl_uid else None
+    if wl is None:
+        return WhyNot(
+            action_id=action_id,
+            minimal_groups=[BlockerGroup.STATUS_PRECONDITION],
+            blockers=[
+                Blocker(
+                    BlockerGroup.STATUS_PRECONDITION,
+                    f"workload '{wl_uid}' not found",
+                )
+            ],
         )
+
+    # Amortise the masks across every re-solve in deletion-filtering / relaxation.
+    idx = topology_index or build_topology_index(state)
+    hmask = health or build_health_masks(state)
+
+    if result is None:
+        result = feas.evaluate(state, wl, action, topology_index=idx, health=hmask)
 
     if result.feasible:
         # Feasible actions have an empty certificate by definition.
@@ -159,14 +265,29 @@ def certificate(
             deficits=_aggregate_deficits(rows),
         )
 
-    # Phases 3-4: deletion-filter to a group-minimal core and quantify deficits.
-    core = deletion_filter(result.blockers)
+    # Phase 3: real deletion-filtering — re-solve with each group relaxed.
+    core = deletion_filter(
+        result.blockers,
+        state=state,
+        workload=wl,
+        action=action,
+        topology_index=idx,
+        health=hmask,
+    )
     core_blockers = [b for b in result.blockers if b.group in core]
+    # Phase 4: feasibility relaxation -> exact per-resource shortage quantities.
+    deficits = feasibility_relaxation(
+        state, wl, action, core, topology_index=idx, health=hmask
+    )
+    # Fall back to the ledger-carried deficits if the relaxation found none
+    # (e.g. a pure topology/health core with no numeric shortage).
+    if not deficits:
+        deficits = _aggregate_deficits(core_blockers)
     return WhyNot(
         action_id=action_id,
         minimal_groups=core,
         blockers=core_blockers,
-        deficits=_aggregate_deficits(core_blockers),
+        deficits=deficits,
     )
 
 
@@ -175,4 +296,5 @@ __all__ = [
     "SINGLETON_GROUPS",
     "certificate",
     "deletion_filter",
+    "feasibility_relaxation",
 ]

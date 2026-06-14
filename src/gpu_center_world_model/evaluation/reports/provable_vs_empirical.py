@@ -259,6 +259,9 @@ _CLAIM_BINDINGS: dict[str, tuple[str, ...]] = {
         "abstention",
         "sample_complexity",
     ),
+    # L10 — operator usefulness: a purely empirical claim, bound to the
+    # interaction-trace study readout (doc F operator_usefulness; doc O L10).
+    "L10": ("operator_usefulness",),
 }
 
 

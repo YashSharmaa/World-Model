@@ -57,7 +57,13 @@ from .provenance.manifest import (
 from .synthetic import SCENARIO_PACKS, generate_pack
 from .synthetic.counterfactual import CounterfactualPack
 from .synthetic.fidelity import FidelityReport
-from .windows.builder import build_window
+from .windows.builder import (
+    HoldoutPolicy,
+    assert_disjoint_splits,
+    assign_split,
+    build_window,
+    descriptor_from_window,
+)
 
 
 @dataclass(slots=True)
@@ -266,6 +272,34 @@ def assemble_release(
     return {"root": str(base), "paths": paths, "data_card": card, "stats": stats}
 
 
+def scenario_families(scenario: str) -> dict[str, object]:
+    """Derive a scenario's holdout family coordinates (doc D four test suites).
+
+    Maps a :data:`SCENARIO_PACKS` key to the family labels the holdout splitters
+    partition on: a topology/flavor family (the pod's flavor + size class), a
+    rare-event family + severity band (from ``cfg.rare_event`` and ``fault_tilt``),
+    and a severe-shift flag (an extreme stress pack). These are the *only* inputs
+    the splitter sees, so a held-out family is well-defined and reproducible.
+    """
+    cfg = SCENARIO_PACKS.get(scenario, SCENARIO_PACKS["normal"])
+    pod = cfg.pod
+    topo = f"{pod.flavor_name}:{pod.n_racks}r"
+    if cfg.fault_tilt >= 10.0:
+        sev = "high"
+    elif cfg.fault_tilt > 1.0:
+        sev = "medium"
+    else:
+        sev = "low"
+    rare = f"{cfg.rare_event}:{sev}" if cfg.rare_event else ""
+    severe = cfg.fault_tilt >= 10.0 or cfg.workload_gpu >= 48
+    return {
+        "topology_family": topo,
+        "rare_event_family": rare,
+        "severe_shift": bool(severe),
+        "severity": float(min(1.0, cfg.fault_tilt / 20.0)),
+    }
+
+
 def build_demo_release(
     root: str | Path,
     *,
@@ -274,21 +308,40 @@ def build_demo_release(
     generator_commit: str = "dev",
     train_frac: float = 0.6,
     val_frac: float = 0.2,
+    holdout: HoldoutPolicy | None = None,
 ) -> dict[str, object]:
     """Generate a small demo release end-to-end (generator → windows → release).
 
     Convenience for the CLI / docs: it produces one counterfactual pack per
     (seed, scenario), turns each into a Gold decision window, builds a provenance
     manifest seeded with the per-pack seeds, and assembles the on-disk release.
-    Windows are temporally split deterministically by index so the same decision
-    hash never crosses splits (doc D splits invariant).
+
+    Splitting is **family-aware** (doc D four disjoint test suites), not index-
+    based: each window is classified by its topology/flavor, intervention, and
+    rare-event families and routed by a :class:`HoldoutPolicy`. A held-out family
+    is diverted to its TEST suite and **never enters train**; the remaining seen
+    pool is split temporally. ``holdout`` defaults to holding out the fault-burst
+    rare-event family and the severe-shift pack, demonstrating the guarantee. The
+    final assignment is checked with :func:`assert_disjoint_splits` so a decision
+    hash can never cross splits.
     """
+    if holdout is None:
+        # Default demo holdout: withhold the gpu_fault_burst (high band) rare-event
+        # family and every severe-shift pack, so the model must extrapolate the
+        # mechanics rather than memorise them (doc D test_rare_events / severe).
+        holdout = HoldoutPolicy(
+            held_out_rare_events=frozenset({"gpu_fault_burst:high"}),
+            hold_out_severe_shift=True,
+        )
+
     packs: list[tuple[str, int, CounterfactualPack]] = []
     for scen in scenarios:
         for seed in seeds:
             packs.append((scen, seed, generate_pack(seed=seed, scenario=scen)))
 
-    # deterministic index-based split (the demo packs share one t0)
+    # Temporal split is applied only over the SEEN pool (held-out families are
+    # diverted first). We stage each window's t0 by index so the seen pool has a
+    # well-defined temporal order even though the demo packs share a nominal t0.
     n = len(packs)
     train_end = int(n * train_frac)
     val_end = int(n * (train_frac + val_frac))
@@ -296,27 +349,61 @@ def build_demo_release(
     windows: list[DecisionWindow] = []
     labels: list[LabelPack] = []
     seed_registry: dict[str, int] = {}
+    assignments: list[tuple[str, Split]] = []
     for i, (scen, seed, pack) in enumerate(packs):
-        split = (
-            Split.TRAIN
-            if i < train_end
-            else (Split.VAL if i < val_end else Split.TEST_TEMPORAL)
-        )
+        fams = scenario_families(scen)
         # rebuild a minimal pre-action state carrier for the t0 timestamp; the
         # pack already owns the authoritative state_hash + seed_bundle.
         carrier = WorldState(ts_ns=int(1000.0 * 1e9))
+        # Build the window first (split is reassigned below from its families).
         window, labs = build_window(
             carrier,
             pack,
-            split=split,
+            split=Split.TRAIN,
             scenario_family=scen,
             source_mix=Origin.SIM_COUNTERFACTUAL,
             generator_commit=generator_commit,
             provenance_uri=f"provenance/transform_manifest.jsonl#{pack.state_hash}",
         )
+        # The decision identity for splitting is the pre-action state hash PLUS the
+        # scenario/rare-event regime: the rare-event onset is part of the
+        # counterfactual scenario, not the frozen pre-state, so two scenarios that
+        # share a pre-action hash but differ in rare-event family are *different
+        # decisions* and must be allowed to land in different suites without
+        # tripping the disjointness guard (doc D: a decision hash never crosses
+        # splits — the decision id encodes the intervention regime).
+        qualified_id = f"{pack.state_hash}@{scen}"
+        window.decision_id = qualified_id
+        for lab in labs:
+            lab.decision_id = qualified_id
+        # Per-action severity: the scenario's severity for placement actions, 0 for
+        # hold (hold is the null intervention).
+        severities = {
+            aid: (0.0 if aid.split(":")[1] == "hold" else float(fams["severity"]))
+            for aid in window.candidate_action_ids
+        }
+        desc = descriptor_from_window(
+            window,
+            topology_family=str(fams["topology_family"]),
+            rare_event_family=str(fams["rare_event_family"]),
+            severities=severities,
+            severe_shift=bool(fams["severe_shift"]),
+        )
+        split = assign_split(
+            desc,
+            holdout,
+            t0_ns=i,  # index-as-time over the seen pool (deterministic order)
+            train_end_ns=train_end,
+            val_end_ns=val_end,
+        )
+        window.split = split
         windows.append(window)
         labels.extend(labs)
+        assignments.append((window.decision_id, split))
         seed_registry[f"{scen}:{seed}"] = seed
+
+    # Disjointness guarantee: no decision hash crosses splits (doc D invariant).
+    assert_disjoint_splits(assignments)
 
     manifest = build_manifest(
         generator_commit=generator_commit,
@@ -340,5 +427,6 @@ __all__ = [
     "build_data_card",
     "build_demo_release",
     "compute_stats",
+    "scenario_families",
     "windows_payload",
 ]

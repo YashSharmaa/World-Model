@@ -39,6 +39,13 @@ export interface StoreState {
   mode: StudioMode;
   snapshot: StateSnapshotDTO | null;
   compare: CompareResultDTO | null;
+  /**
+   * The exact CandidateAction commands sent to /actions/compare for the active
+   * compare result, keyed by action_id. The why-not card looks up the full
+   * (type + params) command here instead of re-synthesising it, so the exact
+   * blocker certificate is computed for the real submitted action.
+   */
+  compareCandidates: Record<string, CandidateAction>;
   /** action_ids pinned for counterfactual compare (max 3 — doc G stability). */
   pinnedActions: string[];
   focusedWorkload: string | null;
@@ -68,6 +75,7 @@ export class Store {
       mode: "decision-studio",
       snapshot: null,
       compare: null,
+      compareCandidates: {},
       pinnedActions: [],
       focusedWorkload: null,
       selection: null,
@@ -165,7 +173,14 @@ export class Store {
   }
 
   setFocusedWorkload(uid: string | null): void {
-    this.set({ focusedWorkload: uid, compare: null, pinnedActions: [] });
+    this.set({
+      focusedWorkload: uid,
+      compare: null,
+      compareCandidates: {},
+      pinnedActions: [],
+      whyNotActionId: null,
+      cursorS: 0,
+    });
   }
 
   setHorizon(horizonS: number): void {
@@ -174,39 +189,75 @@ export class Store {
 
   // ── compare / branches ────────────────────────────────────────────────
   /**
-   * Build the kernel-safe candidate alphabet for the focused workload and ask
-   * the backend to rank + roll them out. In v1 the mock backend certifies three
-   * safe actions; the real serving layer enumerates the kernel's safe set.
+   * Build the kernel-safe candidate ALPHABET for the focused workload directly
+   * from the snapshot — `hold` plus one `admit_and_place` per rack domain in
+   * `topology_domains` — and ask the backend to rank + roll them out.
+   *
+   * The candidate alphabet is derived, never hardcoded:
+   *   - `hold` (the declared baseline) is always present.
+   *   - the highest-headroom feasible rack domain becomes the primary admit
+   *     target (clean block, recommended branch).
+   *   - a deliberately INFEASIBLE rack domain is also included so the exact
+   *     kernel's BLOCKED / why-not path is exercised. A domain is infeasible
+   *     here when it cannot host the workload's whole required gang
+   *     (`free_gpu < gpu_req`) — e.g. the nearly-full / drained `dom-rack-b2`.
+   *
+   * Candidate count is kept shape-stable at three (doc G / MLX compile rule):
+   * baseline hold + one feasible admit + one blocked admit.
    */
   async runCompare(): Promise<void> {
     const snap = this.state.snapshot;
     const wl = this.state.focusedWorkload;
     if (!snap || !wl) return;
 
+    const workload = snap.entities.workloads.find((w) => w.workload_uid === wl);
+    const gpuReq = workload?.gpu_req ?? 16;
+    const domainPolicy = workload?.topology_policy ?? "required";
+
+    // Rack-level domains only (a gang lands in exactly one rack domain when the
+    // topology policy is `required` — doc S gang_atomicity).
+    const rackDomains = snap.entities.topology_domains.filter(
+      (d) => d.level === "rack",
+    );
+
+    const buildAdmit = (actionId: string, domainId: string): CandidateAction => ({
+      action_id: actionId,
+      type: "admit_and_place",
+      params: {
+        workload_uid: wl,
+        cluster_queue_id: workload?.cluster_queue_id ?? "cq-shared",
+        resource_flavor_id: "h100-80g",
+        domain_policy: domainPolicy,
+        domain_id_or_set: [domainId],
+      },
+    });
+
+    // Feasible target: the rack domain with the most free GPUs that can host the
+    // whole gang. Falls back to the highest-headroom domain if none fit.
+    const feasible = rackDomains
+      .filter((d) => d.free_gpu >= gpuReq)
+      .sort((a, b) => b.free_gpu - a.free_gpu);
+    const feasibleDomain =
+      feasible[0]?.domain_id ??
+      [...rackDomains].sort((a, b) => b.headroom_score - a.headroom_score)[0]
+        ?.domain_id ??
+      "dom-rack-a1";
+
+    // Infeasible target: prefer the canonical drained rack `dom-rack-b2` when it
+    // is present and genuinely cannot host the gang; otherwise pick the tightest
+    // rack domain that still fails the gang-atomicity capacity test.
+    const blockedCandidates = rackDomains
+      .filter((d) => d.free_gpu < gpuReq && d.domain_id !== feasibleDomain)
+      .sort((a, b) => a.free_gpu - b.free_gpu);
+    const blockedDomain =
+      blockedCandidates.find((d) => d.domain_id === "dom-rack-b2")?.domain_id ??
+      blockedCandidates[0]?.domain_id ??
+      "dom-rack-b2";
+
     const candidates: CandidateAction[] = [
       { action_id: "hold", type: "hold", params: { workload_uid: wl, hold_windows: 1 } },
-      {
-        action_id: "admit-a",
-        type: "admit_and_place",
-        params: {
-          workload_uid: wl,
-          cluster_queue_id: "cq-shared",
-          resource_flavor_id: "h100-80g",
-          domain_policy: "required",
-          domain_id_or_set: ["dom-rack-a1"],
-        },
-      },
-      {
-        action_id: "admit-b",
-        type: "admit_and_place",
-        params: {
-          workload_uid: wl,
-          cluster_queue_id: "cq-shared",
-          resource_flavor_id: "h100-80g",
-          domain_policy: "required",
-          domain_id_or_set: ["dom-rack-b1"],
-        },
-      },
+      buildAdmit("admit-a", feasibleDomain),
+      buildAdmit("admit-b", blockedDomain),
     ];
 
     const compare = await this.client.compareActions({
@@ -215,11 +266,26 @@ export class Store {
       horizon_s: this.state.horizonS,
       include_rollouts: true,
     });
+
+    // Pin the safe survivors first so the blocked branch never crowds out a
+    // playable ghost, while still keeping the blocked branch pinnable for its
+    // lock badge. Keep the candidate map so why-not can recover type + params.
+    const safeFirst = [...compare.candidates].sort((a, b) => {
+      if (a.safe !== b.safe) return a.safe ? -1 : 1;
+      return (a.rank ?? 99) - (b.rank ?? 99);
+    });
     this.set({
       compare,
-      pinnedActions: compare.candidates.slice(0, MAX_PINNED).map((c) => c.action_id),
+      compareCandidates: Object.fromEntries(candidates.map((c) => [c.action_id, c])),
+      pinnedActions: safeFirst.slice(0, MAX_PINNED).map((c) => c.action_id),
       cursorS: 0,
+      whyNotActionId: null,
     });
+  }
+
+  /** The exact CandidateAction command submitted for `actionId`, or null. */
+  candidateAction(actionId: string): CandidateAction | null {
+    return this.state.compareCandidates[actionId] ?? null;
   }
 
   togglePinned(actionId: string): void {
@@ -231,13 +297,83 @@ export class Store {
     }
   }
 
+  /**
+   * Bring one branch to the front of the pinned set so the grounded scene plays
+   * THAT action's rollout (golden-path beats "play A", "play B", "play hold").
+   * Switches to counterfactual-compare so the renderer drives occupancy from
+   * `pinnedActions[0]` (fixed camera, shared cursor — doc G compare rule), then
+   * rewinds the cursor and plays from t=0.
+   */
+  playBranch(actionId: string): void {
+    if (!this.state.compare) return;
+    const exists = this.state.compare.candidates.some(
+      (c) => c.action_id === actionId,
+    );
+    if (!exists) return;
+    const rest = this.state.pinnedActions.filter((a) => a !== actionId);
+    const ordered = [actionId, ...rest].slice(0, MAX_PINNED);
+    this.set({
+      mode: "counterfactual-compare",
+      pinnedActions: ordered,
+      cursorS: 0,
+      playing: true,
+      whyNotActionId: null,
+    });
+  }
+
+  /**
+   * Freeze the shared time cursor at the horizon (or a given time) so the delta
+   * ribbon can be read at the end-of-horizon outcome — golden-path beat "Freeze
+   * and compare". Stops playback; the scene holds on the frozen rollout point.
+   */
+  freezeAt(tS: number = this.state.horizonS): void {
+    this.set({
+      playing: false,
+      cursorS: Math.max(0, Math.min(this.state.horizonS, tS)),
+    });
+  }
+
   // ── why-not ───────────────────────────────────────────────────────────
+  /**
+   * Open the why-not card for a rejected action (golden-path beat "Show
+   * why-not"). The rejected branch is also pinned so its scene-graph lock badge
+   * lights up alongside the card (doc G: "Rejected option gets a lock badge and
+   * a why-not card listing exact blockers and predicted downside").
+   */
   async showWhyNot(actionId: string): Promise<void> {
-    this.set({ whyNotActionId: actionId });
+    const cur = this.state.pinnedActions;
+    const pinned = cur.includes(actionId)
+      ? cur
+      : [...cur, actionId].slice(0, MAX_PINNED);
+    this.set({ whyNotActionId: actionId, pinnedActions: pinned });
   }
 
   clearWhyNot(): void {
     this.set({ whyNotActionId: null });
+  }
+
+  /**
+   * Golden-path beat "Resolve to recommendation": close the why-not card, return
+   * to decision-studio (where the renderer brightens the recommended branch and
+   * dims the alternatives), re-pin the recommended branch first, and replay it
+   * from t=0 so the demo ends on the bright recommended future.
+   */
+  resolveToRecommendation(): void {
+    const cmp = this.state.compare;
+    const recId = cmp?.recommended_action_id ?? null;
+    const ordered = recId
+      ? [
+          recId,
+          ...this.state.pinnedActions.filter((a) => a !== recId),
+        ].slice(0, MAX_PINNED)
+      : this.state.pinnedActions;
+    this.set({
+      mode: "decision-studio",
+      whyNotActionId: null,
+      pinnedActions: ordered,
+      cursorS: 0,
+      playing: true,
+    });
   }
 
   // ── replay ────────────────────────────────────────────────────────────

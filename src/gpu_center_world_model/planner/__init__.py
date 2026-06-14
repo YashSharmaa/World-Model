@@ -79,45 +79,45 @@ from .why_not import (
 )
 
 __all__ = [
+    "LEDGER_KINDS",
+    "LEX_FIELDS",
+    "AbstainDecision",
+    # ledger
+    "ExplanationLedger",
+    "LedgerEntry",
+    "LexWeights",
+    "PlannerResult",
+    "RankNote",
+    "RiskAssessment",
+    "RiskNote",
+    "SafeRegret",
     # contracts
     "ScoredAction",
-    "LedgerEntry",
-    "PlannerResult",
     # planner + evaluation
     "ShieldedPlanner",
-    "safe_regret",
-    "SafeRegret",
+    "WhyNotCard",
+    "action_id_for",
+    "aggregate_abstention",
+    # risk gate
+    "assess_risk",
+    "blockers_card",
+    # scoring
+    "build_lex_key",
+    # why-not
+    "compose_why_not",
+    "conformal_upper_for",
+    "cvar_from_margin",
     # enumeration
     "enumerate_safe_candidates",
     "filter_by_policy_whitelist",
-    "action_id_for",
-    # scoring
-    "build_lex_key",
-    "lex_key_components",
-    "scalar_embedding",
-    "LexWeights",
-    "LEX_FIELDS",
-    # risk gate
-    "assess_risk",
-    "passes_risk_gate",
-    "RiskAssessment",
     "hazard_budget_map",
-    "conformal_upper_for",
-    "cvar_from_margin",
+    "lex_key_components",
+    "observation_integrity_bad_prob",
+    "passes_risk_gate",
+    "rank_card",
+    "risk_card",
+    "safe_regret",
+    "scalar_embedding",
     # abstain
     "should_abstain",
-    "aggregate_abstention",
-    "observation_integrity_bad_prob",
-    "AbstainDecision",
-    # why-not
-    "compose_why_not",
-    "blockers_card",
-    "risk_card",
-    "rank_card",
-    "WhyNotCard",
-    "RiskNote",
-    "RankNote",
-    # ledger
-    "ExplanationLedger",
-    "LEDGER_KINDS",
 ]

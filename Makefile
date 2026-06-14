@@ -16,7 +16,7 @@ help:
 	@echo "  make docs       build the docs site"
 
 dev:
-	uv sync --extra dev --extra serve --extra data --extra baselines || pip install -e ".[dev,serve,data,baselines]"
+	uv sync --frozen --extra dev --extra serve --extra data --extra baselines || pip install -e ".[dev,serve,data,baselines]"
 
 test:
 	pytest

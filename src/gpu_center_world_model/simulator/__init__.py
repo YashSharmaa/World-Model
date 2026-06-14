@@ -55,31 +55,31 @@ from .rare_events import (
 )
 
 __all__ = [
-    # contracts (re-exported so the package presents one surface)
-    "ExactKernel",
-    "BranchRunnerProtocol",
-    "BranchRoot",
-    "FeasibilityResult",
-    "WhyNot",
+    "RARE_EVENTS",
     "Blocker",
     "BlockerGroup",
+    "BranchRoot",
+    "BranchRunner",
+    "BranchRunnerProtocol",
+    # contracts (re-exported so the package presents one surface)
+    "ExactKernel",
     # kernel + branch runner
     "ExactSymbolicKernel",
-    "BranchRunner",
+    "FeasibilityResult",
     "ResidualFn",
     "ResidualTransition",
-    "build_topology_index",
+    "WhyNot",
+    "apply_event",
     "build_health_masks",
+    "build_topology_index",
+    "cooling_derate",
+    "gpu_fault_burst",
+    "maintenance_mask",
+    "pods_ready_timeout",
+    "power_derate",
+    "queue_burst",
     "quota_check",
     # rare events
     "rare_events",
-    "RARE_EVENTS",
-    "apply_event",
-    "gpu_fault_burst",
-    "pods_ready_timeout",
-    "cooling_derate",
-    "power_derate",
-    "queue_burst",
-    "maintenance_mask",
     "telemetry_degradation",
 ]

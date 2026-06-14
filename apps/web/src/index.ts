@@ -59,4 +59,4 @@ export { createTextSprite, buildRackLabels, createCreditPlate } from "./scene/la
 export { createPostFX } from "./render/postfx";
 export type { PostFX } from "./render/postfx";
 export { CinematicDirector, SHOTS, defaultGoldenPath } from "./anim/director";
-export type { Shot, Beat } from "./anim/director";
+export type { Shot, Beat, CaptionSink } from "./anim/director";

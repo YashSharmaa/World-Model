@@ -66,6 +66,7 @@ from ...schema.actions import (
 from ...schema.entities import (
     Workload,
     WorkloadStatus,
+    admission_checks_positive,
 )
 from ...schema.state import SymbolicState, WorldState
 from ..contracts import FeasibilityResult, WhyNot
@@ -86,12 +87,29 @@ def _copy_symbolic(symbolic: SymbolicState) -> SymbolicState:
     deep-copy *those* tables (and the affected dataclasses) and share the rest by
     reference. This keeps the transition allocation-light at demo-pod scale while
     never mutating the caller's input state.
+
+    ClusterQueue carries the per-(flavor, resource) ``reserved_by_resource`` /
+    ``borrowed_by_resource`` *nested* ledgers that ``step`` mutates in place; a
+    plain :func:`replace` shallow-copies the queue but would alias those nested
+    dicts back into the caller's state, leaking the admission. We therefore clone
+    the nested ledgers explicitly so the transition is genuinely pure.
     """
     return replace(
         symbolic,
         workloads={k: replace(v) for k, v in symbolic.workloads.items()},
         podsets={k: replace(v) for k, v in symbolic.podsets.items()},
-        cluster_queues={k: replace(v) for k, v in symbolic.cluster_queues.items()},
+        cluster_queues={
+            k: replace(
+                v,
+                reserved_by_resource={
+                    f: dict(r) for f, r in v.reserved_by_resource.items()
+                },
+                borrowed_by_resource={
+                    f: dict(r) for f, r in v.borrowed_by_resource.items()
+                },
+            )
+            for k, v in symbolic.cluster_queues.items()
+        },
         nodes={k: replace(v) for k, v in symbolic.nodes.items()},
         gpus={k: replace(v) for k, v in symbolic.gpus.items()},
         domains={k: replace(v) for k, v in symbolic.domains.items()},
@@ -174,8 +192,12 @@ class ExactSymbolicKernel:
             flavors = self._candidate_flavors(symbolic, wl)
             for q in queues:
                 for f in flavors:
-                    # Singleton quota screen before placement work.
+                    # Singleton admission-check + quota screens before placement
+                    # work (doc S latency_budget.pruning: cheap exact screens
+                    # first). chi_qf = 0 gates the (q, f) admit outright (E5).
                     cq = symbolic.cluster_queues[q]
+                    if not admission_checks_positive(cq, f):
+                        continue
                     cohort = quota_mod.resolve_cohort(symbolic.cluster_queues, cq)
                     demand = quota_mod.workload_demand(
                         [
@@ -274,6 +296,20 @@ class ExactSymbolicKernel:
             wl.age_s += 0.0  # defer: age accrues via the time process, not here
             return new_state
 
+        # ── C4: exact integer recheck of the returned assignment (doc S) ───────
+        # Before committing any mutation, re-verify the placement solver's integer
+        # assignment with deterministic integer arithmetic: every podset is bound
+        # all-or-nothing (sum_n x_pn == c_p) and every target node has enough free
+        # *healthy* GPUs and pod headroom for what we are about to bind
+        # (bound == self_bound, per-node capacity). If the recheck fails we abort
+        # to a no-op rather than emit a possibly-inconsistent allocation (T13).
+        if (
+            isinstance(action, (Place, AdmitAndPlace))
+            and result.assignment
+            and not self._c4_integer_recheck(new_symbolic, wl, result.assignment)
+        ):
+            return new_state  # C4 violation -> no-op
+
         # admit / admit_and_place reserve quota.
         if isinstance(action, (Admit, AdmitAndPlace)):
             cq = new_symbolic.cluster_queues.get(action.cluster_queue_id)
@@ -293,7 +329,22 @@ class ExactSymbolicKernel:
                 )
                 gpu_demand = demand.get("gpu", 0.0)
                 borrow_gpu = qd.borrow.get("gpu", 0.0)
-                quota_mod.apply_admission(cq, gpu_demand, borrow_gpu)
+                # Reserve across the full hard-resource set R = {gpu, cpu, mem,
+                # pods}, not just gpu, so a sequence of admissions correctly
+                # decrements declared cpu/mem/pods quota and bounds borrowing
+                # (doc S, Eq. E11/E12 for all r). The ``pods`` demand is the
+                # gang's replica count (one pod per replica).
+                pods_demand = sum(p.count for p in wl.podsets)
+                full_demand = dict(demand)
+                full_demand["pods"] = float(pods_demand)
+                quota_mod.apply_admission(
+                    cq,
+                    gpu_demand,
+                    borrow_gpu,
+                    flavor_id=action.resource_flavor_id,
+                    demand=full_demand,
+                    borrow=qd.borrow,
+                )
                 wl.admitted_flavor_id = action.resource_flavor_id
             wl.status = WorkloadStatus.RESERVING
 
@@ -373,6 +424,88 @@ class ExactSymbolicKernel:
         return tuple(label.split("+"))
 
     @staticmethod
+    def _c4_integer_recheck(
+        symbolic: SymbolicState,
+        wl: Workload,
+        assignment: dict[str, dict[str, int]],
+    ) -> bool:
+        """Exact deterministic integer recheck of an assignment (doc S, C4 / T13).
+
+        Returns ``True`` iff the assignment is committable with *no* modeled hard
+        violation, verified with integer arithmetic only:
+
+        * **Gang atomicity (E6).** For every podset ``p`` the assignment's total
+          replica count over nodes equals the gang demand ``c_p`` — never a
+          partial subset.
+        * **Per-node GPU availability.** Each target node has at least
+          ``self_bound = sum_p replicas_pn * gpu_req_p`` *free healthy* GPUs (the
+          ``bound == self_bound`` condition the binder relies on). We count
+          free, ``HEALTHY``, unallocated devices physically on the node.
+        * **Per-node pod / capacity headroom (E9).** Accumulated pods, cpu, and
+          mem across all podsets landing on a node fit its declared residual.
+
+        Any failure aborts the transition to a no-op rather than emit a possibly
+        inconsistent allocation. This closes the C4 gap even if an upstream solver
+        used float tolerances internally.
+        """
+        from ...schema.entities import DeviceHealth
+
+        req_by_podset = {p.name: p for p in wl.podsets}
+
+        # E6: gang all-or-nothing per podset.
+        for p in wl.podsets:
+            placed = sum(assignment.get(p.name, {}).values())
+            if placed != p.count:
+                return False
+
+        # Per-node accumulation of the integer demand this assignment imposes.
+        gpu_need: dict[str, int] = {}
+        cpu_need: dict[str, float] = {}
+        mem_need: dict[str, float] = {}
+        for podset_name, node_map in assignment.items():
+            p = req_by_podset.get(podset_name)
+            if p is None:
+                return False  # assignment references an unknown podset
+            for node_uid, replicas in node_map.items():
+                if replicas < 0:
+                    return False
+                gpu_need[node_uid] = gpu_need.get(node_uid, 0) + replicas * int(
+                    p.gpu_req
+                )
+                cpu_need[node_uid] = cpu_need.get(node_uid, 0.0) + replicas * p.cpu_req
+                mem_need[node_uid] = (
+                    mem_need.get(node_uid, 0.0) + replicas * p.mem_req_gb
+                )
+
+        eps = 1e-9
+        for node_uid, need_gpu in gpu_need.items():
+            node = symbolic.nodes.get(node_uid)
+            if node is None:
+                return False
+            # Free *healthy* GPU devices physically on this node.
+            free_healthy = sum(
+                1
+                for g in symbolic.gpus.values()
+                if g.node_uid == node_uid
+                and g.allocated_to is None
+                and g.health_state is DeviceHealth.HEALTHY
+            )
+            # When the symbolic state carries no per-GPU inventory for this node,
+            # fall back to the declared free GPU capacity (cap - 0 here, since the
+            # snapshot residual is the declared gpu_cap for inventory-less nodes).
+            has_inventory = any(g.node_uid == node_uid for g in symbolic.gpus.values())
+            avail_gpu = free_healthy if has_inventory else node.gpu_cap
+            if need_gpu > avail_gpu:
+                return False
+            # Per-node cpu + mem headroom (E9), exact comparisons with an epsilon
+            # only to absorb float representation of integer-derived demands.
+            if node.cpu_alloc + cpu_need[node_uid] > node.cpu_cap + eps:
+                return False
+            if node.mem_alloc_gb + mem_need[node_uid] > node.mem_cap_gb + eps:
+                return False
+        return True
+
+    @staticmethod
     def _bind_assignment(
         symbolic: SymbolicState,
         wl: Workload,
@@ -382,8 +515,9 @@ class ExactSymbolicKernel:
 
         Decrements free capacity on each target node deterministically. This is
         the symbolic placement transition: it consumes the exact integer GPU /
-        pod counts the placement solver produced (Condition C4 — integer recheck
-        is implicit since we only add integer replica counts).
+        pod counts the placement solver produced. The assignment has already
+        passed :meth:`_c4_integer_recheck` (Condition C4), so ``bound`` always
+        reaches ``self_bound`` here; the binder is therefore a pure commit.
         """
         # Map podset name -> per-replica request for capacity bookkeeping.
         req_by_podset = {p.name: p for p in wl.podsets}

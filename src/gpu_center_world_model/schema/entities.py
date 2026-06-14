@@ -173,12 +173,31 @@ class ClusterQueue:
     nominal_quota: dict[str, dict[str, float]] = field(default_factory=dict)
     borrowing_limit: dict[str, dict[str, float]] = field(default_factory=dict)
     lending_limit: dict[str, dict[str, float]] = field(default_factory=dict)
+    # AdmissionCheck gate (doc S, Eq. E5 / Definition D5/D15; Kueue AdmissionChecks
+    # are a hard post-quota gate — Kueue admits only once *all* required checks are
+    # positive). ``admission_check_state`` is the per-flavor conjunction
+    # ``chi_qf(s) in {0, 1}``: ``True`` means every required check for this
+    # (queue, flavor) is currently positive (READY); ``False`` means at least one
+    # required check is pending/retried/rejected and the (q, f) admission is
+    # gated. The synthetic key ``"*"`` is the queue-wide default applied to any
+    # flavor without an explicit entry; an absent map means "no checks required"
+    # (the gate is vacuously satisfied — Eq. E5 with chi_qf = 1).
+    admission_check_state: dict[str, bool] = field(default_factory=dict)
     # dynamic
     reserved_gpu: float = 0.0
     borrowed_gpu: float = 0.0
     pending_gpu: float = 0.0
     weighted_share: float = 0.0
     active_workloads: int = 0
+    # Per-(flavor, resource) dynamic reservation/borrow counters for the full
+    # hard-resource set R = {gpu, cpu, mem, pods} (doc S, Definition D1 +
+    # Eq. E11/E12). ``reserved_gpu`` / ``borrowed_gpu`` above remain the legacy
+    # GPU-only scalars (kept byte-stable for downstream importers); these nested
+    # maps are the authoritative per-resource ledger the exact kernel decrements
+    # across a sequence of admissions so cpu/mem/pods quota and borrowing are
+    # bounded, not just GPU. Keyed ``[flavor][resource] -> amount``.
+    reserved_by_resource: dict[str, dict[str, float]] = field(default_factory=dict)
+    borrowed_by_resource: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -191,6 +210,71 @@ class ResourceFlavor:
     topology_name: str | None = None
     nominal_quota_by_resource: dict[str, float] = field(default_factory=dict)
     borrow_limit_by_resource: dict[str, float] = field(default_factory=dict)
+
+
+class AdmissionCheckState(str, Enum):
+    """Disposition of a single Kueue ``AdmissionCheck`` for a (queue, flavor).
+
+    Kueue admits a Workload only once *every* referenced AdmissionCheck reaches
+    ``READY``; ``PENDING``/``RETRY``/``REJECTED`` all hold admission (doc S,
+    Eq. E5; doc C scheduler_state ``admission_check_state``). Only ``READY`` is
+    positive in the conjunction ``chi_qf(s)``.
+    """
+
+    READY = "ready"
+    PENDING = "pending"
+    RETRY = "retry"
+    REJECTED = "rejected"
+
+    @property
+    def is_positive(self) -> bool:
+        """True iff this check contributes a positive literal to ``chi_qf``."""
+        return self is AdmissionCheckState.READY
+
+
+@dataclass(slots=True)
+class AdmissionCheck:
+    """A named hard post-quota admission gate (Kueue ``AdmissionCheck`` object).
+
+    The exact kernel's E5 screen reads the *conjunction* of all required checks
+    for a (queue, flavor); this typed entity is the read-model / audit record of a
+    single check's controller, target flavors, and current disposition.
+    """
+
+    name: str
+    controller: str = "manual"
+    #: flavors this check applies to ("*" or empty means all flavors of the queue)
+    target_flavors: list[str] = field(default_factory=list)
+    state: AdmissionCheckState = AdmissionCheckState.READY
+    required: bool = True
+    message: str = ""
+
+
+#: Default key in ``ClusterQueue.admission_check_state`` applied to any flavor
+#: without an explicit per-flavor entry (the queue-wide check conjunction).
+ADMISSION_CHECK_DEFAULT_KEY = "*"
+
+
+def admission_checks_positive(cq: ClusterQueue, flavor_id: str) -> bool:
+    """Exact AdmissionCheck conjunction ``chi_qf(s) in {0, 1}`` (doc S, Eq. E5).
+
+    Returns ``True`` (the gate is satisfied, ``chi_qf = 1``) iff the (queue,
+    flavor) has no recorded required admission check or every recorded check is
+    positive (READY). The per-flavor entry takes precedence; otherwise the
+    queue-wide default key :data:`ADMISSION_CHECK_DEFAULT_KEY` applies. An empty
+    ``admission_check_state`` means no checks are required, so admission is *not*
+    gated here (vacuous conjunction is true) — faithful to Kueue, where a
+    ClusterQueue without ``admissionChecks`` admits on quota alone.
+    """
+    state = cq.admission_check_state
+    if not state:
+        return True
+    if flavor_id in state:
+        return bool(state[flavor_id])
+    if ADMISSION_CHECK_DEFAULT_KEY in state:
+        return bool(state[ADMISSION_CHECK_DEFAULT_KEY])
+    # A per-flavor map exists but this flavor is unlisted -> no check for it.
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -324,6 +408,8 @@ class OperatorPolicy:
 
 
 # Convenient registry of all entity types (used by tensorizer & docs generation).
+# NOTE: ``admission_check`` is appended (never reorder existing members) so
+# positional consumers of ENTITY_TYPES stay byte-stable.
 ENTITY_TYPES: tuple[str, ...] = (
     "workload",
     "podset",
@@ -338,11 +424,15 @@ ENTITY_TYPES: tuple[str, ...] = (
     "power_domain",
     "cooling_zone",
     "operator_policy",
+    "admission_check",
 )
 
 __all__ = [
+    "ADMISSION_CHECK_DEFAULT_KEY",
     "ENTITY_TYPES",
     "GPU",
+    "AdmissionCheck",
+    "AdmissionCheckState",
     "ClusterQueue",
     "CommClass",
     "CoolingZone",
@@ -361,4 +451,5 @@ __all__ = [
     "TopologyPolicy",
     "Workload",
     "WorkloadStatus",
+    "admission_checks_positive",
 ]

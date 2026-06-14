@@ -72,6 +72,17 @@ jobs:
       - name: Typecheck (pyright)
         run: pyright
 
+      # Doc H "Static checks": JSON-schema + manifest-shape validation. Fails on
+      # any drift between the generated schemas and the contracts, on any sample
+      # pack file that violates its schema, or on a provenance manifest missing
+      # the reproducibility-gate fields (schema_hash / feature_stats /
+      # benchmark_manifest). Runs before the longer pytest/replay jobs.
+      - name: Validate JSON schemas + sample pack + manifest shape
+        run: |
+          python scripts/gen_json_schema.py --check
+          python scripts/validate_schemas.py
+          python -m pytest -ra -q scripts/test_repro_gates.py
+
       - name: Test (pytest core, no MLX/slow)
         run: pytest -ra -q -m "not mlx and not slow" --cov=gpu_center_world_model --cov-report=xml
 
@@ -120,3 +131,33 @@ jobs:
 
       - name: Local-demo parity (deterministic safe-set replay)
         run: pytest -ra -q -m "not slow" tests/golden tests/integration
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Reproducibility gate (doc H): the committed uv.lock must be in sync with
+  # pyproject and must resolve with --frozen. This keeps installs replayable
+  # (`uv sync --frozen`) for every contributor; uv documents the lockfile as the
+  # reproducibility mechanism. Authoritative — blocks the merge gate.
+  # ───────────────────────────────────────────────────────────────────────────
+  lockfile:
+    name: lockfile (uv --frozen)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `uv lock --check` fails if uv.lock is stale relative to pyproject.toml;
+      # `uv sync --frozen` then proves the committed lock resolves end-to-end
+      # without ever rewriting it (mirrors `make dev`).
+      - name: Verify lock is in sync with pyproject
+        run: uv lock --check
+
+      - name: Install from the frozen lock
+        run: uv sync --frozen --extra dev --extra serve --extra data --extra baselines

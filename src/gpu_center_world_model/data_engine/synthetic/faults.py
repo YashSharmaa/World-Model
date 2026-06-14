@@ -72,12 +72,70 @@ _BUNDLE: dict[str, list[tuple[str, float, float]]] = {
 
 @dataclass(slots=True)
 class FaultParams:
-    """Calibrated fault hazard parameters (sampled from posteriors, doc D)."""
+    """Fault-hazard parameters (doc R, Eq14 parent intensity).
+
+    .. note::
+
+        These defaults are **uncalibrated priors** (doc D randomization_rules
+        ``calibrated_bounds_only`` tier — "failure base rates ... fit to real
+        traces first; then randomize from fitted posteriors"). They are a
+        physically-plausible prior centre, *not* a fit. :mod:`...synthetic.sysid`
+        fits the base hazard from labelled fault traces and samples calibrated
+        draws from the joint posterior; treat these as a prior until then.
+    """
 
     base_parent_rate_hz: float = 2e-6  # per-GPU baseline parent intensity
     health_boost: float = 8.0  # multiplier when GPU already degraded
     thermal_boost: float = 4.0  # multiplier per K of excess thermal margin loss
     family_weights: tuple[float, float, float] = (0.5, 0.3, 0.2)
+
+
+@dataclass(slots=True)
+class HazardResidual:
+    """Parameter-modulating fault-hazard residual (doc N, H1-H2 / TP3).
+
+    The parent intensity (doc R, Eq14) is ``λ = base · b_f(H, C)``. We modulate
+    the *log-hazard* multiplicatively — the natural parameterisation for an
+    exponential-family point process (Eq14 already writes ``λ = exp{θᵀχ + b}``) —
+    so the modulated intensity is ``λ_eff = base · exp(δ_base) · b_f`` with the
+    health/thermal boosts themselves re-scaled in log-space::
+
+        base_eff   = base · exp(δ_log_base)
+        health_eff = health_boost · exp(δ_log_health)
+        thermal_eff= thermal_boost · exp(δ_log_thermal)
+
+    All factors stay strictly positive (exp is positive) so the proposal remains a
+    valid intensity — the rare-event likelihood-ratio accounting in
+    :mod:`rare_events` is unaffected. Conditioning the residual on missingness /
+    source-health is the doc N TP3 recommendation (telemetry failures are state).
+
+    DEFAULT IS IDENTITY (TP1): all log-deltas zero ⇒ ``λ_eff = λ`` exactly.
+    """
+
+    log_base: float = 0.0
+    log_health: float = 0.0
+    log_thermal: float = 0.0
+
+    @property
+    def is_identity(self) -> bool:
+        return (
+            self.log_base == 0.0
+            and self.log_health == 0.0
+            and self.log_thermal == 0.0
+        )
+
+    def apply(self, params: FaultParams) -> FaultParams:
+        """Return a FaultParams with the hazard factors re-modulated (log-space)."""
+        if self.is_identity:
+            return params
+        from math import exp
+
+        return FaultParams(
+            base_parent_rate_hz=params.base_parent_rate_hz * exp(self.log_base),
+            health_boost=params.health_boost * exp(self.log_health),
+            thermal_boost=params.thermal_boost * exp(self.log_thermal),
+            family_weights=params.family_weights,
+        )
 
 
 @dataclass(slots=True)
@@ -119,6 +177,7 @@ def sample_fault_cluster(
     health_state: dict[str, str] | None = None,
     thermal_excess_c: dict[str, float] | None = None,
     rate_tilt: float = 1.0,
+    residual: HazardResidual | None = None,
 ) -> list[FaultEvent]:
     """Sample the marked parent-offspring fault process over the horizon.
 
@@ -128,11 +187,17 @@ def sample_fault_cluster(
         Importance-sampling multiplier on the parent hazard (doc R, EQUATION
         Eq22). The likelihood-ratio accounting is computed in :mod:`rare_events`;
         here we only tilt the proposal. ``rate_tilt = 1`` is the nominal process.
+    residual:
+        Optional learned hazard residual (doc N, H1-H2). ``None`` or identity
+        (TP1 default) leaves the calibrated hazard untouched; once trained it
+        re-modulates the base/health/thermal log-hazard factors before sampling.
 
     Each parent is drawn from a thinned Poisson process whose intensity is tilted
     by device health and thermal stress; the descendant bundle is attached
     deterministically from ``_BUNDLE`` so incidents stay coherent.
     """
+    if residual is not None and not residual.is_identity:
+        params = residual.apply(params)
     health_state = health_state or {}
     thermal_excess_c = thermal_excess_c or {}
     weights = np.array(params.family_weights, dtype=float)
@@ -196,6 +261,7 @@ __all__ = [
     "FAULT_FAMILIES",
     "FaultEvent",
     "FaultParams",
+    "HazardResidual",
     "descendant_bundle",
     "fault_pressure_at",
     "parent_intensity",

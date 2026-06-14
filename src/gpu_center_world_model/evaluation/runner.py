@@ -32,9 +32,10 @@ release-gating logic in :func:`apply_acceptance`.
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from ..simulator.contracts import BlockerGroup
 from ..version import SCHEMA_VERSION
 from .metrics.abstention import (
     RiskCoverageReport,
@@ -42,26 +43,45 @@ from .metrics.abstention import (
     false_safe_under_shift,
     risk_coverage_curve,
 )
-from .metrics.calibration import CalibrationReport
+from .metrics.calibration import (
+    CalibrationReport,
+    CoverageBySliceReport,
+    coverage_by_slice,
+    expected_calibration_error,
+)
 from .metrics.counterfactual import (
     BranchWindow,
     CounterfactualReport,
     evaluate_counterfactual,
+)
+from .metrics.operator_usefulness import (
+    OperatorCase,
+    OperatorUsefulnessReport,
+    evaluate_operator_usefulness,
 )
 from .metrics.planning import (
     PlanningReport,
     PlanningWindow,
     evaluate_planning,
 )
-from .metrics.predictive import PredictiveReport
+from .metrics.predictive import (
+    PredictiveReport,
+    score_hazard_channel,
+    score_quantile_channel,
+)
 from .metrics.safety_gate import (
     SafetyGateReport,
     SafetyJudgement,
     evaluate_safety_gate,
 )
 from .reports.report import EvaluationReport
-from .sample_complexity import SampleComplexityPlan, build_certification_plan
-from .slice_defs import SLICE_FAMILIES, assign_slices
+from .sample_complexity import (
+    SampleComplexityPlan,
+    build_certification_plan,
+    effective_pairwise_samples,
+    mixing_effective_n,
+)
+from .slice_defs import MIN_EFFECTIVE_WINDOWS_PER_SLICE, SLICE_FAMILIES, assign_slices
 from .suites.redteam import RedTeamCase, RedTeamReport, evaluate_red_team
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,9 +117,19 @@ class TrackInputs:
     branch_windows: list[BranchWindow] = field(default_factory=list)
     predictive_reports: list[PredictiveReport] = field(default_factory=list)
     calibration_reports: list[CalibrationReport] = field(default_factory=list)
+    # raw predictive inputs the runner scores via score_quantile_channel /
+    # score_hazard_channel (so a saved pack carries arrays, not pre-scored reports)
+    quantile_channel_inputs: list[dict[str, object]] = field(default_factory=list)
+    hazard_channel_inputs: list[dict[str, object]] = field(default_factory=list)
+    # raw calibration inputs the runner scores via expected_calibration_error
+    calibration_inputs: list[dict[str, object]] = field(default_factory=list)
+    # interval-coverage-by-slice inputs (lower/upper/truth + slice labels)
+    coverage_by_slice_inputs: dict[str, object] = field(default_factory=dict)
     # Track C — safe action selection
     planning_windows: list[PlanningWindow] = field(default_factory=list)
     baseline_planning_windows: list[PlanningWindow] = field(default_factory=list)
+    # operator-usefulness study (provisional; doc O L10)
+    operator_cases: list[OperatorCase] = field(default_factory=list)
     # abstention / shift
     risk_score: list[float] = field(default_factory=list)
     selective_error: list[float] = field(default_factory=list)
@@ -162,6 +192,104 @@ def run_track_planning(
     )
 
 
+def run_track_predictive(inputs: TrackInputs) -> list[PredictiveReport]:
+    """Track-B diagnostic: score continuous + discrete predictive channels.
+
+    The runner scores any raw ``quantile_channel_inputs`` via
+    :func:`score_quantile_channel` (continuous channels — MAE/WAPE/pinball/
+    coverage) and any ``hazard_channel_inputs`` via :func:`score_hazard_channel`
+    (discrete hazards — Brier + PR-at-budget for hotspot / pods_ready_timeout /
+    requeue / node_failure / xid_fault). Pre-scored ``predictive_reports`` passed
+    directly are preserved (the typed dataclass remains a first-class input).
+    """
+    reports: list[PredictiveReport] = list(inputs.predictive_reports)
+    for rec in inputs.quantile_channel_inputs:
+        quantile_preds = {
+            float(k): v for k, v in dict(rec.get("quantile_preds", {})).items()
+        }
+        reports.append(
+            score_quantile_channel(
+                channel=str(rec.get("channel", "channel")),
+                horizon_s=int(rec.get("horizon_s", 0)),
+                truth=rec.get("truth", []),  # type: ignore[arg-type]
+                quantile_preds=quantile_preds,  # type: ignore[arg-type]
+                lower_q=float(rec.get("lower_q", 0.05)),
+                upper_q=float(rec.get("upper_q", 0.95)),
+            )
+        )
+    for rec in inputs.hazard_channel_inputs:
+        budgets = rec.get("alert_budgets")
+        kwargs: dict[str, object] = {}
+        if budgets is not None:
+            kwargs["alert_budgets"] = tuple(float(b) for b in budgets)  # type: ignore[arg-type]
+        reports.append(
+            score_hazard_channel(
+                channel=str(rec.get("channel", "hazard")),
+                horizon_s=int(rec.get("horizon_s", 0)),
+                prob=rec.get("prob", []),  # type: ignore[arg-type]
+                label=rec.get("label", []),  # type: ignore[arg-type]
+                **kwargs,  # type: ignore[arg-type]
+            )
+        )
+    return reports
+
+
+def run_track_calibration(inputs: TrackInputs) -> list[CalibrationReport]:
+    """Track-B diagnostic: ECE per (channel, slice) from raw calibration inputs.
+
+    Scores any raw ``calibration_inputs`` via :func:`expected_calibration_error`
+    and preserves pre-scored ``calibration_reports`` passed directly. Doc F:
+    calibration is reported *by slice* (topology-shift / degraded-telemetry /
+    unseen-workload), never as one in-distribution number.
+    """
+    reports: list[CalibrationReport] = list(inputs.calibration_reports)
+    for rec in inputs.calibration_inputs:
+        reports.append(
+            expected_calibration_error(
+                rec.get("prob", []),  # type: ignore[arg-type]
+                rec.get("label", []),  # type: ignore[arg-type]
+                n_bins=int(rec.get("n_bins", 10)),
+                channel=str(rec.get("channel", "hazard")),
+                slice_name=str(rec.get("slice_name", "all")),
+            )
+        )
+    return reports
+
+
+def run_coverage_by_slice(inputs: TrackInputs) -> CoverageBySliceReport | None:
+    """Interval coverage per slice with the doc-F 85%-95% acceptance band.
+
+    Expects ``coverage_by_slice_inputs`` to carry aligned ``lower`` / ``upper`` /
+    ``truth`` arrays and a ``slice_labels`` list. Returns ``None`` if not present.
+    """
+    rec = inputs.coverage_by_slice_inputs
+    if not rec or "slice_labels" not in rec:
+        return None
+    band = rec.get(
+        "band",
+        (THRESHOLDS["coverage_band_lo"], THRESHOLDS["coverage_band_hi"]),
+    )
+    return coverage_by_slice(
+        rec.get("lower", []),  # type: ignore[arg-type]
+        rec.get("upper", []),  # type: ignore[arg-type]
+        rec.get("truth", []),  # type: ignore[arg-type]
+        list(rec.get("slice_labels", [])),  # type: ignore[arg-type]
+        nominal=float(rec.get("nominal", 0.90)),
+        band=(float(band[0]), float(band[1])),  # type: ignore[index]
+    )
+
+
+def run_operator_usefulness(inputs: TrackInputs) -> OperatorUsefulnessReport | None:
+    """Operator-usefulness study (provisional; doc O L10). None if no cases.
+
+    Doc F: operator usefulness is the fifth, deployment-readiness layer — measured
+    from interaction traces, reported provisionally, and never release-blocking.
+    """
+    if not inputs.operator_cases:
+        return None
+    return evaluate_operator_usefulness(inputs.operator_cases)
+
+
 def run_abstention(
     inputs: TrackInputs,
 ) -> tuple[RiskCoverageReport | None, ShiftAbstentionReport | None]:
@@ -184,37 +312,135 @@ def run_abstention(
     return rc, sa
 
 
-def compute_slices(inputs: TrackInputs) -> dict[str, object]:
-    """Group counterfactual sign accuracy by each prespecified Mondrian slice.
+def _slice_power(
+    n_windows: int, n_branches: int, rho_pair: float, tau_mix: float
+) -> dict[str, object]:
+    """Per-slice statistical-power certification against doc O's ~750/slice.
 
-    For each slice family and cell we recompute the headline counterfactual
-    report over the windows whose feature record lands in that cell, so the
-    report shows slice-wise sign accuracy / optimism bias (doc F: always publish
-    slice-wise metrics). Requires ``window_features`` aligned with
-    ``branch_windows``.
+    Computes the dependence-corrected effective window count
+    ``n_eff = n_windows / tau_mix`` (mixing ESS, doc O E2) and the effective
+    pairwise count, and flags the slice as *under-powered* when the effective
+    window count is below :data:`MIN_EFFECTIVE_WINDOWS_PER_SLICE` (doc O
+    sample_complexity: each major reported slice needs ~750 effective windows for
+    calibration/coverage). An under-powered slice's metrics are still reported,
+    but the report marks them as not yet certifiable.
+    """
+    window_eff = mixing_effective_n(n_windows, tau_mix) if n_windows else 0.0
+    pair_eff = (
+        effective_pairwise_samples(n_windows, n_branches, rho_pair)
+        if n_windows
+        else 0.0
+    )
+    return {
+        "n_windows": n_windows,
+        "effective_n_windows": window_eff,
+        "effective_n_pairwise": pair_eff,
+        "min_effective_windows": MIN_EFFECTIVE_WINDOWS_PER_SLICE,
+        "sufficiently_powered": window_eff >= MIN_EFFECTIVE_WINDOWS_PER_SLICE,
+        "under_powered": window_eff < MIN_EFFECTIVE_WINDOWS_PER_SLICE,
+    }
+
+
+def compute_slices(inputs: TrackInputs) -> dict[str, object]:
+    """Group slice-wise metrics by each prespecified Mondrian slice (doc F/O).
+
+    For each slice family and cell we recompute:
+
+    * the headline counterfactual report (sign accuracy / optimism bias / top-1
+      near-oracle) over the cell's windows;
+    * a **per-slice risk-coverage** readout when per-window risk / selective-error
+      arrays are supplied (parallel to ``branch_windows``);
+    * a **per-slice statistical-power certification** against doc O's
+      ~750-effective-windows requirement, flagging under-powered cells.
+
+    Requires ``window_features`` aligned with ``branch_windows``. Doc F: always
+    publish slice-wise metrics rather than a single average; doc O: each major
+    reported slice needs ~750 effective windows.
     """
     out: dict[str, object] = {}
     feats = inputs.window_features
     windows = inputs.branch_windows
     if not feats or len(feats) != len(windows):
         return out
+    # optional per-window risk / selective-error arrays, aligned to branch_windows
+    risk = inputs.risk_score if len(inputs.risk_score) == len(windows) else None
+    sel_err = (
+        inputs.selective_error
+        if len(inputs.selective_error) == len(windows)
+        else None
+    )
+    n_under_powered = 0
+    n_cells = 0
     for family in SLICE_FAMILIES:
         cells: dict[str, dict[str, object]] = {}
         # bucket window indices by this family's cell label
-        buckets: dict[str, list[BranchWindow]] = {}
-        for w, rec in zip(windows, feats, strict=False):
+        idx_buckets: dict[str, list[int]] = {}
+        for i, rec in enumerate(feats):
             label = assign_slices(rec)[family.name]
-            buckets.setdefault(label, []).append(w)
-        for label, ws in buckets.items():
+            idx_buckets.setdefault(label, []).append(i)
+        for label, idxs in idx_buckets.items():
+            ws = [windows[i] for i in idxs]
             rep = evaluate_counterfactual(ws)
-            cells[label] = {
+            power = _slice_power(
+                len(ws), inputs.n_branches, inputs.rho_pair, inputs.tau_mix
+            )
+            cell: dict[str, object] = {
                 "n_windows": rep.n_windows,
                 "sign_accuracy": rep.sign_accuracy,
                 "optimism_bias_rate": rep.optimism_bias_rate,
                 "top1_near_oracle": rep.top1_near_oracle,
+                "power": power,
             }
+            if risk is not None and sel_err is not None and idxs:
+                rc = risk_coverage_curve(
+                    [risk[i] for i in idxs],
+                    [sel_err[i] for i in idxs],
+                    target_coverage=THRESHOLDS["min_coverage"],
+                )
+                cell["risk_coverage"] = {
+                    "aurc": rc.aurc,
+                    "selective_risk_at_target": rc.selective_risk_at_target,
+                    "target_coverage": rc.target_coverage,
+                }
+            cells[label] = cell
+            n_cells += 1
+            if power["under_powered"]:
+                n_under_powered += 1
         out[family.name] = cells
+    out["_power_summary"] = {
+        "min_effective_windows_per_slice": MIN_EFFECTIVE_WINDOWS_PER_SLICE,
+        "n_cells": n_cells,
+        "n_under_powered_cells": n_under_powered,
+        "all_cells_sufficiently_powered": n_under_powered == 0 and n_cells > 0,
+    }
     return out
+
+
+def counterfactual_coverage(windows: Sequence[BranchWindow]) -> float:
+    """Fraction of decision windows the model answered (did not fully abstain).
+
+    Doc F acceptance for counterfactual ranking requires the >=0.80 non-abstained
+    accuracy to be retained *while keeping >= 0.60 coverage* — a model that
+    abstains on everything but the easy cases would otherwise pass trivially. A
+    window counts as *answered* when at least one of its candidate actions was
+    recommended without abstaining (or, absent recommendation flags, when at least
+    one action was not abstained on). Returns NaN for an empty set.
+    """
+    if not windows:
+        return float("nan")
+    answered = 0
+    for w in windows:
+        ids = w.action_ids
+        if w.recommended:
+            did = any(
+                w.recommended.get(a, False) and not w.abstained.get(a, False)
+                for a in ids
+            )
+        else:
+            did = any(not w.abstained.get(a, False) for a in ids)
+        if did:
+            answered += 1
+    return answered / len(windows)
 
 
 def apply_acceptance(
@@ -225,11 +451,20 @@ def apply_acceptance(
     planning: PlanningReport | None,
     abstention_shift: ShiftAbstentionReport | None,
     risk_coverage: RiskCoverageReport | None,
+    counterfactual_coverage_value: float | None = None,
+    coverage_by_slice: CoverageBySliceReport | None = None,
+    operator_usefulness: OperatorUsefulnessReport | None = None,
 ) -> dict[str, object]:
     """Evaluate each doc-F acceptance threshold; return a pass/fail map.
 
     Hard-safety and red-team are release-blocking; the rest are profile claims
     reported with their pass/fail flags but never folded into a blended score.
+
+    ``counterfactual_coverage_value`` is the answered-window coverage used to gate
+    the >=0.80 non-abstained accuracy clause at >=0.60 coverage (doc F). When it
+    is below the floor, the counterfactual_ranking acceptance *fails* even with a
+    high non-abstained accuracy, because the high accuracy was bought by
+    abstaining too often.
     """
     acc: dict[str, object] = {}
 
@@ -247,6 +482,11 @@ def apply_acceptance(
             "release_blocking": True,
         }
     if counterfactual is not None:
+        cov = counterfactual_coverage_value
+        # Coverage gate: NaN coverage (no abstention flags) is treated as full
+        # coverage so a pack without flags is not penalised; a measured coverage
+        # below the floor fails the non-abstained clause.
+        coverage_ok = cov is None or cov != cov or _ge(cov, THRESHOLDS["min_coverage"])
         acc["counterfactual_ranking"] = {
             "passed": (
                 _ge(counterfactual.sign_accuracy, THRESHOLDS["min_sign_accuracy"])
@@ -254,10 +494,11 @@ def apply_acceptance(
                     counterfactual.sign_accuracy_non_abstained,
                     THRESHOLDS["min_sign_accuracy_non_abstained"],
                 )
+                and coverage_ok
             ),
             "detail": f"sign_acc={counterfactual.sign_accuracy:.4f} "
             f"(>=0.70), non_abstained={counterfactual.sign_accuracy_non_abstained:.4f} "
-            "(>=0.80)",
+            f"(>=0.80), coverage={_fmt_cov(cov)} (>=0.60)",
         }
         acc["optimism_bias"] = {
             "passed": _le(
@@ -265,6 +506,32 @@ def apply_acceptance(
                 THRESHOLDS["max_optimism_bias"],
             ),
             "detail": f"rate={counterfactual.optimism_bias_rate:.4f} (<0.05)",
+        }
+    if coverage_by_slice is not None:
+        per = coverage_by_slice.per_slice
+        out_of_band = sorted(
+            s for s, m in per.items() if not bool(m.get("in_band", False))
+        )
+        acc["interval_coverage_band"] = {
+            "passed": len(per) > 0 and not out_of_band,
+            "detail": (
+                f"nominal={coverage_by_slice.nominal:.2f} band "
+                f"[{coverage_by_slice.band_lo:.2f},{coverage_by_slice.band_hi:.2f}]; "
+                f"{len(per) - len(out_of_band)}/{len(per)} slices in band"
+                + (f"; out-of-band: {out_of_band}" if out_of_band else "")
+            ),
+        }
+    if operator_usefulness is not None:
+        ou = operator_usefulness
+        acc["operator_usefulness"] = {
+            "passed": ou.passed,
+            "detail": (
+                f"median_decision_time_reduction="
+                f"{_fmt_cov(ou.decision_time.median_reduction)} (>=0.20), "
+                f"no_safety_loss={ou.overrides.no_safety_loss}"
+            ),
+            "provisional": True,
+            "release_blocking": False,
         }
     if planning is not None:
         acc["planning_utility"] = {
@@ -299,6 +566,12 @@ def _le(x: float, t: float) -> bool:
     return x == x and x <= t
 
 
+def _fmt_cov(x: float | None) -> str:
+    if x is None or x != x:  # None or NaN
+        return "n/a"
+    return f"{x:.4f}"
+
+
 @dataclass(slots=True)
 class BenchmarkRunner:
     """Drives the three tracks and assembles the final report.
@@ -322,11 +595,26 @@ class BenchmarkRunner:
         safety_gate, red_team = run_track_semantics(inputs)
         counterfactual = run_track_counterfactual(inputs)
         planning = run_track_planning(inputs)
+        predictive = run_track_predictive(inputs)
+        calibration = run_track_calibration(inputs)
+        coverage_slice = run_coverage_by_slice(inputs)
+        operator = run_operator_usefulness(inputs)
         risk_cov, shift_ab = run_abstention(inputs)
         slices = compute_slices(inputs)
 
+        cf_coverage = (
+            counterfactual_coverage(inputs.branch_windows)
+            if inputs.branch_windows
+            else None
+        )
+
         sample_plan: SampleComplexityPlan | None = None
         if inputs.branch_windows:
+            # Use the measured non-abstained coverage to size the non-abstained
+            # certification clause honestly (doc O), rather than the 0.60 default.
+            na_windows = None
+            if cf_coverage is not None and cf_coverage == cf_coverage:
+                na_windows = round(cf_coverage * len(inputs.branch_windows))
             sample_plan = build_certification_plan(
                 n_windows=len(inputs.branch_windows),
                 n_branches=inputs.n_branches,
@@ -336,6 +624,7 @@ class BenchmarkRunner:
                     inputs.n_severe_shift_zero_events
                     or sum(1 for v in inputs.shift_false_safe if v <= 0.5)
                 ),
+                n_non_abstained_windows=na_windows,
             )
 
         acceptance = apply_acceptance(
@@ -345,6 +634,9 @@ class BenchmarkRunner:
             planning=planning,
             abstention_shift=shift_ab,
             risk_coverage=risk_cov,
+            counterfactual_coverage_value=cf_coverage,
+            coverage_by_slice=coverage_slice,
+            operator_usefulness=operator,
         )
 
         # Merge the abstention readouts into one dict for the report.
@@ -364,9 +656,11 @@ class BenchmarkRunner:
             red_team=red_team.as_dict() if red_team else None,
             counterfactual=counterfactual.as_dict() if counterfactual else None,
             planning=planning.as_dict() if planning else None,
-            predictive=[p.as_dict() for p in inputs.predictive_reports],
-            calibration=[c.as_dict() for c in inputs.calibration_reports],
+            predictive=[p.as_dict() for p in predictive],
+            calibration=[c.as_dict() for c in calibration],
             abstention=abstention_dict,
+            coverage_by_slice=coverage_slice.as_dict() if coverage_slice else None,
+            operator_usefulness=operator.as_dict() if operator else None,
             slices=slices,
             sample_complexity=sample_plan.as_dict() if sample_plan else None,
             acceptance=acceptance,
@@ -375,6 +669,10 @@ class BenchmarkRunner:
                 "n_safety_judgements": len(inputs.safety_judgements),
                 "n_branch_windows": len(inputs.branch_windows),
                 "n_planning_windows": len(inputs.planning_windows),
+                "n_predictive_reports": len(predictive),
+                "n_calibration_reports": len(calibration),
+                "n_operator_cases": len(inputs.operator_cases),
+                "counterfactual_coverage": cf_coverage,
                 "is_shift_pack": inputs.is_shift_pack,
                 "thresholds": dict(THRESHOLDS),
             },
@@ -397,19 +695,326 @@ TRACKS: tuple[str, ...] = (
 )
 
 
-def track_inputs_from_records(
-    records: Sequence[dict[str, object]],
-) -> TrackInputs:  # pragma: no cover - thin adapter
-    """Adapter stub for future JSON-record ingestion.
+# ──────────────────────────────────────────────────────────────────────────────
+# JSON-record ingestion (deserialize a saved benchmark pack → TrackInputs)
+# ──────────────────────────────────────────────────────────────────────────────
+def _blocker_set(values: object) -> frozenset[BlockerGroup]:
+    """Coerce a JSON list of blocker-group strings/values into a frozenset enum."""
+    if not values:
+        return frozenset()
+    out: set[BlockerGroup] = set()
+    for v in values:  # type: ignore[union-attr]
+        if isinstance(v, BlockerGroup):
+            out.add(v)
+        else:
+            out.add(BlockerGroup(str(v)))
+    return frozenset(out)
 
-    The release format for collected records is JSON; this adapter is the
-    intended seam for loading them. It is intentionally minimal in v1 (the
-    typed dataclasses are the primary API) and raises if asked to parse, so the
-    contract is explicit rather than silently wrong.
+
+def _f(rec: Mapping[str, object], key: str, default: float = 0.0) -> float:
+    v = rec.get(key, default)
+    return float(v)  # type: ignore[arg-type]
+
+
+def _b(rec: Mapping[str, object], key: str, default: bool = False) -> bool:
+    return bool(rec.get(key, default))
+
+
+def _safety_judgement_from(rec: Mapping[str, object]) -> SafetyJudgement:
+    return SafetyJudgement(
+        action_id=str(rec.get("action_id", "")),
+        recommended=_b(rec, "recommended"),
+        abstained=_b(rec, "abstained"),
+        kernel_feasible=_b(rec, "kernel_feasible", True),
+        kernel_blockers=_blocker_set(rec.get("kernel_blockers")),
+        emitted_blockers=_blocker_set(rec.get("emitted_blockers")),
+    )
+
+
+def _float_dict(d: object) -> dict[str, float]:
+    if not d:
+        return {}
+    return {str(k): float(v) for k, v in dict(d).items()}  # type: ignore[arg-type]
+
+
+def _bool_dict(d: object) -> dict[str, bool]:
+    if not d:
+        return {}
+    return {str(k): bool(v) for k, v in dict(d).items()}  # type: ignore[arg-type]
+
+
+def _branch_window_from(rec: Mapping[str, object]) -> BranchWindow:
+    return BranchWindow(
+        window_id=str(rec.get("window_id", "")),
+        action_ids=[str(a) for a in rec.get("action_ids", [])],  # type: ignore[union-attr]
+        pred_energy=_float_dict(rec.get("pred_energy")),
+        true_energy=_float_dict(rec.get("true_energy")),
+        baseline_action_id=(
+            str(rec["baseline_action_id"])
+            if rec.get("baseline_action_id") is not None
+            else None
+        ),
+        recommended=_bool_dict(rec.get("recommended")),
+        abstained=_bool_dict(rec.get("abstained")),
+        ref_unsafe=_bool_dict(rec.get("ref_unsafe")),
+        pred_risk=_float_dict(rec.get("pred_risk")),
+    )
+
+
+def _lex_keys(d: object) -> dict[str, tuple[float, ...]]:
+    if not d:
+        return {}
+    return {
+        str(k): tuple(float(x) for x in v)  # type: ignore[union-attr]
+        for k, v in dict(d).items()
+    }
+
+
+def _planning_window_from(rec: Mapping[str, object]) -> PlanningWindow:
+    return PlanningWindow(
+        window_id=str(rec.get("window_id", "")),
+        chosen_action_id=str(rec.get("chosen_action_id", "")),
+        true_lex_keys=_lex_keys(rec.get("true_lex_keys")),
+        safe_action_ids=[str(a) for a in rec.get("safe_action_ids", [])],  # type: ignore[union-attr]
+        baseline_chosen_id=(
+            str(rec["baseline_chosen_id"])
+            if rec.get("baseline_chosen_id") is not None
+            else None
+        ),
+    )
+
+
+def _red_team_case_from(rec: Mapping[str, object]) -> RedTeamCase:
+    return RedTeamCase(
+        scenario=str(rec.get("scenario", "")),
+        case_id=str(rec.get("case_id", "")),
+        recommended_action_id=(
+            str(rec["recommended_action_id"])
+            if rec.get("recommended_action_id") is not None
+            else None
+        ),
+        abstained=_b(rec, "abstained"),
+        fell_back=_b(rec, "fell_back"),
+        emitted_blockers=_blocker_set(rec.get("emitted_blockers")),
+        kernel_feasible=_b(rec, "kernel_feasible", True),
+        kernel_blockers=_blocker_set(rec.get("kernel_blockers")),
+        reference_unsafe=_b(rec, "reference_unsafe"),
+        is_ood=_b(rec, "is_ood"),
+        policy_changed_mid_horizon=_b(rec, "policy_changed_mid_horizon"),
+        respected_policy_change=_b(rec, "respected_policy_change", True),
+        explained_shrinkage=_b(rec, "explained_shrinkage"),
+        predicted_high_risk=_b(rec, "predicted_high_risk"),
+        uncertainty_increased=_b(rec, "uncertainty_increased"),
+        chose_lower_regret_multistep=_b(rec, "chose_lower_regret_multistep"),
+        telemetry_degraded=_b(rec, "telemetry_degraded"),
+        fragmentation_trap=_b(rec, "fragmentation_trap"),
+        derate_occurred=_b(rec, "derate_occurred"),
+        triggers_present=frozenset(
+            str(x) for x in rec.get("triggers_present", [])  # type: ignore[union-attr]
+        ),
+    )
+
+
+def _predictive_report_from(rec: Mapping[str, object]) -> PredictiveReport:
+    pinball = {
+        float(k): float(v) for k, v in dict(rec.get("pinball", {})).items()  # type: ignore[arg-type]
+    }
+    pr_at_budget = {
+        float(k): {str(kk): float(vv) for kk, vv in dict(v).items()}
+        for k, v in dict(rec.get("pr_at_budget", {})).items()  # type: ignore[arg-type]
+    }
+    return PredictiveReport(
+        channel=str(rec.get("channel", "channel")),
+        horizon_s=int(rec.get("horizon_s", 0)),  # type: ignore[arg-type]
+        n=int(rec.get("n", 0)),  # type: ignore[arg-type]
+        mae=_f(rec, "mae", float("nan")),
+        medae=_f(rec, "medae", float("nan")),
+        wape=_f(rec, "wape", float("nan")),
+        rmse=_f(rec, "rmse", float("nan")),
+        pinball=pinball,
+        coverage_90=_f(rec, "coverage_90", float("nan")),
+        sharpness_90=_f(rec, "sharpness_90", float("nan")),
+        brier=_f(rec, "brier", float("nan")),
+        pr_at_budget=pr_at_budget,
+    )
+
+
+def _calibration_report_from(rec: Mapping[str, object]) -> CalibrationReport:
+    from .metrics.calibration import ReliabilityBin
+
+    bins = [
+        ReliabilityBin(
+            lo=float(b.get("lo", 0.0)),
+            hi=float(b.get("hi", 0.0)),
+            count=int(b.get("count", 0)),
+            mean_pred=float(b.get("mean_pred", float("nan"))),
+            mean_truth=float(b.get("mean_truth", float("nan"))),
+        )
+        for b in rec.get("bins", [])  # type: ignore[union-attr]
+    ]
+    return CalibrationReport(
+        channel=str(rec.get("channel", "hazard")),
+        slice_name=str(rec.get("slice_name", "all")),
+        n=int(rec.get("n", 0)),  # type: ignore[arg-type]
+        ece=_f(rec, "ece", float("nan")),
+        mce=_f(rec, "mce", float("nan")),
+        bins=bins,
+    )
+
+
+def _operator_case_from(rec: Mapping[str, object]) -> OperatorCase:
+    return OperatorCase(
+        case_id=str(rec.get("case_id", "")),
+        assistant_spoke=_b(rec, "assistant_spoke"),
+        assistant_correct=_b(rec, "assistant_correct"),
+        operator_followed=_b(rec, "operator_followed"),
+        operator_decision_correct=_b(rec, "operator_decision_correct"),
+        unaided_decision_correct=_b(rec, "unaided_decision_correct"),
+        decision_time_s=_f(rec, "decision_time_s", float("nan")),
+        unaided_decision_time_s=_f(rec, "unaided_decision_time_s", float("nan")),
+        final_decision_unsafe=_b(rec, "final_decision_unsafe"),
+        unaided_decision_unsafe=_b(rec, "unaided_decision_unsafe"),
+        is_blocked_case=_b(rec, "is_blocked_case"),
+        emitted_blockers=frozenset(
+            str(x) for x in rec.get("emitted_blockers", [])  # type: ignore[union-attr]
+        ),
+        operator_blockers=frozenset(
+            str(x) for x in rec.get("operator_blockers", [])  # type: ignore[union-attr]
+        ),
+    )
+
+
+def track_inputs_from_records(
+    records: Sequence[dict[str, object]] | Mapping[str, object],
+) -> TrackInputs:
+    """Deserialize a saved benchmark pack (JSON records) into :class:`TrackInputs`.
+
+    The release format for collected records is JSON. This adapter accepts either:
+
+    * a **payload mapping** with named typed sections — the canonical saved-pack
+      shape ``{"safety_judgements": [...], "branch_windows": [...],
+      "planning_windows": [...], "red_team_cases": {scenario: [...]},
+      "predictive_reports": [...], "calibration_reports": [...],
+      "quantile_channel_inputs": [...], "hazard_channel_inputs": [...],
+      "calibration_inputs": [...], "coverage_by_slice_inputs": {...},
+      "operator_cases": [...], "window_features": [...], ...sample-complexity
+      scalars...}``; or
+    * a **flat sequence of tagged records** ``[{"kind": "safety_judgement", ...},
+      {"kind": "branch_window", ...}, ...]`` where each record carries a ``kind``
+      naming its target section (singular or plural accepted).
+
+    Every section is optional, so a partial pack (e.g. only the safety track on a
+    CI commit) still produces a valid :class:`TrackInputs`. This populates ALL
+    data-dependent tracks so a saved pack runs the full three-track scoring plus
+    the predictive/calibration/coverage/operator-usefulness diagnostics.
     """
-    raise NotImplementedError(
-        "v1 uses the typed TrackInputs dataclass directly; JSON-record ingestion "
-        "is a v2 seam. Construct TrackInputs from your collected dataclasses."
+    if isinstance(records, Mapping):
+        return _track_inputs_from_payload(records)
+    # Flat tagged-record sequence: fold into a payload mapping by ``kind``.
+    payload: dict[str, object] = {}
+    red_team: dict[str, list[dict[str, object]]] = {}
+    _KIND_TO_SECTION = {
+        "safety_judgement": "safety_judgements",
+        "safety_judgements": "safety_judgements",
+        "branch_window": "branch_windows",
+        "branch_windows": "branch_windows",
+        "planning_window": "planning_windows",
+        "planning_windows": "planning_windows",
+        "baseline_planning_window": "baseline_planning_windows",
+        "baseline_planning_windows": "baseline_planning_windows",
+        "predictive_report": "predictive_reports",
+        "predictive_reports": "predictive_reports",
+        "calibration_report": "calibration_reports",
+        "calibration_reports": "calibration_reports",
+        "quantile_channel_input": "quantile_channel_inputs",
+        "quantile_channel_inputs": "quantile_channel_inputs",
+        "hazard_channel_input": "hazard_channel_inputs",
+        "hazard_channel_inputs": "hazard_channel_inputs",
+        "calibration_input": "calibration_inputs",
+        "calibration_inputs": "calibration_inputs",
+        "operator_case": "operator_cases",
+        "operator_cases": "operator_cases",
+        "window_feature": "window_features",
+        "window_features": "window_features",
+    }
+    for rec in records:
+        kind = str(rec.get("kind", "")).strip()
+        body = {k: v for k, v in rec.items() if k != "kind"}
+        if kind in ("red_team_case", "red_team_cases"):
+            scen = str(body.get("scenario", ""))
+            red_team.setdefault(scen, []).append(body)
+            continue
+        section = _KIND_TO_SECTION.get(kind)
+        if section is None:
+            raise ValueError(
+                f"track_inputs_from_records: unknown record kind {kind!r}; expected "
+                f"one of {sorted(set(_KIND_TO_SECTION) | {'red_team_case'})}"
+            )
+        payload.setdefault(section, []).append(body)  # type: ignore[union-attr]
+    if red_team:
+        payload["red_team_cases"] = red_team
+    return _track_inputs_from_payload(payload)
+
+
+def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
+    """Build :class:`TrackInputs` from a named-section payload mapping."""
+
+    def _seq(key: str) -> list[Mapping[str, object]]:
+        v = payload.get(key, [])
+        return list(v) if v else []  # type: ignore[arg-type]
+
+    red_team_cases: dict[str, list[RedTeamCase]] = {}
+    rt_payload = payload.get("red_team_cases", {})
+    if isinstance(rt_payload, Mapping):
+        for scen, cases in rt_payload.items():
+            red_team_cases[str(scen)] = [
+                _red_team_case_from(c) for c in cases  # type: ignore[union-attr]
+            ]
+    elif rt_payload:
+        # accept a flat list of cases carrying their own ``scenario`` field
+        for c in rt_payload:  # type: ignore[union-attr]
+            case = _red_team_case_from(c)
+            red_team_cases.setdefault(case.scenario, []).append(case)
+
+    coverage_inputs = payload.get("coverage_by_slice_inputs", {})
+
+    return TrackInputs(
+        safety_judgements=[
+            _safety_judgement_from(r) for r in _seq("safety_judgements")
+        ],
+        red_team_cases=red_team_cases,
+        branch_windows=[_branch_window_from(r) for r in _seq("branch_windows")],
+        predictive_reports=[
+            _predictive_report_from(r) for r in _seq("predictive_reports")
+        ],
+        calibration_reports=[
+            _calibration_report_from(r) for r in _seq("calibration_reports")
+        ],
+        quantile_channel_inputs=[dict(r) for r in _seq("quantile_channel_inputs")],
+        hazard_channel_inputs=[dict(r) for r in _seq("hazard_channel_inputs")],
+        calibration_inputs=[dict(r) for r in _seq("calibration_inputs")],
+        coverage_by_slice_inputs=(
+            dict(coverage_inputs) if isinstance(coverage_inputs, Mapping) else {}
+        ),
+        planning_windows=[_planning_window_from(r) for r in _seq("planning_windows")],
+        baseline_planning_windows=[
+            _planning_window_from(r) for r in _seq("baseline_planning_windows")
+        ],
+        operator_cases=[_operator_case_from(r) for r in _seq("operator_cases")],
+        risk_score=[float(x) for x in payload.get("risk_score", [])],  # type: ignore[union-attr]
+        selective_error=[float(x) for x in payload.get("selective_error", [])],  # type: ignore[union-attr]
+        shift_abstained_or_fellback=[
+            float(x) for x in payload.get("shift_abstained_or_fellback", [])  # type: ignore[union-attr]
+        ],
+        shift_false_safe=[float(x) for x in payload.get("shift_false_safe", [])],  # type: ignore[union-attr]
+        window_features=[dict(r) for r in _seq("window_features")],
+        n_branches=int(payload.get("n_branches", 4)),  # type: ignore[arg-type]
+        rho_pair=float(payload.get("rho_pair", 0.4)),  # type: ignore[arg-type]
+        tau_mix=float(payload.get("tau_mix", 2.0)),  # type: ignore[arg-type]
+        n_severe_shift_zero_events=int(
+            payload.get("n_severe_shift_zero_events", 0)  # type: ignore[arg-type]
+        ),
+        is_shift_pack=bool(payload.get("is_shift_pack", False)),
     )
 
 
@@ -420,10 +1025,15 @@ __all__ = [
     "TrackInputs",
     "apply_acceptance",
     "compute_slices",
+    "counterfactual_coverage",
     "run_abstention",
     "run_benchmark",
+    "run_coverage_by_slice",
+    "run_operator_usefulness",
+    "run_track_calibration",
     "run_track_counterfactual",
     "run_track_planning",
+    "run_track_predictive",
     "run_track_semantics",
     "track_inputs_from_records",
 ]

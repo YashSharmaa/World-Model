@@ -92,7 +92,20 @@ WORKLOAD_PHASES: tuple[str, ...] = (
     "teardown",
 )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# UNCALIBRATED PRIORS (doc D randomization_rules ``calibrated_bounds_only`` tier)
+# ──────────────────────────────────────────────────────────────────────────────
+# The semi-Markov dwell means, jump-chain probabilities, util/power emission
+# tables, and health-transition rates below are *uncalibrated priors*: they encode
+# the qualitative shape of public H100 / DCGM / Kueue behaviour but have NOT been
+# fit to a real trace. Per doc D they belong to the calibrated-bounds tier — fit
+# from traces first, then randomize from the fitted posterior. The system-
+# identification module (:mod:`...synthetic.sysid`) fits the power/RC/hazard blocks
+# and exposes a joint posterior; :func:`sysid.sample_tier` draws calibrated
+# randomization. Treat every constant here as a prior centre, never ground truth.
+
 #: Mean phase dwell time (s) — semi-Markov (different per phase, doc N A2).
+#: **Uncalibrated prior** (see the banner above).
 _PHASE_DWELL_S: dict[str, float] = {
     "staging": 90.0,
     "warmup": 120.0,
@@ -577,6 +590,52 @@ def source_state_from_health(
     )
 
 
+def calibrated_posterior(
+    pod: PodTopology,
+    *,
+    power_traces: list | None = None,
+    thermal_trace: object | None = None,
+    fault_events: int = 0,
+    fault_exposure_gpu_s: float = 0.0,
+    cross_corr: float = 0.0,
+):
+    """Fit the SCM's calibrated parameter block and return the joint posterior.
+
+    Ties the SCM's residual parents (power source, thermal RC, fault hazard) to the
+    system-identification module: it fits whatever traces are supplied (any subset
+    of power / thermal / fault), centring un-fit blocks on their uncalibrated
+    priors, and returns the joint :class:`sysid.JointPosterior` from which
+    :func:`sysid.sample_tier` draws calibrated randomization (doc N Q2/Q3; doc D
+    calibrated_bounds_only tier). When *no* traces are supplied the posterior is
+    the prior block (mean = prior centre, prior-width covariance) so a generator
+    can still sample tiers before any real trace exists.
+    """
+    from . import sysid
+    from .faults import FaultParams
+    from .power import PowerParams
+
+    power_blocks = (
+        sysid.fit_power(power_traces, PowerParams()) if power_traces else None
+    )
+    thermal_block = (
+        sysid.fit_thermal(thermal_trace, pod.thermal)  # type: ignore[arg-type]
+        if thermal_trace is not None
+        else None
+    )
+    hazard_block = sysid.fit_hazard(
+        n_events=fault_events,
+        exposure_gpu_s=fault_exposure_gpu_s,
+        prior=FaultParams(),
+    )
+    return sysid.build_joint_posterior(
+        power_blocks=power_blocks,
+        thermal_block=thermal_block,
+        hazard_block=hazard_block,
+        graph=pod.thermal,
+        cross_corr=cross_corr,
+    )
+
+
 __all__ = [
     "COOLING_STATES",
     "HEALTH_STATES",
@@ -586,6 +645,7 @@ __all__ = [
     "PodSpec",
     "PodTopology",
     "build_pod",
+    "calibrated_posterior",
     "context_from_latents",
     "emit_gpu_telemetry",
     "sample_phase_program",

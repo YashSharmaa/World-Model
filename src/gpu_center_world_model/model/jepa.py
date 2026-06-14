@@ -348,10 +348,13 @@ def competing_risk_nll(
     h_end = event_interval if event_interval is not None else len(interval_probs)
     for r in range(min(h_end, len(interval_probs))):
         nll -= float(np.log(max(interval_probs[r][0], 1e-8)))  # survived interval r
-    if event_class is not None and event_interval is not None:
-        if 0 <= event_interval < len(interval_probs):
-            p = interval_probs[event_interval][event_class]
-            nll -= float(np.log(max(p, 1e-8)))
+    if (
+        event_class is not None
+        and event_interval is not None
+        and 0 <= event_interval < len(interval_probs)
+    ):
+        p = interval_probs[event_interval][event_class]
+        nll -= float(np.log(max(p, 1e-8)))
     return nll
 
 

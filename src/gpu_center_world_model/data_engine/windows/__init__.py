@@ -26,16 +26,16 @@ from .builder import (
 )
 
 __all__ = [
-    "WindowFeatures",
-    "assemble_features",
-    "assert_no_leakage",
-    "labels_from_pack",
-    "build_window",
-    "temporal_split",
-    "derive_seed_bundle",
     # re-export contracts for one clean surface
     "DecisionWindow",
     "LabelPack",
     "Origin",
     "Split",
+    "WindowFeatures",
+    "assemble_features",
+    "assert_no_leakage",
+    "build_window",
+    "derive_seed_bundle",
+    "labels_from_pack",
+    "temporal_split",
 ]

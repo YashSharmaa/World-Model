@@ -1,0 +1,101 @@
+{
+  "$id": "https://github.com/yashsharmaa/gpu-center-world-model/schema/json_schema/pack_index.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Top-level index for a benchmark/replay pack: project attribution plus the per-window manifest referencing decision windows and label packs (doc H tiny benchmark + replay pack; doc D decision-window manifests).",
+  "properties": {
+    "author": {
+      "type": "string"
+    },
+    "author_url": {
+      "type": "string"
+    },
+    "credit": {
+      "type": "string"
+    },
+    "generator_commit": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "windows": {
+      "items": {
+        "additionalProperties": true,
+        "properties": {
+          "branch_state_hash": {
+            "type": "string"
+          },
+          "family": {
+            "type": "string"
+          },
+          "label_uri": {
+            "type": "string"
+          },
+          "n_branches": {
+            "type": "integer"
+          },
+          "n_gpus": {
+            "type": "integer"
+          },
+          "n_labels": {
+            "type": "integer"
+          },
+          "n_nodes": {
+            "type": "integer"
+          },
+          "pending_queue": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rare_event": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scenario_id": {
+            "type": "string"
+          },
+          "scenario_state_hash": {
+            "type": "string"
+          },
+          "split": {
+            "enum": [
+              "train",
+              "val",
+              "test_temporal",
+              "test_topology",
+              "test_intervention",
+              "test_rare_event",
+              "test_severe_shift"
+            ],
+            "type": "string"
+          },
+          "window_uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "split",
+          "window_uri",
+          "label_uri"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "windows"
+  ],
+  "title": "pack_index",
+  "type": "object"
+}

@@ -29,11 +29,14 @@ The construction follows doc R verbatim:
    branch deltas estimate intervention effects, not intervention-plus-noise
    (doc D, splits.counterfactual_harness; doc R, Eq11/Eq12).
 
-The exact-kernel logic here is a *self-contained, deterministic* implementation of
-the demo-pod feasibility/transition consistent with
-:mod:`...simulator.contracts` (``FeasibilityResult``, ``Blocker``,
-``BlockerGroup``). It owns hard feasibility (quota, gang atomicity, topology fit,
-health masks, operator whitelist) — it is the shield and is never learned.
+KERNEL UNIFICATION (doc R, [D3]/[Eq1]/[T2]): the generator and the safety shield
+**must be byte-identical** so that "same (X_τ, a_τ, M_τ) ⇒ same feasibility,
+blocker set, feasible domains, X_τ⁺" (doc R, T2). To guarantee that, the
+feasibility/transition used for branch construction is the **real**
+:class:`...simulator.exact_kernel.ExactSymbolicKernel` — there is no second
+hand-rolled copy to drift out of sync. :func:`feasible` and :func:`step` below are
+**thin module-level adapters** over a shared kernel instance (read-only use of the
+kernel's stable public API ``feasible`` / ``safe_actions`` / ``step`` / ``why_not``).
 """
 
 from __future__ import annotations
@@ -53,20 +56,19 @@ from ...schema.actions import (
 )
 from ...schema.hashing import state_hash
 from ...schema.kpis import HazardChannel, KPIChannel
-from ...schema.state import SymbolicState, WorldState
-from ...simulator.contracts import (
-    Blocker,
-    BlockerGroup,
-    FeasibilityResult,
-)
+from ...schema.state import WorldState
+from ...simulator.contracts import FeasibilityResult
+from ...simulator.exact_kernel import ExactSymbolicKernel
 from ...utils.seeding import SeedBundle
 from .faults import (
     FaultParams,
+    HazardResidual,
     fault_pressure_at,
     sample_fault_cluster,
 )
 from .power import (
     PowerParams,
+    PowerResidual,
     init_power_state,
     power_cap_array,
     rack_power_kw,
@@ -79,202 +81,36 @@ from .scm import (
     step_cooling,
     step_health,
 )
-from .thermal import ThermalState, step_thermal
-
+from .thermal import ThermalResidual, ThermalState, step_thermal
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Exact kernel (self-contained demo-pod feasibility + transition)
+# Exact kernel adapters — the generator uses the REAL shield (doc R, [D3]/[T2])
 # ──────────────────────────────────────────────────────────────────────────────
-def _workload_gpu_demand(state: SymbolicState, uid: str) -> int:
-    wl = state.workloads.get(uid)
-    if wl is None:
-        return 0
-    return int(sum(ps.count * ps.gpu_req for ps in wl.podsets))
+#: One shared, stateless kernel instance. The kernel is deterministic and owns no
+#: mutable per-call state, so a module-level singleton is safe and keeps the
+#: generator's feasibility byte-identical to the deployed shield (doc R, T2).
+_KERNEL = ExactSymbolicKernel()
 
 
 def feasible(state: WorldState, action: Action) -> FeasibilityResult:
-    """Exact feasibility for one demo action (the shield; doc R, [D3]/[Eq1]).
+    """Exact feasibility for one action — thin adapter over the real shield.
 
-    Checks, in semantic blocker order (doc S): action whitelist → status
-    precondition → quota → topology fit (gang atomicity inside a domain) →
-    health/schedulability. Returns the integer assignment when feasible.
+    Delegates verbatim to :meth:`ExactSymbolicKernel.feasible` so the generator
+    and the deployed safety gate certify the *same* safe set (doc R, T2). The
+    return type is the shared :class:`...simulator.contracts.FeasibilityResult`
+    (blockers, feasible-domain selection labels, integer assignment).
     """
-    sym = state.symbolic
-    policy = sym.operator_policy
-    blockers: list[Blocker] = []
-
-    if action.type == ActionType.HOLD:
-        return FeasibilityResult(feasible=True)  # hold is always feasible
-
-    if action.type.value not in policy.allowed_actions:
-        blockers.append(
-            Blocker(BlockerGroup.ACTION_WHITELIST, f"{action.type.value} not allowed")
-        )
-        return FeasibilityResult(feasible=False, blockers=blockers)
-
-    uid = action_workload_uid(action)
-    wl = sym.workloads.get(uid) if uid else None
-    if wl is None:
-        blockers.append(Blocker(BlockerGroup.STATUS_PRECONDITION, "unknown workload"))
-        return FeasibilityResult(feasible=False, blockers=blockers)
-
-    demand = _workload_gpu_demand(sym, uid)
-
-    # Quota: cluster-queue reserved + demand must fit nominal quota.
-    if action.type in (ActionType.ADMIT, ActionType.ADMIT_AND_PLACE):
-        cq_id = getattr(action, "cluster_queue_id", None)
-        cq = sym.cluster_queues.get(cq_id) if cq_id else None
-        if cq is None:
-            blockers.append(
-                Blocker(BlockerGroup.QUEUE_FLAVOR_ELIGIBILITY, "unknown cluster queue")
-            )
-            return FeasibilityResult(feasible=False, blockers=blockers)
-        flavor_id = getattr(action, "resource_flavor_id", "")
-        nominal = cq.nominal_quota.get(flavor_id, {}).get("gpu", 0.0)
-        if cq.reserved_gpu + demand > nominal + 1e-9:
-            deficit = cq.reserved_gpu + demand - nominal
-            blockers.append(
-                Blocker(BlockerGroup.QUOTA, "gpu quota exceeded", {"gpu": deficit})
-            )
-
-    # Topology fit: gang atomicity — the whole gang must fit one feasible domain.
-    feasible_domains: list[str] = []
-    assignment: dict[str, dict[str, int]] = {}
-    if action.type in (ActionType.PLACE, ActionType.ADMIT_AND_PLACE):
-        masked = set(policy.protected_domains)
-        cand_domains = getattr(action, "domain_id_or_set", ()) or tuple(
-            d for d, dom in sym.domains.items() if dom.level.value == "rack"
-        )
-        for dom_id in cand_domains:
-            if dom_id in masked:
-                continue
-            free = _domain_free_gpu(sym, dom_id)
-            if free >= demand:
-                feasible_domains.append(dom_id)
-        if not feasible_domains:
-            blockers.append(
-                Blocker(
-                    BlockerGroup.GANG_ATOMICITY,
-                    "gang does not fit any feasible domain",
-                    {"gpu": float(demand)},
-                )
-            )
-        else:
-            assignment = _assign_gang(sym, feasible_domains[0], demand)
-            if not assignment:
-                blockers.append(
-                    Blocker(BlockerGroup.HEALTH_SCHEDULABILITY, "no healthy gpus")
-                )
-
-    ok = len(blockers) == 0
-    return FeasibilityResult(
-        feasible=ok,
-        blockers=blockers,
-        feasible_domains=feasible_domains,
-        assignment=assignment if ok else {},
-    )
-
-
-def _domain_free_gpu(sym: SymbolicState, dom_id: str) -> int:
-    """Free schedulable GPU in a rack domain (ready & unallocated; doc TAS rule)."""
-    dom = sym.domains.get(dom_id)
-    if dom is None:
-        return 0
-    # rack domain id convention: "dom-rack-{r}" ↔ rack "rack-{r}"
-    rack_id = dom_id.replace("dom-rack-", "rack-")
-    free = 0
-    for gpu in sym.gpus.values():
-        node = sym.nodes.get(gpu.node_uid)
-        if node is None or node.rack_id != rack_id:
-            continue
-        if not node.ready or not node.schedulable:
-            continue
-        if node.node_health.value not in ("ready", "degraded"):
-            continue
-        if gpu.allocated_to is None and gpu.health_state.value in (
-            "healthy",
-            "degraded",
-        ):
-            free += 1
-    return free
-
-
-def _assign_gang(
-    sym: SymbolicState, dom_id: str, demand: int
-) -> dict[str, dict[str, int]]:
-    """Produce a concrete integer placement (podset → {node: replicas})."""
-    rack_id = dom_id.replace("dom-rack-", "rack-")
-    by_node: dict[str, int] = {}
-    remaining = demand
-    for gpu in sym.gpus.values():
-        if remaining <= 0:
-            break
-        node = sym.nodes.get(gpu.node_uid)
-        if node is None or node.rack_id != rack_id:
-            continue
-        if gpu.allocated_to is None and gpu.health_state.value in (
-            "healthy",
-            "degraded",
-        ):
-            by_node[gpu.node_uid] = by_node.get(gpu.node_uid, 0) + 1
-            remaining -= 1
-    if remaining > 0:
-        return {}
-    return {"gang": by_node}
+    return _KERNEL.feasible(state, action)
 
 
 def step(state: WorldState, action: Action) -> WorldState:
     """Apply the exact symbolic transition ``X_{t+1} = K(X_t, a_t)`` (doc R, Eq1).
 
-    Deterministic. Infeasible actions are a *reject / no-op*, never a teleport
-    into an infeasible allocation (doc actions.py interventional semantics).
+    Thin adapter over :meth:`ExactSymbolicKernel.step`: deterministic, with
+    interventional reject-as-no-op semantics. Using the kernel here means a branch
+    transition can never diverge from the shield's transition (doc R, T2).
     """
-    import copy
-
-    res = feasible(state, action)
-    new_sym = copy.deepcopy(state.symbolic)
-    if not res.feasible:
-        return WorldState(
-            ts_ns=state.ts_ns,
-            tick=state.tick + 1,
-            symbolic=new_sym,
-            context=state.context,
-            source=state.source,
-        )
-    uid = action_workload_uid(action)
-    wl = new_sym.workloads.get(uid) if uid else None
-    if action.type in (ActionType.ADMIT, ActionType.ADMIT_AND_PLACE) and wl is not None:
-        cq_id = getattr(action, "cluster_queue_id", None)
-        cq = new_sym.cluster_queues.get(cq_id)
-        demand = _workload_gpu_demand(new_sym, uid)
-        if cq is not None:
-            cq.reserved_gpu += demand
-        wl.status = (
-            new_sym.workloads[uid].status.ADMITTED
-            if action.type == ActionType.ADMIT
-            else new_sym.workloads[uid].status.RUNNING
-        )
-        wl.admitted_flavor_id = getattr(action, "resource_flavor_id", None)
-    if action.type in (ActionType.PLACE, ActionType.ADMIT_AND_PLACE) and wl is not None:
-        if res.feasible_domains:
-            wl.admitted_domain_id = res.feasible_domains[0]
-        # commit the integer assignment onto the GPUs
-        for _ps, by_node in res.assignment.items():
-            for node_id, k in by_node.items():
-                assigned = 0
-                for gpu in new_sym.gpus.values():
-                    if assigned >= k:
-                        break
-                    if gpu.node_uid == node_id and gpu.allocated_to is None:
-                        gpu.allocated_to = uid
-                        assigned += 1
-    return WorldState(
-        ts_ns=state.ts_ns,
-        tick=state.tick + 1,
-        symbolic=new_sym,
-        context=state.context,
-        source=state.source,
-    )
+    return _KERNEL.step(state, action)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -323,6 +159,47 @@ class CounterfactualPack:
         return out
 
 
+@dataclass(slots=True)
+class RareEventSpec:
+    """A single scheduled rare-event onset (the ONE unified injection path).
+
+    The data engine ships exactly one rare-event application path (doc D
+    rare_event_library; doc R rare_event_simulation). ``cfg.rare_event`` (or a
+    scenario_loader injection) is translated into this spec, which the rollout
+    applies **at a scheduled onset step** through the simulator's state-mutating
+    library (:func:`...simulator.rare_events.apply_event`). The *same* library the
+    branch runner and exact kernel re-read is used here, so a fault burst masks
+    GPUs, a cooling derate lowers the shared zone margin/coupling before any
+    delayed thermal effect, and a queue burst bursts pending counts — all under
+    common random numbers so paired branches see the identical exogenous event
+    (doc R causal-consistency rules: perturb the shared parent state first).
+
+    ``name`` is a member of :data:`...simulator.rare_events.RARE_EVENTS`.
+    ``onset_s`` schedules the mutation: ``0`` applies it at ``t0`` (reconciling the
+    scenario_loader pre-state path), ``>0`` applies it mid-rollout at the first
+    step ``k`` with ``k·dt ≥ onset_s`` (the "fault onset time" the doc randomizes
+    aggressively). ``kwargs`` carry the event's severity-shaped parameters.
+    """
+
+    name: str
+    onset_s: float = 0.0
+    kwargs: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ResidualBundle:
+    """The optional learned residuals applied during a branch rollout (doc N H1).
+
+    Defaults to ``None`` everywhere ⇒ identity ⇒ the rollout is the calibrated
+    pure-physics generator (TP1). A trained model injects modulating residuals to
+    couple physics + learned dynamics without breaking passivity (doc N H2/H3).
+    """
+
+    thermal: ThermalResidual | None = None
+    power: PowerResidual | None = None
+    hazard: HazardResidual | None = None
+
+
 def build_pack(
     pod: PodTopology,
     base_state: WorldState,
@@ -332,12 +209,18 @@ def build_pack(
     *,
     baseline_action_id: str = "hold",
     fault_tilt: float = 1.0,
+    rare_event: RareEventSpec | None = None,
+    residuals: ResidualBundle | None = None,
 ) -> CounterfactualPack:
     """Build a counterfactual pack: roll each action under common random numbers.
 
     Every branch shares the exogenous seed bundle ``Û`` (doc R, [A5]); only the
     clamped action changes (doc R, [A4]). The pre-action hash anchors the pack
     (doc R, abduction step 1/2). At least three actions are required.
+
+    ``rare_event`` is the single unified rare-event onset applied identically to
+    every branch via the simulator library (doc D/R); ``residuals`` are optional
+    learned physics residuals (doc N H1, identity by default).
     """
     if len(actions) < 3:
         raise ValueError("counterfactual pack requires >= 3 actions (doc D harness)")
@@ -352,7 +235,15 @@ def build_pack(
     for i, action in enumerate(actions):
         aid = _action_id(action, i)
         outcome = _rollout_branch(
-            pod, base_state, action, aid, bundle, horizon_s, fault_tilt
+            pod,
+            base_state,
+            action,
+            aid,
+            bundle,
+            horizon_s,
+            fault_tilt,
+            rare_event=rare_event,
+            residuals=residuals,
         )
         pack.branches.append(outcome)
     return pack
@@ -373,6 +264,9 @@ def _rollout_branch(
     bundle: SeedBundle,
     horizon_s: int,
     fault_tilt: float,
+    *,
+    rare_event: RareEventSpec | None = None,
+    residuals: ResidualBundle | None = None,
 ) -> BranchOutcome:
     """Roll one action branch forward deterministically under shared seeds.
 
@@ -380,6 +274,14 @@ def _rollout_branch(
     residual rollout draws from per-stream generators derived from the *shared*
     bundle, so two branches see identical phase/health/cooling/fault noise — the
     common-random-number property (doc R, Eq11/Eq12).
+
+    The unified rare-event onset (``rare_event``) is applied **once**, at its
+    scheduled step, through the simulator's state-mutating library. Its symbolic
+    effect (masked GPUs, derated zone, burst pending) then *propagates* through
+    the rest of the rollout — the kernel sees a smaller healthy pool, the thermal
+    boundary rises, etc. — exactly the doc-R causal-consistency requirement that a
+    rare event perturbs the shared parent state first and induces downstream
+    effects only afterwards.
     """
     res = feasible(base_state, action)
     if not res.feasible:
@@ -396,6 +298,8 @@ def _rollout_branch(
         wl = post.symbolic.workloads.get(uid)
         placed = wl.admitted_domain_id if wl else None
 
+    residuals = residuals or ResidualBundle()
+
     # ----- stochastic residual rollout under common random numbers -----------
     rng_phase = np.random.default_rng(bundle.stream("phase"))
     rng_health = np.random.default_rng(bundle.stream("health"))
@@ -408,13 +312,35 @@ def _rollout_branch(
     dt_s = 30.0
     n_steps = max(1, int(horizon_s / dt_s))
 
-    # which GPUs are active under this branch (allocated_to set ⇒ running a job)
-    active_mask = np.array(
-        [post.symbolic.gpus[g].allocated_to is not None for g in pod.gpu_ids]
-    )
+    # Onset bookkeeping: the rare event fires once, at the first step whose end of
+    # interval reaches ``onset_s`` (``onset_s == 0`` fires at t0, before step 0).
+    onset_step = _onset_step(rare_event, dt_s, n_steps) if rare_event else None
+    rare_applied = False
+    cur_state = post  # the symbolic world the rare event mutates in place
+
+    # If the onset is at t0, apply it before the dynamics so the very first step
+    # already runs on the perturbed parent state (reconciles scenario_loader t0).
+    if rare_event is not None and onset_step == 0:
+        cur_state = _apply_rare_onset(rare_event, cur_state, bundle, step_i=0)
+        rare_applied = True
+
+    # which GPUs are active under this branch (allocated_to set ⇒ running a job).
+    # Recomputed lazily from ``cur_state`` after every onset so a fault burst that
+    # masks a placed GPU drops it from the active set immediately.
+    def _active_from(state: WorldState) -> np.ndarray:
+        return np.array(
+            [
+                state.symbolic.gpus[g].allocated_to is not None
+                and state.symbolic.gpus[g].health_state.value
+                in ("healthy", "degraded")
+                for g in pod.gpu_ids
+            ]
+        )
+
+    active_mask = _active_from(cur_state)
     phase_prog = sample_phase_program(horizon_s, rng_phase)
-    health = {g: post.symbolic.gpus[g].health_state.value for g in pod.gpu_ids}
-    cooling_state = "normal"
+    health = {g: cur_state.symbolic.gpus[g].health_state.value for g in pod.gpu_ids}
+    cooling_state = "derated" if _zone_derated(cur_state) else "normal"
 
     faults = sample_fault_cluster(
         [g for g, a in zip(pod.gpu_ids, active_mask, strict=False) if a],
@@ -423,6 +349,7 @@ def _rollout_branch(
         FaultParams(),
         health_state=health,
         rate_tilt=fault_tilt,
+        residual=residuals.hazard,
     )
 
     pwr_params = PowerParams()
@@ -434,12 +361,33 @@ def _rollout_branch(
     min_headroom = float("inf")
     hotspot_steps = 0
     requeue_flag = 0.0
-    xid_flag = 0.0
+    xid_flag = 1.0 if _zone_fault_present(cur_state, pod) else 0.0
     pods_ready_timeout = 0.0
     completion_progress = 0.0
+    queue_burst_active = _queue_bursting(cur_state)
 
     for k in range(n_steps):
         t = k * dt_s
+        # ---- mid-rollout rare-event onset (the single unified injection path) --
+        if (
+            rare_event is not None
+            and not rare_applied
+            and onset_step is not None
+            and k == onset_step
+        ):
+            cur_state = _apply_rare_onset(rare_event, cur_state, bundle, step_i=k)
+            rare_applied = True
+            # Propagate the perturbed parent state into the rollout immediately.
+            active_mask = _active_from(cur_state)
+            for g in pod.gpu_ids:
+                health[g] = cur_state.symbolic.gpus[g].health_state.value
+            if _zone_derated(cur_state):
+                cooling_state = "derated"
+            if _zone_fault_present(cur_state, pod):
+                xid_flag = 1.0
+            if _queue_bursting(cur_state):
+                queue_burst_active = True
+
         phase_idx = phase_prog.index_at(t)
         gpu_phase = np.full(n_gpu, phase_idx, dtype=int)
         # synchronised transitions per rack: gang ⇒ all active gpus transition
@@ -464,6 +412,7 @@ def _rollout_branch(
             pwr_params,
             rng_tel,
             dt_s,
+            residual=residuals.power,
         )
         # thermal: map per-gpu power into the gpu thermal compartments. Power (W)
         # is scaled to heat-source units so a full-load GPU sits ~30 K above the
@@ -471,21 +420,36 @@ def _rollout_branch(
         heat = np.zeros(pod.thermal.n)
         for gi, tidx in enumerate(pod.gpu_thermal_idx):
             heat[tidx] = pwr.p_gpu_w[gi] / 100.0
-        boundary = ambient + (3.0 if cooling_state == "derated" else 0.0)
-        thermal = step_thermal(pod.thermal, thermal, heat, boundary, dt_s)
+        # Boundary inlet rise from an active cooling derate, read from the mutated
+        # zone state so the *magnitude* tracks the event severity (a 30 % derate
+        # raises inlet ~6 K — the simulator library's zone perturbation) rather
+        # than a flat penalty (doc D: shared zone-level perturbation, then delayed
+        # hotspot via thermal inertia).
+        derate_inlet = (
+            _zone_inlet_rise(cur_state) if cooling_state == "derated" else 0.0
+        )
+        boundary = ambient + derate_inlet
+        thermal = step_thermal(
+            pod.thermal, thermal, heat, boundary, dt_s, residual=residuals.thermal
+        )
 
         racks_kw = rack_power_kw(pwr, pod.gpu_rack_idx, n_rack, pwr_params)
         max_rack_power = max(max_rack_power, float(racks_kw.max()))
 
         # Rack thermal headroom = design_limit − rack temperature deviation. The
         # 25 K design margin above the inlet reference leaves positive headroom at
-        # full load (~18 K rack deviation) but tightens toward zero — and into
-        # violation — under a cooling derate, exactly the delayed-hotspot pathway
-        # of doc D (cooling_derate rare event).
+        # full load but tightens toward zero — and into violation — under a cooling
+        # derate. A derate shrinks BOTH sides of the budget: it raises the inlet
+        # boundary (above) AND lowers the usable design limit, because a zone that
+        # has lost cooling capacity can safely reject less heat (doc D: shared
+        # zone-level perturbation → delayed hotspot via thermal inertia).
+        design_limit = 25.0 - (
+            _zone_margin_loss(cur_state) * 18.0 if cooling_state == "derated" else 0.0
+        )
         rack_temp = np.array(
             [thermal.theta[pod.thermal.index[f"T:{rid}"]] for rid in pod.rack_ids]
         )
-        headroom = 25.0 - rack_temp
+        headroom = design_limit - rack_temp
         min_headroom = min(min_headroom, float(headroom.min()))
         if float(headroom.min()) < 4.0:
             hotspot_steps += 1
@@ -513,8 +477,9 @@ def _rollout_branch(
     if action.type == ActionType.HOLD:
         pods_ready_timeout = 0.0
     else:
-        # if the gang barely fit, readiness can time out under fault pressure
-        pods_ready_timeout = 0.3 * xid_flag
+        # if the gang barely fit, readiness can time out under fault pressure; a
+        # queue burst raises the pods-ready timeout pressure regardless of faults.
+        pods_ready_timeout = max(0.3 * xid_flag, 0.5 if queue_burst_active else 0.0)
 
     kpis = {
         KPIChannel.RACK_POWER_KW.value: max_rack_power,
@@ -540,6 +505,96 @@ def _rollout_branch(
         hazards=hazards,
         placed_domain=placed,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unified rare-event onset application (THE single injection path)
+# ──────────────────────────────────────────────────────────────────────────────
+def _onset_step(spec: RareEventSpec, dt_s: float, n_steps: int) -> int:
+    """First rollout step at which the scheduled onset fires (``onset_s == 0 → 0``).
+
+    The onset fires at the first step ``k`` whose interval *end* ``(k+1)·dt`` has
+    reached ``onset_s`` — i.e. ``k = floor(onset_s / dt)`` — clamped into range so
+    a late onset still lands on the last step rather than being silently dropped.
+    """
+    if spec.onset_s <= 0.0:
+        return 0
+    return int(min(max(0, int(spec.onset_s // dt_s)), n_steps - 1))
+
+
+def _apply_rare_onset(
+    spec: RareEventSpec, state: WorldState, bundle: SeedBundle, *, step_i: int
+) -> WorldState:
+    """Apply ONE rare-event onset through the simulator state-mutating library.
+
+    This is the single point where a named rare event mutates the world during a
+    rollout. It dispatches to :func:`...simulator.rare_events.apply_event` — the
+    *same* library the branch runner uses and the exact kernel re-reads — with a
+    seed derived from the event's natural noise stream (so a fault burst draws from
+    ``health``, a cooling derate from ``cooling``, a queue burst from ``arrivals``)
+    XOR-mixed with the onset step for determinism under common random numbers
+    across paired branches (doc seeding STREAMS; doc R causal-consistency rules).
+    """
+    from ...simulator.rare_events import apply_event
+
+    stream_of = {
+        "gpu_fault_burst": "health",
+        "pods_ready_timeout": "phase",
+        "cooling_derate": "cooling",
+        "power_derate": "cooling",
+        "queue_burst": "arrivals",
+        "maintenance_mask": "operator",
+        "telemetry_degradation": "telemetry",
+    }
+    base = bundle.stream(stream_of.get(spec.name, "regime"))
+    seed = base ^ (step_i * 0x85EBCA6B)
+    return apply_event(spec.name, state, seed, **spec.kwargs)
+
+
+def _zone_derated(state: WorldState) -> bool:
+    """True iff any cooling zone has lost margin (a derate is active; doc D)."""
+    return any(
+        cz.cooling_margin < 0.999 or cz.inlet_temp_c > 0.0 + 1e-6
+        for cz in state.symbolic.cooling_zones.values()
+    )
+
+
+def _zone_inlet_rise(state: WorldState) -> float:
+    """Max inlet-temperature rise across cooling zones (K) from an active derate.
+
+    The simulator ``cooling_derate`` event raises each zone's ``inlet_temp_c``;
+    the rollout reads the realised rise so the thermal boundary tracks the event's
+    severity rather than a flat penalty (doc D shared-zone perturbation).
+    """
+    rises = [cz.inlet_temp_c for cz in state.symbolic.cooling_zones.values()]
+    return float(max(rises)) if rises else 0.0
+
+
+def _zone_margin_loss(state: WorldState) -> float:
+    """Fractional cooling-margin loss across zones in ``[0, 1]`` (derate depth).
+
+    ``cooling_margin`` starts at ~1.0 and is multiplied down by a derate; the loss
+    ``1 − margin`` measures how much usable thermal headroom the zone forfeits.
+    """
+    losses = [
+        max(0.0, 1.0 - cz.cooling_margin)
+        for cz in state.symbolic.cooling_zones.values()
+    ]
+    return float(max(losses)) if losses else 0.0
+
+
+def _zone_fault_present(state: WorldState, pod: PodTopology) -> bool:
+    """True iff any GPU is in a fault/masked device-health state (burst onset)."""
+    return any(
+        state.symbolic.gpus[g].health_state.value
+        in ("intermittently_faulty", "masked", "reset_recovery")
+        for g in pod.gpu_ids
+    )
+
+
+def _queue_bursting(state: WorldState) -> bool:
+    """True iff the context records an active arrival burst (queue_burst onset)."""
+    return state.context.arrival_burst_regime in ("burst", "campaign")
 
 
 def _branch_cross_rack(pod: PodTopology, post: WorldState, uid: str | None) -> float:
@@ -608,6 +663,8 @@ def default_action_catalog(state: WorldState, workload_uid: str) -> list[Action]
 __all__ = [
     "BranchOutcome",
     "CounterfactualPack",
+    "RareEventSpec",
+    "ResidualBundle",
     "build_pack",
     "default_action_catalog",
     "feasible",

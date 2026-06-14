@@ -67,6 +67,41 @@ function rackToDomain(rackId: string): string {
   return `dom-${rackId}`;
 }
 
+function domainToRack(domainId: string): string {
+  return domainId.replace(/^dom-/, "");
+}
+
+/**
+ * Baseline occupancy fraction per rack at tick 0. SINGLE source of truth shared
+ * by the snapshot, the rollout builder, and the compare feasibility math so the
+ * mock backend is internally consistent (a domain's reported `free_gpu` is the
+ * same number the why-not deficit is computed against).
+ */
+const BASE_FILL: Record<string, number> = {
+  "rack-a1": 0.18,
+  "rack-a2": 0.62,
+  "rack-b1": 0.45,
+  "rack-b2": 0.84,
+};
+
+/** GPUs free in a rack domain at tick 0 (mirrors buildMockSnapshot). */
+function rackFreeGpu(rackId: string): number {
+  const cap = NODES_PER_RACK * GPUS_PER_NODE;
+  const fill = BASE_FILL[rackId] ?? 0.5;
+  return Math.round((1 - fill) * cap);
+}
+
+/**
+ * Schedulable (gang-eligible) GPUs free in a rack domain. Mirrors the snapshot's
+ * degraded-node masking: rack-b2's node n3 is degraded (Xid 79) and
+ * unschedulable, so its 8 GPUs cannot host any part of a required gang.
+ */
+function rackSchedulableFreeGpu(rackId: string): number {
+  const free = rackFreeGpu(rackId);
+  const maskedByDegradedNode = rackId === "rack-b2" ? GPUS_PER_NODE : 0;
+  return Math.max(0, free - maskedByDegradedNode);
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // GET /state/current
 // ──────────────────────────────────────────────────────────────────────────
@@ -79,12 +114,7 @@ export function buildMockSnapshot(tick = 0): StateSnapshotDTO {
 
   // Baseline occupancy: rack-a1 lightly loaded (clean block), a2 busy,
   // b1 half, b2 nearly full (tight headroom). Drives the golden-path story.
-  const baseFill: Record<string, number> = {
-    "rack-a1": 0.18,
-    "rack-a2": 0.62,
-    "rack-b1": 0.45,
-    "rack-b2": 0.84,
-  };
+  const baseFill = BASE_FILL;
 
   for (const rackId of RACK_IDS) {
     const fill = Math.min(0.95, baseFill[rackId] + 0.03 * Math.sin(tick / 3));
@@ -268,12 +298,7 @@ function buildRollout(
 ): RolloutDTO {
   const step = 60;
   const points: RolloutPoint[] = [];
-  const baseFill: Record<string, number> = {
-    "rack-a1": 0.18,
-    "rack-a2": 0.62,
-    "rack-b1": 0.45,
-    "rack-b2": 0.84,
-  };
+  const baseFill = BASE_FILL;
 
   for (let t = 0; t <= horizonS; t += step) {
     const frac = t / horizonS;
@@ -361,19 +386,107 @@ function buildRollout(
 // ──────────────────────────────────────────────────────────────────────────
 // POST /actions/compare
 // ──────────────────────────────────────────────────────────────────────────
+/**
+ * Abstain thresholds (mirror docs G / L). When a candidate's calibrated
+ * epistemic or OOD score crosses these, the forecast is treated as too
+ * uncertain to recommend on and the candidate ABSTAINS (banded chart + abstain
+ * chip), rather than being silently down-weighted.
+ */
+const EPISTEMIC_ABSTAIN = 0.45;
+const OOD_ABSTAIN = 0.35;
+
 export function buildMockCompare(req: CompareRequest): CompareResultDTO {
   const horizon = req.horizon_s || 1800;
-  const candidates: CandidateResultDTO[] = req.candidate_actions.map((c) => {
-    const target =
-      (c.params.domain_id_or_set as string[] | undefined)?.[0]?.replace(
-        "dom-",
-        "",
-      ) ?? null;
-    const isHold = c.type === "hold";
-    const rack = isHold ? null : (target ?? "rack-a1");
 
-    // Branch B (rack-b cluster) is feasible but worse locality + higher risk.
+  // Resolve the focused workload's required gang size from the deterministic
+  // tick-0 snapshot (kept consistent with what the renderer fetched), so the
+  // gang-atomicity feasibility test below uses the SAME numbers the UI shows.
+  const snap0 = buildMockSnapshot(0);
+  const reqWorkloadUid =
+    (req.candidate_actions[0]?.params.workload_uid as string | undefined) ??
+    FOCUS_WORKLOAD;
+  const gpuReq =
+    snap0.entities.workloads.find((w) => w.workload_uid === reqWorkloadUid)
+      ?.gpu_req ?? 16;
+
+  const candidates: CandidateResultDTO[] = req.candidate_actions.map((c) => {
+    const domainId = (c.params.domain_id_or_set as string[] | undefined)?.[0] ?? null;
+    const rack = c.type === "hold" || !domainId ? null : domainToRack(domainId);
+    const isHold = c.type === "hold";
+    const domainPolicy = (c.params.domain_policy as string | undefined) ?? "required";
+
+    // Exact-kernel feasibility (doc S gang_atomicity + health_schedulability):
+    // a required/preferred gang must fit one rack domain's SCHEDULABLE free GPUs.
+    const schedFree = rack != null ? rackSchedulableFreeGpu(rack) : Infinity;
+    const gangConstrained = domainPolicy === "required" || domainPolicy === "preferred";
+    const blocked = !isHold && gangConstrained && schedFree < gpuReq;
+
+    // Branch into rack-b cluster is feasible-but-worse-locality; the blocked
+    // branch lands in the tightest rack and exercises the why-not path.
     const worseLocality = rack?.startsWith("rack-b") ?? false;
+
+    if (blocked) {
+      // BLOCKED candidate: no rank, no forward motion, exact blockers populated.
+      const epistemic = 0.31;
+      const oodScore = 0.12;
+      return {
+        action_id: c.action_id,
+        safe: false,
+        exact_blockers: ["gang_atomicity", "node_capacities", "health_schedulability"],
+        rank: null,
+        delta_kpis: {
+          // Deltas are still reported for context but the gate already rejected.
+          queue_wait_delta_s: -420,
+          admitted_gpu_hours_delta: 24,
+          topology_fragmentation_delta: 0.22,
+          rack_thermal_headroom_c: -5.5,
+          completion_time_delta_s: 540,
+          cross_rack_rate: 0.41,
+        },
+        uncertainty: {
+          epistemic_score: epistemic,
+          ood_score: oodScore,
+          abstain: false,
+          abstain_reason: null,
+          quantiles: [
+            {
+              channel: "queue_wait_delta_s",
+              horizon_s: horizon,
+              quantiles: { "0.05": -540, "0.5": -420, "0.95": -180 },
+            },
+          ],
+          hazards: [
+            {
+              channel: "hotspot",
+              horizon_s: horizon,
+              probability: 0.22,
+              conformal_upper: 0.28,
+            },
+            {
+              channel: "pods_ready_timeout",
+              horizon_s: horizon,
+              probability: 0.09,
+              conformal_upper: 0.14,
+            },
+          ],
+        },
+        // Blocked branches carry NO rollout: motion stops at the blocker and the
+        // branch gets a lock badge instead of a soft-failure animation (doc G).
+        rollout: req.include_rollouts
+          ? {
+              branch_id: c.action_id,
+              action_label: `Admit → ${rack} (blocked)`,
+              timestep_s: 60,
+              points: [],
+              scene_annotations: {
+                recommended_domain_ids: [],
+                blocked_domain_ids: [domainId!],
+                highlight_workload_ids: [reqWorkloadUid],
+              },
+            }
+          : null,
+      };
+    }
 
     const deltaKpis: Partial<Record<KPIChannel, number>> = isHold
       ? {
@@ -392,20 +505,44 @@ export function buildMockCompare(req: CompareRequest): CompareResultDTO {
           cross_rack_rate: worseLocality ? 0.34 : 0.02,
         };
 
-    const epistemic = worseLocality ? 0.31 : 0.16;
+    // Fit margin: how comfortably the gang fits the chosen feasible domain.
+    // A domain that BARELY fits (free_gpu just above gpu_req) drives the forecast
+    // toward saturation, where the learned model extrapolates out-of-distribution
+    // — so OOD/epistemic rise as the margin shrinks (doc L calibrated abstain).
+    const freeGpu = rack != null ? rackFreeGpu(rack) : Infinity;
+    const fitMargin = isHold
+      ? 1
+      : Math.max(0, Math.min(1, (freeGpu - gpuReq) / Math.max(1, gpuReq)));
+    const tightness = 1 - fitMargin; // 0 = roomy, 1 = exactly at capacity
+
+    const epistemic = isHold
+      ? 0.14
+      : (worseLocality ? 0.28 : 0.14) + 0.22 * tightness;
+    const oodScore = isHold
+      ? 0.05
+      : (worseLocality ? 0.1 : 0.06) + 0.4 * tightness;
     const hotspotProb = worseLocality ? 0.22 : 0.07;
+
+    // Abstain GATE: if calibrated epistemic / OOD uncertainty crosses the
+    // thresholds, this candidate abstains (doc L) — banded chart + abstain chip,
+    // and it cannot win the recommendation.
+    const abstain =
+      epistemic >= EPISTEMIC_ABSTAIN || oodScore >= OOD_ABSTAIN;
+    const abstainReason = abstain
+      ? `epistemic ${epistemic.toFixed(2)} / ood ${oodScore.toFixed(2)} exceed abstain threshold`
+      : null;
 
     return {
       action_id: c.action_id,
-      safe: true, // all three demo candidates are kernel-certified safe
+      safe: true, // kernel-certified feasible
       exact_blockers: [],
-      rank: isHold ? 3 : worseLocality ? 2 : 1,
+      rank: abstain ? null : isHold ? 3 : worseLocality ? 2 : 1,
       delta_kpis: deltaKpis,
       uncertainty: {
         epistemic_score: epistemic,
-        ood_score: 0.08,
-        abstain: false,
-        abstain_reason: null,
+        ood_score: oodScore,
+        abstain,
+        abstain_reason: abstainReason,
         quantiles: [
           {
             channel: "queue_wait_delta_s",
@@ -445,9 +582,22 @@ export function buildMockCompare(req: CompareRequest): CompareResultDTO {
     };
   });
 
+  // Recommendation: best lexicographic rank among candidates that are SAFE,
+  // not abstaining, and ranked. Blocked / abstaining candidates are excluded by
+  // the gate, never by a soft penalty.
   const safeRanked = candidates
     .filter((c) => c.safe && !c.uncertainty.abstain && c.rank !== null)
     .sort((a, b) => (a.rank ?? 99) - (b.rank ?? 99));
+
+  // Whole-compare abstain: if no safe ranked survivor remains (all blocked or
+  // abstaining), the compare itself abstains rather than inventing a winner.
+  const anyAbstain = candidates.some((c) => c.uncertainty.abstain);
+  const compareAbstain = safeRanked.length === 0;
+  const abstainReason = compareAbstain
+    ? anyAbstain
+      ? "all feasible candidates exceed the uncertainty abstain threshold"
+      : "no feasible candidate survived the exact kernel"
+    : null;
 
   return {
     state_hash: req.state_hash,
@@ -457,8 +607,8 @@ export function buildMockCompare(req: CompareRequest): CompareResultDTO {
       req.candidate_actions[0]?.action_id ??
       "baseline",
     recommended_action_id: safeRanked[0]?.action_id ?? null,
-    abstain: false,
-    abstain_reason: null,
+    abstain: compareAbstain,
+    abstain_reason: abstainReason,
     candidates,
     model_version: MODEL_VERSION,
     policy_version: POLICY_VERSION,
@@ -470,34 +620,64 @@ export function buildMockCompare(req: CompareRequest): CompareResultDTO {
 // POST /actions/why-not
 // ──────────────────────────────────────────────────────────────────────────
 export function buildMockWhyNot(req: WhyNotRequest): WhyNotDTO {
-  // The mock "blocked" certificate demonstrates the doc-S grammar: a required
-  // 16-GPU gang cannot fit in the nearly-full rack-b2 domain (gang atomicity +
-  // node capacity deficit), and a degraded node masks part of the block.
+  // The "blocked" certificate demonstrates the doc-S grammar: a required gang
+  // cannot fit one rack domain (gang atomicity + node-capacity deficit) and a
+  // degraded node masks part of the block. The deficits are computed from the
+  // ACTUAL submitted action (its target domain + the workload's gang size) and
+  // the same deterministic capacity model the snapshot/compare use, so the card
+  // is consistent with the rest of the demo rather than hardcoded.
   const action = req.candidate_action;
+  const domainId =
+    (action.params.domain_id_or_set as string[] | undefined)?.[0] ?? "dom-rack-b2";
+  const rack = domainToRack(domainId);
+  const policy = (action.params.domain_policy as string | undefined) ?? "required";
+
+  const snap0 = buildMockSnapshot(0);
+  const wlUid = (action.params.workload_uid as string | undefined) ?? FOCUS_WORKLOAD;
+  const gpuReq =
+    snap0.entities.workloads.find((w) => w.workload_uid === wlUid)?.gpu_req ?? 16;
+
+  const freeGpu = rackFreeGpu(rack);
+  const schedFree = rackSchedulableFreeGpu(rack);
+  const gangDeficit = Math.max(1, gpuReq - freeGpu);
+  const degradedNode = rack === "rack-b2";
+
+  const exactBlockers: WhyNotDTO["exact_blockers"] = [
+    {
+      group: "gang_atomicity",
+      detail: `topology_policy=${policy}: ${gpuReq}-GPU gang must fit one rack domain; ${domainId} free=${freeGpu}`,
+      deficit: { gpu: gangDeficit },
+    },
+    {
+      group: "node_capacities",
+      detail: `${domainId} schedulable free=${schedFree} < required ${gpuReq}`,
+      deficit: { schedulable_gpu: Math.max(1, gpuReq - schedFree) },
+    },
+  ];
+  const minimalGroups: WhyNotDTO["minimal_groups"] = ["gang_atomicity", "node_capacities"];
+  if (degradedNode) {
+    exactBlockers.push({
+      group: "health_schedulability",
+      detail: `node ${rack}-n3 is degraded (Xid 79) and unschedulable`,
+      deficit: { schedulable_gpu: GPUS_PER_NODE },
+    });
+    minimalGroups.push("health_schedulability");
+  }
+
   return {
     action_id: action.action_id,
     safe: false,
-    minimal_groups: ["gang_atomicity", "node_capacities"],
-    exact_blockers: [
-      {
-        group: "gang_atomicity",
-        detail:
-          "required topology policy: 16-GPU gang must fit one rack domain; dom-rack-b2 free=5",
-        deficit: { gpu: 11 },
-      },
-      {
-        group: "node_capacities",
-        detail: "node rack-b2-n3 is degraded (Xid 79) and unschedulable",
-        deficit: { schedulable_gpu: 8 },
-      },
-    ],
+    minimal_groups: minimalGroups,
+    exact_blockers: exactBlockers,
     predicted_risks: [
       "hotspot probability 0.22 (conformal upper 0.28) over 30 min",
       "pods-ready timeout probability 0.09 — cross-rack spillover likely",
     ],
-    rejected_domain_ids: ["dom-rack-b2"],
-    policy_reasons: ["topology_policy=required forbids cross-domain split"],
-    supporting_entities: ["rack-b2", "rack-b2-n3", "tor-rack-b2"],
+    rejected_domain_ids: [domainId],
+    policy_reasons: [`topology_policy=${policy} forbids cross-domain split`],
+    supporting_entities: degradedNode
+      ? [rack, `${rack}-n3`, `tor-${rack}`]
+      : [rack, `tor-${rack}`],
   };
 }
 

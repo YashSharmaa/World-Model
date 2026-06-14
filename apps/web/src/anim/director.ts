@@ -21,6 +21,7 @@
 //  alive during holds.
 
 import { PerspectiveCamera, Vector3 } from "three";
+import type { Store } from "../state/store";
 
 export interface Shot {
   name: string;
@@ -104,6 +105,11 @@ export class CinematicDirector {
     return this.engaged || this.seqActive;
   }
 
+  /** True while the golden-path beat SEQUENCE is still playing (not just a cut). */
+  isSequenceActive(): boolean {
+    return this.seqActive;
+  }
+
   /** Cut to a named shot with an eased transition; engages cinematic control. */
   cutTo(shot: keyof typeof SHOTS, duration = 1.6): void {
     const s = SHOTS[shot];
@@ -119,10 +125,11 @@ export class CinematicDirector {
 
   /**
    * Start the golden-path beat sequence. Beats are timed in seconds of the
-   * sequence clock (which advances with update's dt). Calling with no beats
-   * uses the built-in storyboard.
+   * sequence clock (which advances with update's dt). Pass beats from
+   * {@link defaultGoldenPath} (which binds the store side-effects) or a custom
+   * storyboard.
    */
-  playGoldenPath(beats: Beat[] = defaultGoldenPath()): void {
+  playGoldenPath(beats: Beat[]): void {
     this.beats = [...beats].sort((a, b) => a.at - b.at);
     this.seqTime = 0;
     this.nextBeat = 0;
@@ -196,14 +203,124 @@ export class CinematicDirector {
   }
 }
 
-/** The built-in golden-path storyboard (doc G beats). */
-export function defaultGoldenPath(): Beat[] {
+/** Optional per-beat caption sink (drives the on-screen muted caption). */
+export type CaptionSink = (text: string | null) => void;
+
+/**
+ * The built-in golden-path storyboard — the eight doc-G beats, with each
+ * `onBegin` wired to drive REAL store state so the camera move and the decision
+ * narrative stay in lockstep:
+ *
+ *   1 current pod state   setFocusedWorkload(focus) + runCompare()
+ *   2 surface the choice  (candidate chips are now populated by the compare)
+ *   3 play branch A       playBranch(feasible / recommended)
+ *   4 play branch B       reset cursor + playBranch(blocked) → lock badge
+ *   5 play hold           reset cursor + playBranch(hold)
+ *   6 freeze and compare  freezeAt(horizon) → delta ribbon reads the outcome
+ *   7 show why-not        showWhyNot(blocked) → lock badge + why-not card
+ *   8 resolve             resolveToRecommendation() → bright recommended branch
+ *
+ * The feasible / blocked / hold action ids are LOOKED UP from the live compare
+ * result at beat time (never hardcoded), so the storyboard tracks whatever
+ * candidate alphabet `runCompare` derived from the snapshot.
+ */
+export function defaultGoldenPath(store: Store, caption?: CaptionSink): Beat[] {
+  const recommendedId = (): string | null =>
+    store.get().compare?.recommended_action_id ?? null;
+  const blockedId = (): string | null =>
+    store.get().compare?.candidates.find((c) => !c.safe)?.action_id ?? null;
+  const holdId = (): string | null =>
+    store.get().compare?.candidates.find(
+      (c) => store.candidateAction(c.action_id)?.type === "hold",
+    )?.action_id ?? "hold";
+
+  const cap = (text: string): void => caption?.(text);
+
   return [
-    { at: 0.0, shot: "establishing", duration: 2.2 },
-    { at: 3.0, shot: "pod34", duration: 2.0 },
-    { at: 7.0, shot: "rackCloseup", duration: 1.8 },
-    { at: 11.0, shot: "compareSideBySide", duration: 2.0 },
-    { at: 16.0, shot: "recommendation", duration: 2.0 },
-    { at: 21.0, shot: "pod34", duration: 2.4 },
+    {
+      at: 0.0,
+      shot: "establishing",
+      duration: 2.2,
+      onBegin: () => {
+        const focus =
+          store.get().focusedWorkload ??
+          store.get().snapshot?.entities.workloads.find(
+            (w) => w.status === "pending",
+          )?.workload_uid ??
+          null;
+        store.setFocusedWorkload(focus);
+        void store.runCompare();
+        cap("Current pod state");
+      },
+    },
+    {
+      at: 4.0,
+      shot: "pod34",
+      duration: 2.0,
+      onBegin: () => {
+        store.setMode("decision-studio");
+        cap("Three safe choices");
+      },
+    },
+    {
+      at: 9.0,
+      shot: "rackCloseup",
+      duration: 1.8,
+      onBegin: () => {
+        const a = recommendedId();
+        if (a) store.playBranch(a);
+        cap("Admit now, domain A");
+      },
+    },
+    {
+      at: 16.0,
+      shot: "compareSideBySide",
+      duration: 2.0,
+      onBegin: () => {
+        const b = blockedId();
+        store.setCursor(0);
+        if (b) store.playBranch(b);
+        cap("Feasible, but worse locality");
+      },
+    },
+    {
+      at: 23.0,
+      shot: "pod34",
+      duration: 2.0,
+      onBegin: () => {
+        const h = holdId();
+        store.setCursor(0);
+        if (h) store.playBranch(h);
+        cap("Wait one window");
+      },
+    },
+    {
+      at: 29.0,
+      shot: "compareSideBySide",
+      duration: 1.6,
+      onBegin: () => {
+        store.freezeAt();
+        cap("Compare futures");
+      },
+    },
+    {
+      at: 37.0,
+      shot: "recommendation",
+      duration: 1.8,
+      onBegin: () => {
+        const b = blockedId();
+        if (b) void store.showWhyNot(b);
+        cap("Rejected for exact blockers and higher risk");
+      },
+    },
+    {
+      at: 42.0,
+      shot: "recommendation",
+      duration: 2.0,
+      onBegin: () => {
+        store.resolveToRecommendation();
+        cap("Predict before you place");
+      },
+    },
   ];
 }

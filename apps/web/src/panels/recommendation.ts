@@ -137,10 +137,14 @@ function rowFor(
   store: Store,
 ): HTMLElement {
   const recommended = c.action_id === recommendedId;
-  const row = el(
-    "div",
-    `rec-row ${!c.safe ? "blocked" : recommended ? "recommended" : ""}`,
-  );
+  const rowClass = !c.safe
+    ? "blocked"
+    : c.uncertainty.abstain
+      ? "abstain"
+      : recommended
+        ? "recommended"
+        : "";
+  const row = el("div", `rec-row ${rowClass}`);
 
   const head = el("div", "rec-head");
   head.style.display = "flex";
@@ -153,17 +157,23 @@ function rowFor(
   spacer.style.flex = "1";
   head.append(spacer);
 
-  if (c.safe) {
-    head.append(el("span", "badge safe", "SAFE"));
-  } else {
+  // Abstain is its OWN visual state (doc G): a safe-but-too-uncertain candidate
+  // shows an explicit abstain chip and cannot be the recommendation, rather than
+  // being silently down-weighted.
+  const abstaining = c.safe && c.uncertainty.abstain;
+  if (!c.safe) {
     head.append(el("span", "badge blocked", "BLOCKED"));
+  } else if (abstaining) {
+    head.append(el("span", "badge abstain", "ABSTAIN"));
+  } else {
+    head.append(el("span", "badge safe", "SAFE"));
   }
 
   const actions = el("div", "rec-actions");
-  if (c.safe) {
-    actions.append(chip("Pin", () => store.togglePinned(c.action_id)));
-  } else {
+  if (!c.safe) {
     actions.append(chip("Why not?", () => void store.showWhyNot(c.action_id), "danger"));
+  } else {
+    actions.append(chip("Pin", () => store.togglePinned(c.action_id)));
   }
 
   const wrap = el("div", "");

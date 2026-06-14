@@ -1,7 +1,7 @@
 [
   {
     "action_id": "0:hold:wl-demo-0:",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [],
     "feasible": true,
     "hazards": {
@@ -52,7 +52,7 @@
   },
   {
     "action_id": "0:hold:wl-demo-0:",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [],
     "feasible": true,
     "hazards": {
@@ -103,7 +103,7 @@
   },
   {
     "action_id": "0:hold:wl-demo-0:",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [],
     "feasible": true,
     "hazards": {
@@ -154,7 +154,7 @@
   },
   {
     "action_id": "0:hold:wl-demo-0:",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [],
     "feasible": true,
     "hazards": {
@@ -205,9 +205,9 @@
   },
   {
     "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -216,9 +216,9 @@
   },
   {
     "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -227,9 +227,9 @@
   },
   {
     "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -238,9 +238,9 @@
   },
   {
     "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -249,9 +249,9 @@
   },
   {
     "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -260,9 +260,9 @@
   },
   {
     "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -271,9 +271,9 @@
   },
   {
     "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -282,9 +282,9 @@
   },
   {
     "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -293,9 +293,9 @@
   },
   {
     "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -304,9 +304,9 @@
   },
   {
     "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -315,9 +315,9 @@
   },
   {
     "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},
@@ -326,9 +326,9 @@
   },
   {
     "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
-    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "decision_id": "af68f31771740ef5a6bca6587f7e884e10f555238faf98b2a991d8cdcfa2756b",
     "explanation_tags": [
-      "gang_atomicity"
+      "node_capacities"
     ],
     "feasible": false,
     "hazards": {},

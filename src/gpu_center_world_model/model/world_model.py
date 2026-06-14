@@ -40,7 +40,13 @@ from ..schema.policy import AbstentionConfig
 from ..schema.state import WorldState
 from ..schema.tensors import ShapeCaps
 from ..version import SCHEMA_VERSION
-from .architecture import ArchConfig, FeatureBuilder, RelationalWorldModel, TensorState
+from .architecture import (
+    ArchConfig,
+    FeatureBuilder,
+    RelationalWorldModel,
+    TensorState,
+    kernel_state_summary,
+)
 from .backend import Backend, get_backend
 from .calibration.conformal import ConformalBundleCalibrator
 from .heads import ForecastHeads, HeadConfig, latent_dims_of
@@ -175,21 +181,72 @@ class ResidualWorldModel:
         horizon-complete and the planner reads the slice it needs.
         """
         ts = self._tensor_state(state, caps)
-        return self._forecast_from_tensor(ts, action)
+        return self._forecast_from_tensor(ts, action, state=state, horizon_s=horizon_s)
 
     def _forecast_from_tensor(
-        self, ts: TensorState, action: Action
+        self,
+        ts: TensorState,
+        action: Action,
+        state: WorldState | None = None,
+        horizon_s: int | None = None,
     ) -> KPIForecastBundle:
         a_name = _action_name(action)
         action_id = self._action_id(action)
         z = self.backbone.encode(ts, a_name)
+        # Free-running predictor rollout (doc J D6, doc E compiled outer rollout
+        # step): advance the encoded belief through ``P_θ`` for the requested
+        # horizon, conditioned on the action and the stop-grad exact kernel-state
+        # summary, then forecast from the *rolled* latent so the bundle reflects
+        # the deployed recursive core — not a single-step encoding. The latent
+        # key set is unchanged, so the head contract and KPIForecastBundle fields
+        # stay byte-stable.
+        z_head = self._rollout_latent(z, a_name, ts, state, horizon_s)
         epi = self._epistemic(ts, a_name, z)
         query_row = self._query_row(ts, action)
         bundle = self.heads.forecast_bundle(
-            action_id, z, ts.masks, query_row=query_row, epistemic_disagreement=epi
+            action_id, z_head, ts.masks, query_row=query_row, epistemic_disagreement=epi
         )
         bundle = self.calibrator.calibrate(bundle)
         return self._apply_gate(bundle)
+
+    def _rollout_latent(
+        self,
+        z0: object,
+        action_name: str,
+        ts: TensorState,
+        state: WorldState | None,
+        horizon_s: int | None,
+    ) -> dict:
+        """Advance ``z0`` through the predictor for ``horizon_s`` (doc J D6).
+
+        Returns the final rolled latent ``ẑ_H`` the heads forecast from. With no
+        predictor or no state context the encoded ``z0`` is returned unchanged
+        (the heads already emit every horizon), so the path degrades gracefully.
+        """
+        bb = self.backbone
+        if bb.predictor is None or state is None:
+            return z0  # type: ignore[return-value]
+        # Map the wall-clock horizon to a small number of slow predictor steps,
+        # capped by the configured H_slow (doc J B3). One slow step ≈ the planner
+        # decision cadence; HORIZONS_S[-1] (the longest band) maps to H_slow.
+        from ..schema.kpis import HORIZONS_S
+
+        hmax = min(getattr(bb.cfg, "t_slow", 12), 12)
+        if horizon_s is None or not HORIZONS_S:
+            steps = 1
+        else:
+            longest = float(max(HORIZONS_S))
+            steps = max(1, round(hmax * float(horizon_s) / longest))
+        psi = kernel_state_summary(state, bb.be)
+        traj = bb.rollout(
+            z0,  # type: ignore[arg-type]
+            action_name,
+            ts.masks,
+            kernel_states=[psi] * steps,
+            horizon=steps,
+            detach_every=0,  # inference: no BPTT truncation needed
+        )
+        return traj[-1] if traj else z0  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ #
     # WorldModel.score_actions — the single compiled hot path.
@@ -209,7 +266,10 @@ class ResidualWorldModel:
         :class:`KPIForecastBundle` per action, in input order.
         """
         ts = self._tensor_state(state, caps)
-        return [self._forecast_from_tensor(ts, a) for a in actions]
+        return [
+            self._forecast_from_tensor(ts, a, state=state, horizon_s=horizon_s)
+            for a in actions
+        ]
 
     # ------------------------------------------------------------------ #
     # Abstention gate (doc L selective-prediction / doc J R6).

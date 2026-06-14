@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -95,36 +96,79 @@ class EventBroker:
     own bounded queue. Slow clients drop the oldest event rather than back up the
     publisher — matching doc G's note that SSE is the right transport precisely
     because we do not want unbounded two-way buffering.
+
+    Publishing must work from **both** the event loop (async route handlers, the
+    keep-alive task) and a worker thread (FastAPI runs ``def`` route handlers in
+    a threadpool). The subscriber registry is therefore guarded by a plain
+    threading lock, and each subscriber records the loop it belongs to so a
+    cross-thread publish hands the ``put_nowait`` back to that loop via
+    ``call_soon_threadsafe`` — never touching an :class:`asyncio.Queue` off-loop.
     """
 
     def __init__(self, max_queue: int = 256) -> None:
         self._max_queue = max_queue
-        self._subscribers: set[asyncio.Queue[SSEMessage]] = set()
-        self._lock = asyncio.Lock()
+        # queue -> the event loop that queue is serviced on
+        self._subscribers: dict[
+            asyncio.Queue[SSEMessage], asyncio.AbstractEventLoop
+        ] = {}
+        self._lock = threading.Lock()
 
     async def subscribe(self) -> asyncio.Queue[SSEMessage]:
         q: asyncio.Queue[SSEMessage] = asyncio.Queue(maxsize=self._max_queue)
-        async with self._lock:
-            self._subscribers.add(q)
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            self._subscribers[q] = loop
         return q
 
     async def unsubscribe(self, q: asyncio.Queue[SSEMessage]) -> None:
-        async with self._lock:
-            self._subscribers.discard(q)
+        with self._lock:
+            self._subscribers.pop(q, None)
+
+    @staticmethod
+    def _deliver(q: asyncio.Queue[SSEMessage], message: SSEMessage) -> None:
+        """Enqueue one message onto a subscriber, dropping the oldest if full.
+
+        Must run on the loop that owns ``q``. Dropping the oldest event keeps a
+        slow client from backing up the publisher (doc G: SSE is chosen precisely
+        to avoid unbounded buffering).
+        """
+        if q.full():
+            with contextlib.suppress(asyncio.QueueEmpty):  # pragma: no cover
+                q.get_nowait()
+        with contextlib.suppress(asyncio.QueueFull):  # pragma: no cover
+            q.put_nowait(message)
 
     async def publish(self, message: SSEMessage) -> None:
-        """Broadcast a message to all subscribers (dropping oldest if full)."""
-        async with self._lock:
-            subscribers = list(self._subscribers)
-        for q in subscribers:
-            if q.full():
-                # Drop the oldest event so a slow client never backs up the
-                # publisher (doc G: SSE is chosen precisely to avoid unbounded
-                # buffering).
-                with contextlib.suppress(asyncio.QueueEmpty):  # pragma: no cover
-                    q.get_nowait()
-            with contextlib.suppress(asyncio.QueueFull):  # pragma: no cover
-                q.put_nowait(message)
+        """Broadcast a message to all subscribers from the event loop."""
+        with self._lock:
+            subscribers = list(self._subscribers.items())
+        running = asyncio.get_running_loop()
+        for q, loop in subscribers:
+            if loop is running:
+                self._deliver(q, message)
+            else:  # pragma: no cover - cross-loop publish is rare in-process
+                loop.call_soon_threadsafe(self._deliver, q, message)
+
+    def publish_nowait(self, message: SSEMessage) -> None:
+        """Broadcast from *any* thread (e.g. a sync FastAPI route handler).
+
+        Each subscriber's ``put_nowait`` is scheduled on the loop that owns its
+        queue via ``call_soon_threadsafe``, so this is safe to call from a worker
+        thread without ever touching an :class:`asyncio.Queue` off its loop. If a
+        subscriber's loop is the current running loop (rare), delivery is direct.
+        """
+        with self._lock:
+            subscribers = list(self._subscribers.items())
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        for q, loop in subscribers:
+            if loop is running and running is not None:
+                self._deliver(q, message)
+            else:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._deliver, q, message)
 
     @property
     def subscriber_count(self) -> int:
@@ -161,6 +205,66 @@ async def event_source(
         await broker.unsubscribe(q)
 
 
+def state_diff(
+    prev: dict[str, Any] | None, curr: dict[str, Any]
+) -> dict[str, Any]:
+    """Compute a compact semantic ``state_delta`` between two snapshots (doc G).
+
+    Doc G's hardest rule is that the backend returns **semantic diffs and rollout
+    points, not a frame stream**. A ``state_delta`` event therefore carries only
+    what changed between the previous published snapshot and the current one:
+
+    * ``state_hash`` / ``prev_state_hash`` — provenance so the UI can confirm the
+      delta applies to the snapshot it currently holds;
+    * ``entities`` — per entity-kind, the rows whose content changed, keyed by the
+      entity's id field (added/updated rows only; removed ids are listed
+      separately) so the front-end patches its read-model in place;
+    * ``current_kpis`` — only the KPI fields whose value moved;
+    * ``freshness`` — the new freshness block (always small).
+
+    When ``prev`` is ``None`` (the first publish) the delta degrades to a full
+    set of upserts, which is still a valid patch for an empty client model.
+    """
+    out: dict[str, Any] = {
+        "state_hash": curr.get("state_hash"),
+        "prev_state_hash": (prev or {}).get("state_hash"),
+        "entities": {},
+        "current_kpis": {},
+        "freshness": curr.get("freshness", {}),
+    }
+    #: id field per entity kind (mirrors the serialize_state row schema).
+    id_fields = {
+        "racks": "rack_id",
+        "nodes": "node_uid",
+        "gpus": "gpu_uuid",
+        "workloads": "workload_uid",
+        "queues": "name",
+        "topology_domains": "domain_id",
+    }
+    prev_ents = (prev or {}).get("entities", {}) or {}
+    curr_ents = curr.get("entities", {}) or {}
+    for kind, id_field in id_fields.items():
+        prev_rows = {
+            r.get(id_field): r for r in prev_ents.get(kind, []) if id_field in r
+        }
+        upserts: list[dict[str, Any]] = []
+        curr_ids: set[Any] = set()
+        for row in curr_ents.get(kind, []):
+            rid = row.get(id_field)
+            curr_ids.add(rid)
+            if prev_rows.get(rid) != row:
+                upserts.append(row)
+        removed = [rid for rid in prev_rows if rid not in curr_ids]
+        if upserts or removed:
+            out["entities"][kind] = {"upsert": upserts, "remove": removed}
+
+    prev_kpis = (prev or {}).get("current_kpis", {}) or {}
+    for k, v in (curr.get("current_kpis", {}) or {}).items():
+        if prev_kpis.get(k) != v:
+            out["current_kpis"][k] = v
+    return out
+
+
 def render_stream(messages: Iterable[SSEMessage]) -> str:
     """Render a finite sequence of messages to one ``text/event-stream`` body.
 
@@ -187,4 +291,5 @@ __all__ = [
     "event_source",
     "have_sse_starlette",
     "render_stream",
+    "state_diff",
 ]

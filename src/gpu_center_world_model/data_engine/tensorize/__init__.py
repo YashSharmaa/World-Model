@@ -26,15 +26,15 @@ from .tensorizer import (
 )
 
 __all__ = [
-    "tensorize",
-    "EntityIndex",
-    "WORKLOAD_FEATURES",
-    "NODE_FEATURES",
     "GPU_FEATURES",
-    "RACK_FEATURES",
+    "NODE_FEATURES",
     "QUEUE_FEATURES",
+    "RACK_FEATURES",
+    "WORKLOAD_FEATURES",
+    "EntityIndex",
     # re-export schema tensor contract for one clean surface
     "ShapeCaps",
     "TensorBatch",
     "pick_bucket",
+    "tensorize",
 ]

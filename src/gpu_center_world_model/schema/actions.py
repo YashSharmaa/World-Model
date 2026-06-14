@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Union
 
 
 class ActionType(str, Enum):
@@ -99,7 +98,7 @@ class MaskDomain:
     type: ActionType = field(default=ActionType.MASK_DOMAIN, init=False)
 
 
-Action = Union[Hold, Admit, Place, AdmitAndPlace, MaskDomain]
+Action = Hold | Admit | Place | AdmitAndPlace | MaskDomain
 
 
 def action_workload_uid(action: Action) -> str | None:

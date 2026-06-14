@@ -1,0 +1,69 @@
+{
+  "$id": "https://github.com/yashsharmaa/gpu-center-world-model/schema/json_schema/provenance_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Per-release provenance for auditable, reproducible data (docs D/R) plus the doc-H reproducibility gates: a content schema_hash distinct from the SCHEMA_VERSION string, feature/tensorization stats, and a versioned benchmark-manifest reference.",
+  "properties": {
+    "author": {
+      "type": "string"
+    },
+    "author_url": {
+      "type": "string"
+    },
+    "benchmark_manifest": {
+      "additionalProperties": true,
+      "description": "Versioned reference to the benchmark manifest this release was scored against: the benchmark tracks and a manifest URI (doc H Reproducibility gates; evaluation 'Benchmark manifests').",
+      "type": "object"
+    },
+    "calibration_window": {
+      "type": "string"
+    },
+    "feature_stats": {
+      "additionalProperties": true,
+      "description": "Tensorization metadata / feature stats for the release: padded shape caps, per-entity latent widths, compile buckets, and message-passing depth (doc D outputs; doc H Reproducibility gates). 'uri' optionally points at a fuller feature-stats artifact.",
+      "type": "object"
+    },
+    "generator_commit": {
+      "type": "string"
+    },
+    "known_invalid_uses": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "real_fraction": {
+      "type": "number"
+    },
+    "schema_hash": {
+      "description": "Content hash of the canonical JSON-Schema contract set (<algo>:<hexdigest>). Distinct from the SCHEMA_VERSION string: it changes whenever any contract *shape* drifts, even within a version.",
+      "pattern": "^[a-z0-9]+:[0-9a-f]+$",
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "seed_registry": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "type": "object"
+    },
+    "simulator_version": {
+      "type": "string"
+    },
+    "source_inventory": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "generator_commit",
+    "schema_version",
+    "simulator_version"
+  ],
+  "title": "provenance_manifest",
+  "type": "object"
+}

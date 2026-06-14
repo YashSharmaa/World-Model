@@ -25,8 +25,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-
 from ...schema.entities import (
     CommClass,
     PodSet,
@@ -37,7 +35,6 @@ from ...schema.entities import (
 from ...schema.state import WorldState
 from ...schema.tensors import ShapeCaps
 from ...schema.topology import RELATION_ENDPOINTS, Relation, RelationType
-from ...utils.seeding import SeedBundle
 from .arrivals import (
     Arrival,
     RegimeChain,
@@ -47,6 +44,8 @@ from .arrivals import (
 from .counterfactual import (
     BranchOutcome,
     CounterfactualPack,
+    RareEventSpec,
+    ResidualBundle,
     build_pack,
     default_action_catalog,
     feasible,
@@ -54,6 +53,7 @@ from .counterfactual import (
 )
 from .faults import (
     FaultParams,
+    HazardResidual,
     sample_fault_cluster,
 )
 from .fidelity import (
@@ -68,7 +68,14 @@ from .fidelity import (
     predecision_leakage_test,
 )
 from .network import Commodity, Link, allocate
-from .power import PowerParams, init_power_state, rack_power_kw, step_power
+from .power import (
+    PowerParams,
+    PowerResidual,
+    init_power_state,
+    rack_power_kw,
+    step_power,
+    zero_power_residual,
+)
 from .rare_events import (
     RARE_EVENT_FAMILIES,
     RareEventEstimate,
@@ -82,8 +89,29 @@ from .scm import (
     PodSpec,
     PodTopology,
     build_pod,
+    calibrated_posterior,
 )
-from .thermal import ThermalState, step_thermal
+from .sysid import (
+    RANDOMIZATION_TIERS,
+    CalibratedDraw,
+    JointPosterior,
+    PowerTrace,
+    ThermalTrace,
+    build_joint_posterior,
+    fit_hazard,
+    fit_power,
+    fit_thermal,
+    sample_tier,
+)
+from .thermal import (
+    ThermalResidual,
+    ThermalState,
+    effective_system,
+    energy_residual,
+    lyapunov_margin,
+    step_thermal,
+    zero_residual,
+)
 
 
 @dataclass(slots=True)
@@ -187,10 +215,51 @@ def _inject_pending_workload(
     return state, uid
 
 
+#: Default onset (s) and severity-shaped kwargs for each scenario rare-event
+#: family, used to translate ``cfg.rare_event`` (a family name) into the single
+#: unified :class:`RareEventSpec` onset (doc D rare_event_library; doc R onset is
+#: randomized aggressively — onset 0 reconciles the scenario_loader t0 path).
+_RARE_EVENT_DEFAULTS: dict[str, tuple[float, dict[str, object]]] = {
+    "gpu_fault_burst": (300.0, {"intensity": 0.08}),
+    "pods_ready_timeout": (0.0, {"fraction": 0.25}),
+    "cooling_derate": (300.0, {"derate_frac": 0.3}),
+    "power_derate": (300.0, {"derate_frac": 0.25}),
+    "queue_burst": (0.0, {"burst_factor": 2.5}),
+    "maintenance_mask": (0.0, {"fraction": 0.15}),
+    "telemetry_degradation": (300.0, {"fraction": 0.3}),
+}
+
+
+def rare_event_spec_for(
+    name: str | None,
+    *,
+    onset_s: float | None = None,
+    kwargs: dict[str, object] | None = None,
+) -> RareEventSpec | None:
+    """Translate a rare-event family name into the unified :class:`RareEventSpec`.
+
+    Returns ``None`` for ``None``/unknown families (a scenario with no rare event).
+    Onset and kwargs default to :data:`_RARE_EVENT_DEFAULTS` but may be overridden
+    (e.g. by a scenario_loader injection's ``onset_s``/``severity``), so the t0
+    pre-state path and the rollout path schedule the *same* event consistently.
+    """
+    if not name or name not in RARE_EVENT_FAMILIES:
+        return None
+    d_onset, d_kwargs = _RARE_EVENT_DEFAULTS.get(name, (0.0, {}))
+    return RareEventSpec(
+        name=name,
+        onset_s=d_onset if onset_s is None else float(onset_s),
+        kwargs=dict(kwargs) if kwargs is not None else dict(d_kwargs),
+    )
+
+
 def generate_pack(
     caps: ShapeCaps | None = None,
     seed: int = 0,
     scenario: str | ScenarioConfig = "normal",
+    *,
+    rare_event: RareEventSpec | None = None,
+    residuals: ResidualBundle | None = None,
 ) -> CounterfactualPack:
     """Generate one paired counterfactual pack (the synthetic entrypoint).
 
@@ -211,6 +280,13 @@ def generate_pack(
         Master seed for the shared bundle (CRN across branches).
     scenario:
         A scenario name (key of :data:`SCENARIO_PACKS`) or a :class:`ScenarioConfig`.
+    rare_event:
+        Optional explicit unified rare-event onset; defaults to the one implied by
+        ``cfg.rare_event`` (the scenario family's named event). This is the single
+        injection path — the event is applied during the rollout via the simulator
+        state-mutating library, identically across all branches.
+    residuals:
+        Optional learned physics residuals (doc N H1; identity by default).
     """
     cfg = (
         scenario
@@ -226,6 +302,7 @@ def generate_pack(
         pod, cfg.workload_gpu, cfg.comm_class, submit_ts=1000.0
     )
     actions = default_action_catalog(state, uid)
+    spec = rare_event if rare_event is not None else rare_event_spec_for(cfg.rare_event)
     pack = build_pack(
         pod,
         state,
@@ -234,6 +311,8 @@ def generate_pack(
         horizon_s=cfg.horizon_s,
         baseline_action_id=actions[0].type.value,
         fault_tilt=cfg.fault_tilt,
+        rare_event=spec,
+        residuals=residuals,
     )
     # tag baseline id to the concrete hold action id for delta computation
     pack.baseline_action_id = pack.branches[0].action_id
@@ -276,55 +355,78 @@ def generate_pod_state(
 
 
 __all__ = [
-    # entrypoint
-    "generate_pack",
-    "generate_pod_state",
-    "ScenarioConfig",
+    "OPERATOR_MODES",
+    # system identification / calibrated randomization
+    "RANDOMIZATION_TIERS",
+    "RARE_EVENT_FAMILIES",
     "SCENARIO_PACKS",
     # scm
     "WORKLOAD_PHASES",
-    "OPERATOR_MODES",
-    "PodSpec",
-    "PodTopology",
-    "build_pod",
-    # arrivals
-    "TenantClass",
     "Arrival",
-    "RegimeChain",
-    "simulate_arrivals",
-    # thermal / power / network
-    "ThermalState",
-    "step_thermal",
-    "PowerParams",
-    "init_power_state",
-    "step_power",
-    "rack_power_kw",
-    "Link",
-    "Commodity",
-    "allocate",
-    # faults / rare events
-    "FaultParams",
-    "sample_fault_cluster",
-    "RARE_EVENT_FAMILIES",
-    "RareEventEstimate",
-    "build_tilt",
-    "importance_estimate",
-    "point_process_log_lr",
     # counterfactual
     "BranchOutcome",
+    "CalibratedDraw",
+    "Commodity",
     "CounterfactualPack",
-    "build_pack",
-    "default_action_catalog",
-    "feasible",
-    "step",
+    # faults / rare events
+    "FaultParams",
     # fidelity
     "FidelityReport",
+    "HazardResidual",
+    "JointPosterior",
+    "Link",
+    "PodSpec",
+    "PodTopology",
+    "PowerParams",
+    "PowerResidual",
+    "PowerTrace",
+    "RareEventEstimate",
+    "RareEventSpec",
+    "RegimeChain",
+    "ResidualBundle",
+    "ScenarioConfig",
+    # arrivals
+    "TenantClass",
     "TestResult",
-    "exact_kernel_conformance",
-    "mmd2_test",
-    "energy_distance_test",
+    "ThermalResidual",
+    # thermal / power / network
+    "ThermalState",
+    "ThermalTrace",
+    "allocate",
+    "build_joint_posterior",
+    "build_pack",
+    "build_pod",
+    "build_tilt",
+    "calibrated_posterior",
     "classifier_two_sample_test",
-    "lag_structure_test",
+    "default_action_catalog",
+    "effective_system",
+    "energy_distance_test",
+    "energy_residual",
+    "exact_kernel_conformance",
+    "feasible",
+    "fit_hazard",
+    "fit_power",
+    "fit_thermal",
+    # entrypoint
+    "generate_pack",
+    "generate_pod_state",
+    "importance_estimate",
     "incident_bundle_test",
+    "init_power_state",
+    "lag_structure_test",
+    "lyapunov_margin",
+    "mmd2_test",
+    "point_process_log_lr",
     "predecision_leakage_test",
+    "rack_power_kw",
+    "rare_event_spec_for",
+    "sample_fault_cluster",
+    "sample_tier",
+    "simulate_arrivals",
+    "step",
+    "step_power",
+    "step_thermal",
+    "zero_power_residual",
+    "zero_residual",
 ]

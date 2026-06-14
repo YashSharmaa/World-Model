@@ -52,6 +52,10 @@ class EvaluationReport:
     predictive: list[dict[str, object]] = field(default_factory=list)
     calibration: list[dict[str, object]] = field(default_factory=list)
     abstention: dict[str, object] | None = None
+    # interval coverage-by-slice (doc F 85%-95% band, shift-aware)
+    coverage_by_slice: dict[str, object] | None = None
+    # operator-usefulness profile (provisional; doc O ledger L10)
+    operator_usefulness: dict[str, object] | None = None
     slices: dict[str, object] = field(default_factory=dict)
     sample_complexity: dict[str, object] | None = None
     acceptance: dict[str, object] = field(default_factory=dict)
@@ -85,6 +89,7 @@ class EvaluationReport:
             "planning": self.planning,
             "calibration": self.calibration,
             "abstention": self.abstention,
+            "operator_usefulness": self.operator_usefulness,
             "sample_complexity": self.sample_complexity,
         }
         return {
@@ -105,6 +110,8 @@ class EvaluationReport:
             "predictive": self.predictive,
             "calibration": self.calibration,
             "abstention": self.abstention,
+            "coverage_by_slice": self.coverage_by_slice,
+            "operator_usefulness": self.operator_usefulness,
             "slices": self.slices,
             "sample_complexity": self.sample_complexity,
             "acceptance": self.acceptance,
@@ -308,6 +315,57 @@ def render_markdown(report: EvaluationReport) -> str:
                 f"| {c.get('channel')} | {c.get('slice_name')} | {c.get('n')} | "
                 f"{_fmt(c.get('ece'))} | {_fmt(c.get('mce'))} |"
             )
+        lines.append("")
+
+    # 5b. Interval coverage by slice (85%-95% band)
+    if report.coverage_by_slice:
+        cbs = report.coverage_by_slice
+        lines.append("### Interval coverage by slice (85%-95% band)")
+        lines.append(
+            f"- Nominal **{_fmt(cbs.get('nominal'))}** interval; acceptance band "
+            f"[{_fmt(cbs.get('band_lo'))}, {_fmt(cbs.get('band_hi'))}]"
+        )
+        lines.append("")
+        lines.append("| Slice | n | Coverage | In band |")
+        lines.append("|---|---|---|---|")
+        per = cbs.get("per_slice", {})
+        if isinstance(per, dict):
+            for s, m in per.items():
+                lines.append(
+                    f"| {s} | {m.get('n')} | {_fmt(m.get('coverage'))} | "
+                    f"{m.get('in_band')} |"
+                )
+        lines.append("")
+
+    # 5c. Operator usefulness (provisional; never release-blocking)
+    if report.operator_usefulness:
+        ou = report.operator_usefulness
+        lines.append("### Operator usefulness (provisional — deployment-readiness)")
+        cwr = ou.get("coverage_vs_win_rate", {})
+        dt = ou.get("decision_time", {})
+        ov = ou.get("overrides", {})
+        rel = ou.get("appropriate_reliance", {})
+        lines.append(
+            f"- Coverage / win-rate: {_fmt(cwr.get('coverage'))} / "
+            f"{_fmt(cwr.get('win_rate'))}"
+        )
+        lines.append(
+            f"- Median decision-time reduction: "
+            f"**{_fmt(dt.get('median_reduction'))}** "
+            f"(target ≥ {_fmt(dt.get('target_reduction'))})"
+        )
+        lines.append(
+            f"- Appropriate-reliance rate: "
+            f"{_fmt(rel.get('appropriate_reliance_rate'))}"
+        )
+        lines.append(
+            f"- Unsafe-acceptance rate: {_fmt(ov.get('unsafe_acceptance_rate'))} · "
+            f"no safety loss: {ov.get('no_safety_loss')}"
+        )
+        lines.append(
+            f"- Meets doc-F operator threshold: **{ou.get('passed')}** "
+            "(provisional, never release-blocking)"
+        )
         lines.append("")
 
     # 6. Slice-wise metrics

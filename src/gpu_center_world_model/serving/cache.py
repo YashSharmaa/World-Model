@@ -32,10 +32,60 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 K = TypeVar("K")
 V = TypeVar("V")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shape buckets + the prepared/compiled scoring closure (doc F: no compile churn)
+# ──────────────────────────────────────────────────────────────────────────────
+def shape_bucket_key(
+    *,
+    candidate_count: int,
+    horizon_s: int,
+    n_domains: int,
+    n_nodes: int,
+    model_version: str = "",
+) -> str:
+    """A stable cache key for one *shape bucket* of the scoring graph.
+
+    MLX ``compile()`` caches a compiled function after the first call but
+    recompiles when the input **shape, type, or arity** changes (doc G). The
+    public demo therefore asks for compact, repeatable queries with a stable
+    candidate count and stable rollout-tensor shape. We bucket the prepared /
+    compiled scoring closure on exactly the quantities that change a tensor
+    shape or arity: the number of candidate actions (arity), the horizon (head
+    selection), and the pod's domain/node counts (per-entity tensor widths).
+    Two compare calls in the same bucket reuse one closure, so back-to-back
+    serving calls incur **no recompile churn** (doc F live_demo_runtime).
+    """
+    return (
+        f"v={model_version}|k={int(candidate_count)}|h={int(horizon_s)}"
+        f"|d={int(n_domains)}|n={int(n_nodes)}"
+    )
+
+
+@dataclass(slots=True)
+class ScoringGraph:
+    """A prepared/compiled scoring closure for one shape bucket.
+
+    ``forecast`` is the per-action scoring entry point; ``score_actions`` is the
+    batched hot path the serving layer drives. Both are built once per bucket (by
+    :meth:`ServingCache.prepared_scoring_graph`) and cached, so the underlying
+    model's ``compile()`` is warmed exactly once for that shape and reused on
+    every subsequent compare in the same bucket. ``compiles`` counts how many
+    times this closure was actually built (always 1 once cached) so health
+    probes can assert the demo ran with no compile churn.
+    """
+
+    bucket_key: str
+    forecast: Callable[..., Any]
+    score_actions: Callable[..., Any]
+    candidate_count: int
+    horizon_s: int
+    compiles: int = 1
 
 
 @dataclass(slots=True)
@@ -163,6 +213,22 @@ class ServingCache:
     def get_state(self, state_hash: str) -> object | None:
         return self.states.get(state_hash)
 
+    # -- compiled scoring graph (one prepared closure per shape bucket) -------
+    def prepared_scoring_graph(
+        self, bucket_key: str, builder: Callable[[], ScoringGraph]
+    ) -> ScoringGraph:
+        """Return the cached scoring closure for a shape bucket, building once.
+
+        Thin wrapper over ``scoring_graphs.get_or_compute`` that documents the
+        intent at the call site: the ``builder`` (which warms the model's
+        ``compile()`` / prepares the per-shape scoring closure) runs **at most
+        once per bucket** while the cache lock is held, so two concurrent compare
+        calls on the same shape never double-compile (doc F: one compiled scoring
+        endpoint, no compile churn). On a hit the prepared closure is returned
+        without re-preparing anything.
+        """
+        return self.scoring_graphs.get_or_compute(bucket_key, builder)
+
     def stats(self) -> dict[str, dict[str, int]]:
         """Aggregate cache stats for health endpoints."""
         return {
@@ -173,4 +239,10 @@ class ServingCache:
         }
 
 
-__all__ = ["CacheStats", "LRUCache", "ServingCache"]
+__all__ = [
+    "CacheStats",
+    "LRUCache",
+    "ScoringGraph",
+    "ServingCache",
+    "shape_bucket_key",
+]

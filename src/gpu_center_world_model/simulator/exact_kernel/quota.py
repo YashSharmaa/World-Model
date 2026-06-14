@@ -43,6 +43,41 @@ from ...schema.entities import ClusterQueue
 #: Float tolerance used purely to absorb representation error of integer demands.
 _EPS = 1e-9
 
+#: The hard scalar resource set R for which the kernel tracks per-(flavor,
+#: resource) nominal headroom, reservation, and borrowing (doc S, Definition D1:
+#: R includes gpu, cpu, mem, pods). Quota is only *gated* on resources a queue
+#: actually declares (Kueue semantics), but reservations are tracked for every
+#: declared resource — not just gpu — so cpu/mem/pods quota and borrowing are
+#: bounded over a sequence of admissions (Eq. E11/E12 for all r).
+HARD_RESOURCES: tuple[str, ...] = ("gpu", "cpu", "mem", "pods")
+
+
+def reserved_for(cq: ClusterQueue, flavor_id: str, resource: str) -> float:
+    """Live reserved amount for (flavor, resource) from the per-resource ledger.
+
+    The GPU scalar ``reserved_gpu`` and the nested ``reserved_by_resource`` map
+    are kept consistent by :func:`apply_admission` / :func:`apply_release`; we
+    read the nested ledger as the authoritative per-resource value and fall back
+    to the legacy GPU scalar only when the ledger has not yet been populated for
+    GPU (e.g. a snapshot that set ``reserved_gpu`` directly via the adapter).
+    """
+    ledger = cq.reserved_by_resource.get(flavor_id, {})
+    if resource in ledger:
+        return ledger[resource]
+    if resource == "gpu":
+        return cq.reserved_gpu
+    return 0.0
+
+
+def borrowed_for(cq: ClusterQueue, flavor_id: str, resource: str) -> float:
+    """Live borrowed amount for (flavor, resource) from the per-resource ledger."""
+    ledger = cq.borrowed_by_resource.get(flavor_id, {})
+    if resource in ledger:
+        return ledger[resource]
+    if resource == "gpu":
+        return cq.borrowed_gpu
+    return 0.0
+
 
 @dataclass(slots=True)
 class QuotaDecision:
@@ -61,16 +96,14 @@ def _nominal_headroom(cq: ClusterQueue, flavor_id: str, resource: str) -> float:
     """Remaining nominal quota for (flavor, resource): nominal - already reserved.
 
     Nominal quota is keyed ``nominal_quota[flavor][resource]`` on the
-    :class:`ClusterQueue`. The currently reserved amount for GPU is tracked in the
-    dynamic ``reserved_gpu`` field; for non-GPU resources, where the schema does
-    not carry a per-resource reservation counter, we treat the declared nominal
-    as the live headroom (the snapshot already reflects admitted usage — doc S
-    Assumption A1/A3).
+    :class:`ClusterQueue`. The currently reserved amount is read from the
+    per-(flavor, resource) ledger (:func:`reserved_for`) for *every* resource in
+    ``R = {gpu, cpu, mem, pods}`` — not just GPU — so a sequence of admissions
+    correctly decrements declared cpu/mem/pods quota (doc S, Eq. E11). The legacy
+    ``reserved_gpu`` scalar remains the GPU fallback when the ledger is empty.
     """
     nominal = cq.nominal_quota.get(flavor_id, {}).get(resource, 0.0)
-    if resource == "gpu":
-        return max(0.0, nominal - cq.reserved_gpu)
-    return nominal
+    return max(0.0, nominal - reserved_for(cq, flavor_id, resource))
 
 
 def _borrowing_limit(cq: ClusterQueue, flavor_id: str, resource: str) -> float:
@@ -93,7 +126,7 @@ def cohort_headroom(
     lendable_others = 0.0
     for other in cohort:
         nominal = other.nominal_quota.get(flavor_id, {}).get(resource, 0.0)
-        reserved = other.reserved_gpu if resource == "gpu" else 0.0
+        reserved = reserved_for(other, flavor_id, resource)
         unused_cohort += max(0.0, nominal - reserved)
         if other.name != cq.name:
             lendable_others += other.lending_limit.get(flavor_id, {}).get(resource, 0.0)
@@ -174,23 +207,103 @@ def workload_demand(
     return total
 
 
-def apply_admission(cq: ClusterQueue, gpu_demand: float, borrow_gpu: float) -> None:
+def _ledger_add(
+    ledger: dict[str, dict[str, float]],
+    flavor_id: str,
+    amounts: dict[str, float],
+    sign: float,
+) -> None:
+    """Add (or, with ``sign=-1``, subtract) per-resource amounts into a ledger.
+
+    Floors at zero on release so a double-release can never drive a counter
+    negative. Empty inner maps are pruned so the canonical state hash of a fully
+    released queue equals that of a never-admitted one (determinism).
+    """
+    inner = ledger.setdefault(flavor_id, {})
+    for resource, amt in amounts.items():
+        if amt == 0.0:
+            continue
+        inner[resource] = max(0.0, inner.get(resource, 0.0) + sign * amt)
+        if inner[resource] == 0.0:
+            del inner[resource]
+    if not inner:
+        ledger.pop(flavor_id, None)
+
+
+def apply_admission(
+    cq: ClusterQueue,
+    gpu_demand: float,
+    borrow_gpu: float,
+    *,
+    flavor_id: str | None = None,
+    demand: dict[str, float] | None = None,
+    borrow: dict[str, float] | None = None,
+) -> None:
     """Deterministic quota state transition for an admission (used by ``step``).
 
-    Reserves ``gpu_demand`` GPU against the queue and records the borrowed share.
-    Non-GPU resources have no dynamic counter in the schema, so only the GPU
-    accounting is mutated (it is the binding resource in the demo pod).
+    Reserves the admission's demand against the queue and records the borrowed
+    share. GPU is always tracked on the legacy ``reserved_gpu`` / ``borrowed_gpu``
+    scalars for backward compatibility. When ``flavor_id`` is supplied, the full
+    per-resource demand/borrow vectors (``R = {gpu, cpu, mem, pods}``) are written
+    into the per-(flavor, resource) ledgers so cpu/mem/pods quota and borrowing
+    are decremented across the admission, not just gpu (doc S, Eq. E11/E12 for
+    all r). The ``demand`` / ``borrow`` vectors default to the GPU-only scalars.
     """
     cq.reserved_gpu += gpu_demand
     cq.borrowed_gpu += borrow_gpu
     cq.active_workloads += 1
+    if flavor_id is None:
+        return
+    dem = demand if demand is not None else {"gpu": gpu_demand}
+    bor = borrow if borrow is not None else {"gpu": borrow_gpu}
+    _ledger_add(
+        cq.reserved_by_resource,
+        flavor_id,
+        {r: dem.get(r, 0.0) for r in HARD_RESOURCES},
+        +1.0,
+    )
+    _ledger_add(
+        cq.borrowed_by_resource,
+        flavor_id,
+        {r: bor.get(r, 0.0) for r in HARD_RESOURCES},
+        +1.0,
+    )
 
 
-def apply_release(cq: ClusterQueue, gpu_demand: float, borrow_gpu: float) -> None:
-    """Inverse of :func:`apply_admission` (eviction / completion)."""
+def apply_release(
+    cq: ClusterQueue,
+    gpu_demand: float,
+    borrow_gpu: float,
+    *,
+    flavor_id: str | None = None,
+    demand: dict[str, float] | None = None,
+    borrow: dict[str, float] | None = None,
+) -> None:
+    """Inverse of :func:`apply_admission` (eviction / completion).
+
+    Releases the admission's per-resource reservation/borrow back to the queue.
+    See :func:`apply_admission` for the ``flavor_id`` / ``demand`` / ``borrow``
+    contract; with ``flavor_id`` the full per-resource ledgers are decremented.
+    """
     cq.reserved_gpu = max(0.0, cq.reserved_gpu - gpu_demand)
     cq.borrowed_gpu = max(0.0, cq.borrowed_gpu - borrow_gpu)
     cq.active_workloads = max(0, cq.active_workloads - 1)
+    if flavor_id is None:
+        return
+    dem = demand if demand is not None else {"gpu": gpu_demand}
+    bor = borrow if borrow is not None else {"gpu": borrow_gpu}
+    _ledger_add(
+        cq.reserved_by_resource,
+        flavor_id,
+        {r: dem.get(r, 0.0) for r in HARD_RESOURCES},
+        -1.0,
+    )
+    _ledger_add(
+        cq.borrowed_by_resource,
+        flavor_id,
+        {r: bor.get(r, 0.0) for r in HARD_RESOURCES},
+        -1.0,
+    )
 
 
 def resolve_cohort(
@@ -207,11 +320,14 @@ def resolve_cohort(
 
 
 __all__ = [
+    "HARD_RESOURCES",
     "QuotaDecision",
     "apply_admission",
     "apply_release",
+    "borrowed_for",
     "cohort_headroom",
     "quota_check",
+    "reserved_for",
     "resolve_cohort",
     "workload_demand",
 ]

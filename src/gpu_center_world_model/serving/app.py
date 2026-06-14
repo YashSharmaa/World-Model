@@ -35,7 +35,7 @@ from typing import Any
 from .._watermark import CREDIT, watermark
 from ..schema.hashing import state_hash as compute_state_hash
 from ..schema.state import WorldState
-from . import api_v1, dto
+from . import api_v1, dto, sse
 from .api_v1 import EngineBundle
 from .cache import ServingCache
 from .sse import EventBroker, SSEMessage, event_source, have_sse_starlette
@@ -243,6 +243,19 @@ def create_app(
     app.state.broker = broker
     app.state.state_provider = provider
     app.state.replay_loader = replay_loader
+    # Last snapshot dict published on the SSE channel, so the next refresh can
+    # emit a compact `state_delta` (diff vs last snapshot) rather than a full
+    # frame (doc G: semantic diffs, not a frame stream). Held in app.state so it
+    # survives across requests within the one long-lived process.
+    app.state.last_snapshot = None
+
+    def _refresh_snapshot() -> tuple[WorldState, str, dict[str, Any]]:
+        """Pull the live state, register it, and serialise its doc-G snapshot."""
+        state = provider()
+        sh = compute_state_hash(state.symbolic, state.context)
+        serving_cache.register_state(sh, state)
+        snapshot = dto.to_dict(api_v1.serialize_state(state, eng))
+        return state, sh, snapshot
 
     def _current_state_registered() -> tuple[WorldState, str]:
         state = provider()
@@ -250,11 +263,28 @@ def create_app(
         serving_cache.register_state(sh, state)
         return state, sh
 
+    def _publish_state_delta(snapshot: dict[str, Any]) -> None:
+        """Emit a `state_delta` (diff vs last snapshot) and remember this one.
+
+        The very first publish has no predecessor, so the diff is a full set of
+        upserts; subsequent publishes carry only changed entity rows + KPIs.
+        """
+        prev = app.state.last_snapshot
+        if prev is not None and prev.get("state_hash") == snapshot.get("state_hash"):
+            # No semantic change since the last publish — nothing to diff.
+            return
+        delta = sse.state_diff(prev, snapshot)
+        app.state.last_snapshot = snapshot
+        _publish(broker, SSEMessage(event="state_delta", data=delta))
+
     # -- GET /api/v1/state/current -------------------------------------------
     @app.get("/api/v1/state/current")
     def state_current() -> dict[str, Any]:
-        state, _sh = _current_state_registered()
-        return dto.to_dict(api_v1.serialize_state(state, eng))
+        _state, _sh, snapshot = _refresh_snapshot()
+        # Pushing the current state also advances the SSE delta stream so any
+        # connected client converges on the same snapshot the poller just read.
+        _publish_state_delta(snapshot)
+        return snapshot
 
     # -- POST /api/v1/actions/compare ----------------------------------------
     @app.post("/api/v1/actions/compare")
@@ -269,7 +299,27 @@ def create_app(
                     "so branches stay aligned to a frozen pre-action state."
                 ),
             )
-        resp = api_v1.compare_actions(state, req, eng)
+        resp = api_v1.compare_actions(state, req, eng, cache=serving_cache)
+        # branch_ready: the compare branches finished scoring; push a one-way
+        # notice so a connected UI can switch the comparison panel to "ready"
+        # without re-polling (doc G SSE branch_ready event).
+        _publish(
+            broker,
+            SSEMessage(
+                event="branch_ready",
+                data={
+                    "state_hash": resp.state_hash,
+                    "recommended_action_id": resp.recommended_action_id,
+                    "abstain": resp.abstain,
+                    "branch_ids": [
+                        c.action_id
+                        for c in resp.candidates
+                        if not c.action_id.startswith("__pad")
+                    ],
+                    "horizon_s": api_v1._nearest_horizon(int(req.horizon_s)),
+                },
+            ),
+        )
         return dto.to_dict(resp)
 
     # -- POST /api/v1/actions/why-not ----------------------------------------
@@ -285,6 +335,7 @@ def create_app(
     # -- GET /api/v1/replays/{scenario_id} -----------------------------------
     @app.get("/api/v1/replays/{scenario_id}")
     def replays(scenario_id: str) -> dict[str, Any]:
+        cached = serving_cache.replays.get(scenario_id) is not None
         bundle = serving_cache.replays.get(scenario_id)
         if bundle is None and replay_loader is not None:
             bundle = replay_loader(scenario_id)
@@ -294,16 +345,60 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail=f"No replay scenario '{scenario_id}'"
             )
-        return dto.to_dict(api_v1.get_replay(scenario_id, bundle))
+        resp = api_v1.get_replay(scenario_id, bundle)
+        # replay_loaded: a replayable scenario is now available to scrub; push a
+        # one-way notice so the UI can switch the renderer to replay mode (doc G
+        # SSE replay_loaded event; same renderer for live + replay state).
+        _publish(
+            broker,
+            SSEMessage(
+                event="replay_loaded",
+                data={
+                    "scenario_id": scenario_id,
+                    "decision_windows": len(resp.decision_windows),
+                    "trace_len": len(resp.realized_trace),
+                    "from_cache": cached,
+                },
+            ),
+        )
+        return dto.to_dict(resp)
+
+    # -- POST /api/v1/policy ---------------------------------------------------
+    @app.post("/api/v1/policy")
+    def set_policy(payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply an operator policy change and announce it on the SSE channel.
+
+        Operator guardrails (action whitelist, protected/masked domains, risk
+        budgets) are policy context, not actor actions; changing them is an
+        exogenous event the front-end must react to (re-evaluate branches, re-glow
+        locked domains). We update the engine's ``policy_version`` provenance and
+        emit a `policy_changed` event carrying the new policy summary (doc G SSE
+        policy_changed event).
+        """
+        version = str(payload.get("policy_version") or payload.get("version") or "")
+        if version:
+            eng.policy_version = version
+        protected = list(payload.get("protected_domains", []) or [])
+        masked = list(payload.get("masked_domains", []) or [])
+        allowed = payload.get("allowed_actions")
+        summary: dict[str, Any] = {
+            "policy_version": eng.policy_version,
+            "protected_domains": protected,
+            "masked_domains": masked,
+        }
+        if allowed is not None:
+            summary["allowed_actions"] = list(allowed)
+        _publish(broker, SSEMessage(event="policy_changed", data=summary))
+        return {"status": "ok", **summary}
 
     # -- GET /api/v1/stream (SSE) --------------------------------------------
     @app.get("/api/v1/stream")
     async def stream(request: Request):
-        state, _sh = _current_state_registered()
-        snapshot = SSEMessage(
-            event="snapshot",
-            data=dto.to_dict(api_v1.serialize_state(state, eng)),
-        )
+        _state, _sh, snapshot_data = _refresh_snapshot()
+        # The full snapshot is the baseline every subsequent `state_delta` diffs
+        # against, so remember it as the last published snapshot.
+        app.state.last_snapshot = snapshot_data
+        snapshot = SSEMessage(event="snapshot", data=snapshot_data)
         gen = event_source(broker, initial=[snapshot])
 
         if have_sse_starlette():  # pragma: no cover - optional path
@@ -388,6 +483,19 @@ def _resolve_state(
         cache.register_state(state_hash, live)
         return live
     return None
+
+
+def _publish(broker: EventBroker, message: SSEMessage) -> None:
+    """Publish an SSE event from a (possibly synchronous) route handler.
+
+    FastAPI runs ``def`` route handlers in a worker thread, so we use the
+    broker's thread-safe ``publish_nowait`` (which hands each subscriber's
+    enqueue back to its own event loop). When called from an ``async`` handler
+    already on the loop, ``publish_nowait`` still delivers correctly. Publishing
+    when there are no subscribers is a cheap no-op, so producers never have to
+    check the subscriber count first.
+    """
+    broker.publish_nowait(message)
 
 
 def run(

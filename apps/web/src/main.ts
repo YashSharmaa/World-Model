@@ -40,9 +40,9 @@ import { installEnvironment, type EnvironmentHandle } from "./scene/environment"
 import { buildProAssets, type ProAssetsResult } from "./scene/proAssets";
 import { createLoaderArm } from "./scene/loaderArm";
 import { createPostFX } from "./render/postfx";
-import { CinematicDirector } from "./anim/director";
+import { CinematicDirector, defaultGoldenPath } from "./anim/director";
 import { getSceneTheme, onTheme, type SceneTheme } from "./theme";
-import { injectStyles } from "./panels/dom";
+import { el, injectStyles } from "./panels/dom";
 import {
   createFooterCredit,
   createLegend,
@@ -180,6 +180,34 @@ async function main(): Promise<void> {
     beat,
   ];
 
+  // ── golden-path "Play demo" control + auto-start ──────────────────────────
+  // The cinematic director runs the eight doc-G beats; each beat's onBegin
+  // drives real store state (focus → compare → play A → play B → hold → freeze →
+  // why-not → resolve). While the demo runs, its per-beat caption owns the
+  // muted on-screen caption (LinkedIn autoplays muted), so we suppress the
+  // store-driven caption to avoid the two fighting.
+  let goldenPathActive = false;
+  function playDemo(): void {
+    goldenPathActive = true;
+    store.setFocusedWorkload(
+      store.get().focusedWorkload ??
+        store.get().snapshot?.entities.workloads.find(
+          (w) => w.status === "pending",
+        )?.workload_uid ??
+        null,
+    );
+    cinematic.playGoldenPath(
+      defaultGoldenPath(store, (text) => {
+        if (text) beat.set(text);
+      }),
+    );
+  }
+
+  const demoBtn = el("button", "chip play-demo", "▶ Play demo") as HTMLButtonElement;
+  demoBtn.title = "Run the 8-beat golden-path demo (camera + decision narrative)";
+  demoBtn.addEventListener("click", () => playDemo());
+  overlay.appendChild(demoBtn);
+
   // ── raycasting (interaction_root) ────────────────────────────────────────
   const ndc = new Vector2();
   function toNdc(ev: PointerEvent): Vector2 {
@@ -247,7 +275,9 @@ async function main(): Promise<void> {
     modeTabs.update(s.mode);
     sceneGraph.highlight(s.selection);
     for (const p of panels) p.update(s);
-    updateBeatCaption(s);
+    // While the golden-path demo runs, its per-beat caption owns the caption
+    // panel; otherwise the store-driven caption tracks the live state.
+    if (!goldenPathActive) updateBeatCaption(s);
   });
 
   function updateBeatCaption(s: StoreState): void {
@@ -283,6 +313,11 @@ async function main(): Promise<void> {
     // when it yields, the mode CameraDirector drives the limited-orbit preset.
     if (!cinematic.update(dt)) {
       director.tick(orbit);
+    }
+    // When the golden-path beat sequence finishes, hand the caption back to the
+    // live store-driven caption.
+    if (goldenPathActive && !cinematic.isSequenceActive()) {
+      goldenPathActive = false;
     }
 
     applyRolloutToScene(currentState);
@@ -377,8 +412,18 @@ async function main(): Promise<void> {
 
   requestAnimationFrame(frame);
 
+  // ── auto-start the golden-path demo ───────────────────────────────────────
+  // Recordability (doc G): the studio is a self-running recorded explanation, so
+  // it kicks off the eight-beat storyboard shortly after boot. The "Play demo"
+  // control re-runs it on demand. Opt out with ?autostart=0 for manual driving.
+  const autostart =
+    new URLSearchParams(window.location.search).get("autostart") !== "0";
+  if (autostart) {
+    window.setTimeout(() => playDemo(), 1200);
+  }
+
   // expose a tiny debug handle (handy when recording / scripting beats):
-  //   __studio.cinematic.playGoldenPath()  — run the storyboard camera moves
+  //   __studio.playDemo()                  — run the 8-beat golden-path demo
   //   __studio.cinematic.cutTo("rackCloseup") — jump to a named shot
   //   __studio.cinematic.release()          — hand the camera back to mode presets
   //   __studio.arm.playPlace(new THREE.Vector3(...)) — replay the loader place
@@ -389,6 +434,7 @@ async function main(): Promise<void> {
     cinematic,
     arm,
     proAssets,
+    playDemo,
   };
 }
 
