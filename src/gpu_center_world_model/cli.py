@@ -73,15 +73,29 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     sh = compute_state_hash(state.symbolic, state.context)
     engine = EngineBundle()
 
+    # Demo preset (doc H configs/demo): the Decision Studio's fixed branch count,
+    # decision horizon, and declared baseline come from the author-editable
+    # ``configs/demo/decision_studio.yaml`` so the public 3-action / 30-60 min
+    # demo can be re-scripted without editing Python (doc G shape contract). The
+    # CLI flags still win when explicitly set; absent a config the doc-G defaults
+    # (3 branches, 1800 s, baseline=hold) stand.
+    demo_cfg = _load_demo_config(getattr(args, "config", None))
+    branch_cap = _demo_branch_count(demo_cfg)
+    horizon_s = (
+        float(args.horizon_s)
+        if args.horizon_s is not None
+        else float(demo_cfg.get("default_horizon_s", 1800))
+    )
+
     # Build the candidate action set. Default: hold + admit_and_place into each
-    # rack domain for the first pending workload, capped at DEFAULT_BRANCHES.
+    # rack domain for the first pending workload, capped at the demo branch count.
     wl_uid = args.workload or _first_pending_workload(state)
-    candidates = _default_candidates(state, wl_uid)
+    candidates = _default_candidates(state, wl_uid, branch_cap)
 
     req = dto.CompareRequest(
         state_hash=sh,
         candidate_actions=candidates,
-        horizon_s=float(args.horizon_s),
+        horizon_s=horizon_s,
         include_rollouts=args.rollouts,
     )
     resp = compare_actions(state, req, engine)
@@ -119,10 +133,11 @@ def _first_pending_workload(state: Any) -> str:
     return next(iter(state.symbolic.workloads), "")
 
 
-def _default_candidates(state: Any, wl_uid: str):
+def _default_candidates(state: Any, wl_uid: str, branch_cap: int | None = None):
     from .serving import dto
     from .serving.dto import DEFAULT_BRANCHES
 
+    cap = DEFAULT_BRANCHES if branch_cap is None else max(1, int(branch_cap))
     wl = state.symbolic.workloads.get(wl_uid)
     cq = wl.cluster_queue_id if wl else ""
     cands = [
@@ -133,7 +148,7 @@ def _default_candidates(state: Any, wl_uid: str):
         )
     ]
     for dom_id in state.symbolic.domains:
-        if len(cands) >= DEFAULT_BRANCHES:
+        if len(cands) >= cap:
             break
         cands.append(
             dto.CandidateActionRequest(
@@ -149,6 +164,46 @@ def _default_candidates(state: Any, wl_uid: str):
             )
         )
     return cands
+
+
+def _load_demo_config(path: str | None) -> dict[str, Any]:
+    """Load ``configs/demo/decision_studio.yaml`` (doc H configs/demo).
+
+    Returns the parsed preset mapping, or an empty dict when the config is
+    unavailable (so ``gcwm compare`` still runs on the doc-G defaults). ``path``
+    overrides the default repo location.
+    """
+    try:
+        from .model.train import resolve_repo_config
+        from .utils.config import load_config
+    except ImportError:  # pragma: no cover - dependency-light core only
+        return {}
+    target = resolve_repo_config(path or "configs/demo/decision_studio.yaml")
+    try:
+        raw = load_config(target)
+    except (FileNotFoundError, RuntimeError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _demo_branch_count(demo_cfg: dict[str, Any]) -> int:
+    """The FIXED branch count from the demo preset (doc G shape contract).
+
+    Doc G fixes the Decision Studio at exactly three branches so the compiled MLX
+    scorer never recompiles mid-presentation. The preset's ``actions.count`` (or
+    the number of declared ``candidates``) drives the CLI candidate cap; absent a
+    config the serving default (:data:`serving.dto.DEFAULT_BRANCHES`) stands.
+    """
+    from .serving.dto import DEFAULT_BRANCHES
+
+    actions = demo_cfg.get("actions")
+    if isinstance(actions, dict):
+        if "count" in actions:
+            return max(1, int(actions["count"]))
+        cands = actions.get("candidates")
+        if isinstance(cands, list) and cands:
+            return max(1, len(cands))
+    return DEFAULT_BRANCHES
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -208,7 +263,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 3
-    report = fn(suite=args.suite, data=args.data, out=args.out)
+    report = fn(
+        suite=args.suite,
+        data=args.data,
+        out=args.out,
+        config=getattr(args, "config", None),
+    )
     print(f"Evaluation report: {report}")
     return 0
 
@@ -246,7 +306,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cmp.add_argument("--workload", default=None, help="target workload uid")
     p_cmp.add_argument(
-        "--horizon-s", dest="horizon_s", type=int, default=1800, help="horizon (s)"
+        "--horizon-s",
+        dest="horizon_s",
+        type=int,
+        default=None,
+        help="horizon (s); default from configs/demo/decision_studio.yaml",
+    )
+    p_cmp.add_argument(
+        "--config",
+        default=None,
+        help="demo preset YAML (default: configs/demo/decision_studio.yaml)",
     )
     p_cmp.add_argument(
         "--no-rollouts",
@@ -274,6 +343,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--suite", default="all", help="evaluation suite name")
     p_eval.add_argument("--data", default=None, help="data pack path")
     p_eval.add_argument("--out", default="./eval_report", help="report output")
+    p_eval.add_argument(
+        "--config",
+        default=None,
+        help="benchmark YAML (default: configs/eval/benchmark.yaml)",
+    )
     p_eval.set_defaults(func=_cmd_eval)
 
     return parser

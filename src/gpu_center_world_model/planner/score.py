@@ -135,13 +135,17 @@ def fragmentation_cost(bundle: KPIForecastBundle, horizon_s: int) -> float:
 
 
 #: Map each modeled hazard channel to its operator chance-constraint budget.
+#: ``NODE_FAILURE`` maps to its *own* dedicated budget (doc U severity ordering),
+#: not the aliased XID-fault budget — kept in lock-step with the risk gate's
+#: :func:`~.risk_gate.hazard_budget_map` so the lex statistical-safety pressure
+#: term and the gate read the *same* per-channel budget.
 _HAZARD_BUDGET_ATTR: dict[HazardChannel, str] = {
     HazardChannel.HOTSPOT: "max_hotspot_prob",
     HazardChannel.HEADROOM_VIOLATION: "max_headroom_violation_prob",
     HazardChannel.PODS_READY_TIMEOUT: "max_pods_ready_timeout_prob",
     HazardChannel.REQUEUE: "max_requeue_prob",
     HazardChannel.XID_FAULT: "max_xid_fault_prob",
-    HazardChannel.NODE_FAILURE: "max_xid_fault_prob",
+    HazardChannel.NODE_FAILURE: "max_node_failure_prob",
 }
 
 

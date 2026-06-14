@@ -91,6 +91,12 @@ from .suites.redteam import RedTeamCase, RedTeamReport, evaluate_red_team
 # ──────────────────────────────────────────────────────────────────────────────
 # Doc F acceptance thresholds (the single source of truth for the gating)
 # ──────────────────────────────────────────────────────────────────────────────
+# These are the doc-F §35 defaults; ``configs/eval/benchmark.yaml`` is the
+# human-editable source of record (doc H configs/), and :func:`load_thresholds`
+# maps its ``acceptance_thresholds`` block onto these exact keys so the gating can
+# be re-parameterised *without editing Python* while the in-distribution / shift
+# safety floors and the doc-F counterfactual / planning / calibration / shift
+# numbers stay the published defaults when a config omits them.
 THRESHOLDS: dict[str, float] = {
     "max_false_safe_rate": 0.0,  # spine: 0 in-distribution
     "max_false_safe_rate_shift": 0.01,  # doc F shift pack
@@ -103,6 +109,138 @@ THRESHOLDS: dict[str, float] = {
     "max_optimism_bias": 0.05,
     "min_abstain_under_shift": 0.80,
 }
+
+
+def load_thresholds(config: Mapping[str, object]) -> dict[str, float]:
+    """Map a ``configs/eval/benchmark.yaml`` mapping onto the THRESHOLDS keys.
+
+    Doc F §35 nests the acceptance numbers under ``acceptance_thresholds`` by
+    gate (``hard_safety`` / ``counterfactual_ranking`` / ``planning_utility`` /
+    ``calibration_and_optimism`` / ``shift_and_abstention``). This adapter flattens
+    that documented structure onto the exact flat keys the runner gates on,
+    **additively**: a key absent from the config keeps its :data:`THRESHOLDS`
+    default, so a partial config never silently drops a gate. The in-distribution
+    safety floor (``max_false_safe_rate = 0``) is a spine invariant and is taken
+    from the gate's blocking ``exact_kernel_violations_max`` only when present.
+    """
+    out = dict(THRESHOLDS)
+    if not config:
+        return out
+    at = config.get("acceptance_thresholds")
+    if not isinstance(at, Mapping):
+        return out
+
+    safety = at.get("hard_safety")
+    if isinstance(safety, Mapping) and "exact_kernel_violations_max" in safety:
+        # zero exact-kernel violations in-distribution (the spine gate).
+        out["max_false_safe_rate"] = float(safety["exact_kernel_violations_max"])
+
+    cf = at.get("counterfactual_ranking")
+    if isinstance(cf, Mapping):
+        if "overall_pairwise_sign_accuracy_min" in cf:
+            out["min_sign_accuracy"] = float(cf["overall_pairwise_sign_accuracy_min"])
+        if "non_abstained_sign_accuracy_min" in cf:
+            out["min_sign_accuracy_non_abstained"] = float(
+                cf["non_abstained_sign_accuracy_min"]
+            )
+        if "min_coverage" in cf:
+            out["min_coverage"] = float(cf["min_coverage"])
+
+    plan = at.get("planning_utility")
+    if (
+        isinstance(plan, Mapping)
+        and "safe_regret_reduction_vs_best_baseline_min" in plan
+    ):
+        out["min_regret_reduction"] = float(
+            plan["safe_regret_reduction_vs_best_baseline_min"]
+        )
+
+    cal = at.get("calibration_and_optimism")
+    if isinstance(cal, Mapping):
+        band = cal.get("interval_coverage_90_band")
+        if isinstance(band, (list, tuple)) and len(band) == 2:
+            out["coverage_band_lo"] = float(band[0])
+            out["coverage_band_hi"] = float(band[1])
+        if "non_abstained_optimism_bias_rate_max" in cal:
+            out["max_optimism_bias"] = float(
+                cal["non_abstained_optimism_bias_rate_max"]
+            )
+
+    shift = at.get("shift_and_abstention")
+    if isinstance(shift, Mapping):
+        if "abstain_or_fallback_rate_min" in shift:
+            out["min_abstain_under_shift"] = float(
+                shift["abstain_or_fallback_rate_min"]
+            )
+        if "false_safe_rate_max" in shift:
+            out["max_false_safe_rate_shift"] = float(shift["false_safe_rate_max"])
+    return out
+
+
+@dataclass(slots=True)
+class BenchmarkConfig:
+    """The parsed ``configs/eval/benchmark.yaml`` profile the runner consumes.
+
+    Bundles the three things doc F §35 lets an author edit without touching
+    Python: the flat acceptance ``thresholds`` (release-gating numbers), the
+    prespecified ``slices`` (always report slice-wise, never one blended number),
+    and the skeptical ``baselines`` the champion must beat. Built additively by
+    :func:`load_benchmark_config`; ``thresholds`` always falls back to the
+    doc-F defaults so a missing/partial config still gates correctly.
+    """
+
+    thresholds: dict[str, float] = field(default_factory=lambda: dict(THRESHOLDS))
+    slices: dict[str, object] = field(default_factory=dict)
+    baselines: dict[str, object] = field(default_factory=dict)
+    ablations: list[str] = field(default_factory=list)
+    raw: dict[str, object] = field(default_factory=dict)
+
+
+def load_benchmark_config(config: Mapping[str, object] | None) -> BenchmarkConfig:
+    """Parse a ``configs/eval/benchmark.yaml`` mapping into a :class:`BenchmarkConfig`.
+
+    Pulls the acceptance thresholds (via :func:`load_thresholds`), the slice
+    definitions (``slices`` block — horizon / workload class / topology depth /
+    stress regime), the skeptical baselines (``baselines`` block), and the
+    ablation set (``ablations.set``). Each section is optional, so an empty or
+    partial config yields the doc-F default thresholds and empty slice/baseline
+    surfaces (reported as such rather than fabricated).
+    """
+    if not config:
+        return BenchmarkConfig()
+    slices = config.get("slices")
+    baselines = config.get("baselines")
+    abl = config.get("ablations")
+    abl_set: list[str] = []
+    if isinstance(abl, Mapping):
+        abl_set = [str(x) for x in (abl.get("set") or [])]
+    return BenchmarkConfig(
+        thresholds=load_thresholds(config),
+        slices=dict(slices) if isinstance(slices, Mapping) else {},
+        baselines=dict(baselines) if isinstance(baselines, Mapping) else {},
+        ablations=abl_set,
+        raw=dict(config),
+    )
+
+
+def load_benchmark_config_from_yaml(
+    path: str | object | None = None,
+) -> BenchmarkConfig:
+    """Load ``configs/eval/benchmark.yaml`` from disk into a :class:`BenchmarkConfig`.
+
+    ``path`` defaults to the repo's ``configs/eval/benchmark.yaml`` (doc H). A
+    missing file degrades gracefully to the doc-F default thresholds (so a build
+    that ships without the config still gates), with no exception raised.
+    """
+    from ..model.train import resolve_repo_config
+    from ..utils.config import load_config
+
+    target = resolve_repo_config(path or "configs/eval/benchmark.yaml")
+    try:
+        raw = load_config(target)
+    except FileNotFoundError:
+        return BenchmarkConfig()
+    return load_benchmark_config(raw if isinstance(raw, Mapping) else {})
 
 
 @dataclass(slots=True)
@@ -175,14 +313,20 @@ class TrackInputs:
 
 def run_track_semantics(
     inputs: TrackInputs,
+    thresholds: Mapping[str, float] | None = None,
 ) -> tuple[SafetyGateReport | None, RedTeamReport | None]:
-    """Track A: exact-kernel safety gate + red-team suite (release-blocking)."""
+    """Track A: exact-kernel safety gate + red-team suite (release-blocking).
+
+    ``thresholds`` overrides the module-default :data:`THRESHOLDS` (e.g. the
+    config-loaded benchmark profile); absent, the doc-F defaults are used.
+    """
+    th = thresholds if thresholds is not None else THRESHOLDS
     sg = None
     if inputs.safety_judgements:
         max_fs = (
-            THRESHOLDS["max_false_safe_rate_shift"]
+            th["max_false_safe_rate_shift"]
             if inputs.is_shift_pack
-            else THRESHOLDS["max_false_safe_rate"]
+            else th["max_false_safe_rate"]
         )
         sg = evaluate_safety_gate(
             inputs.safety_judgements,
@@ -375,18 +519,23 @@ def run_track_calibration(inputs: TrackInputs) -> list[CalibrationReport]:
     return reports
 
 
-def run_coverage_by_slice(inputs: TrackInputs) -> CoverageBySliceReport | None:
+def run_coverage_by_slice(
+    inputs: TrackInputs,
+    thresholds: Mapping[str, float] | None = None,
+) -> CoverageBySliceReport | None:
     """Interval coverage per slice with the doc-F 85%-95% acceptance band.
 
     Expects ``coverage_by_slice_inputs`` to carry aligned ``lower`` / ``upper`` /
     ``truth`` arrays and a ``slice_labels`` list. Returns ``None`` if not present.
+    The acceptance band defaults to the (possibly config-loaded) ``thresholds``.
     """
+    th = thresholds if thresholds is not None else THRESHOLDS
     rec = inputs.coverage_by_slice_inputs
     if not rec or "slice_labels" not in rec:
         return None
     band = rec.get(
         "band",
-        (THRESHOLDS["coverage_band_lo"], THRESHOLDS["coverage_band_hi"]),
+        (th["coverage_band_lo"], th["coverage_band_hi"]),
     )
     return coverage_by_slice(
         rec.get("lower", []),  # type: ignore[arg-type]
@@ -411,22 +560,28 @@ def run_operator_usefulness(inputs: TrackInputs) -> OperatorUsefulnessReport | N
 
 def run_abstention(
     inputs: TrackInputs,
+    thresholds: Mapping[str, float] | None = None,
 ) -> tuple[RiskCoverageReport | None, ShiftAbstentionReport | None]:
-    """Risk-coverage curve and false-safe-under-shift behaviour."""
+    """Risk-coverage curve and false-safe-under-shift behaviour.
+
+    Coverage target and the shift abstain/false-safe floors default to the
+    (possibly config-loaded) ``thresholds``.
+    """
+    th = thresholds if thresholds is not None else THRESHOLDS
     rc = None
     if inputs.risk_score and inputs.selective_error:
         rc = risk_coverage_curve(
             inputs.risk_score,
             inputs.selective_error,
-            target_coverage=THRESHOLDS["min_coverage"],
+            target_coverage=th["min_coverage"],
         )
     sa = None
     if inputs.shift_abstained_or_fellback:
         sa = false_safe_under_shift(
             inputs.shift_abstained_or_fellback,
             inputs.shift_false_safe,
-            min_abstain_rate=THRESHOLDS["min_abstain_under_shift"],
-            max_false_safe_rate=THRESHOLDS["max_false_safe_rate_shift"],
+            min_abstain_rate=th["min_abstain_under_shift"],
+            max_false_safe_rate=th["max_false_safe_rate_shift"],
         )
     return rc, sa
 
@@ -460,7 +615,10 @@ def _slice_power(
     }
 
 
-def compute_slices(inputs: TrackInputs) -> dict[str, object]:
+def compute_slices(
+    inputs: TrackInputs,
+    thresholds: Mapping[str, float] | None = None,
+) -> dict[str, object]:
     """Group slice-wise metrics by each prespecified Mondrian slice (doc F/O).
 
     For each slice family and cell we recompute:
@@ -476,6 +634,7 @@ def compute_slices(inputs: TrackInputs) -> dict[str, object]:
     publish slice-wise metrics rather than a single average; doc O: each major
     reported slice needs ~750 effective windows.
     """
+    th = thresholds if thresholds is not None else THRESHOLDS
     out: dict[str, object] = {}
     feats = inputs.window_features
     windows = inputs.branch_windows
@@ -484,9 +643,7 @@ def compute_slices(inputs: TrackInputs) -> dict[str, object]:
     # optional per-window risk / selective-error arrays, aligned to branch_windows
     risk = inputs.risk_score if len(inputs.risk_score) == len(windows) else None
     sel_err = (
-        inputs.selective_error
-        if len(inputs.selective_error) == len(windows)
-        else None
+        inputs.selective_error if len(inputs.selective_error) == len(windows) else None
     )
     n_under_powered = 0
     n_cells = 0
@@ -514,7 +671,7 @@ def compute_slices(inputs: TrackInputs) -> dict[str, object]:
                 rc = risk_coverage_curve(
                     [risk[i] for i in idxs],
                     [sel_err[i] for i in idxs],
-                    target_coverage=THRESHOLDS["min_coverage"],
+                    target_coverage=th["min_coverage"],
                 )
                 cell["risk_coverage"] = {
                     "aurc": rc.aurc,
@@ -573,6 +730,7 @@ def apply_acceptance(
     counterfactual_coverage_value: float | None = None,
     coverage_by_slice: CoverageBySliceReport | None = None,
     operator_usefulness: OperatorUsefulnessReport | None = None,
+    thresholds: Mapping[str, float] | None = None,
 ) -> dict[str, object]:
     """Evaluate each doc-F acceptance threshold; return a pass/fail map.
 
@@ -584,7 +742,11 @@ def apply_acceptance(
     is below the floor, the counterfactual_ranking acceptance *fails* even with a
     high non-abstained accuracy, because the high accuracy was bought by
     abstaining too often.
+
+    ``thresholds`` overrides the module-default :data:`THRESHOLDS` (e.g. the
+    config-loaded benchmark profile); absent, the doc-F defaults gate.
     """
+    th = thresholds if thresholds is not None else THRESHOLDS
     acc: dict[str, object] = {}
 
     if safety_gate is not None:
@@ -605,13 +767,13 @@ def apply_acceptance(
         # Coverage gate: NaN coverage (no abstention flags) is treated as full
         # coverage so a pack without flags is not penalised; a measured coverage
         # below the floor fails the non-abstained clause.
-        coverage_ok = cov is None or cov != cov or _ge(cov, THRESHOLDS["min_coverage"])
+        coverage_ok = cov is None or cov != cov or _ge(cov, th["min_coverage"])
         acc["counterfactual_ranking"] = {
             "passed": (
-                _ge(counterfactual.sign_accuracy, THRESHOLDS["min_sign_accuracy"])
+                _ge(counterfactual.sign_accuracy, th["min_sign_accuracy"])
                 and _ge(
                     counterfactual.sign_accuracy_non_abstained,
-                    THRESHOLDS["min_sign_accuracy_non_abstained"],
+                    th["min_sign_accuracy_non_abstained"],
                 )
                 and coverage_ok
             ),
@@ -622,7 +784,7 @@ def apply_acceptance(
         acc["optimism_bias"] = {
             "passed": _le(
                 counterfactual.optimism_bias_rate,
-                THRESHOLDS["max_optimism_bias"],
+                th["max_optimism_bias"],
             ),
             "detail": f"rate={counterfactual.optimism_bias_rate:.4f} (<0.05)",
         }
@@ -656,7 +818,7 @@ def apply_acceptance(
         acc["planning_utility"] = {
             "passed": _ge(
                 planning.relative_regret_reduction,
-                THRESHOLDS["min_regret_reduction"],
+                th["min_regret_reduction"],
             ),
             "detail": f"relative_regret_reduction="
             f"{planning.relative_regret_reduction:.4f} (>=0.15)",
@@ -704,14 +866,27 @@ class BenchmarkRunner:
         (``"semantics" | "counterfactual_rollout" | "safe_action_selection" |
         "all"``). All available inputs are always scored; this only labels the
         report.
+    config:
+        Optional parsed ``configs/eval/benchmark.yaml`` profile (doc H). When
+        supplied, its acceptance ``thresholds`` replace the hardcoded doc-F
+        defaults across every track and the gating, and its slice / baseline /
+        ablation declarations are published in the report's ``slices`` surface
+        under ``_benchmark_profile``. Absent, the doc-F default :data:`THRESHOLDS`
+        gate (the byte-stable Wave-1/2/3 behaviour).
     """
 
     run_id: str = "eval"
     track: str = "all"
+    config: BenchmarkConfig | None = None
 
     def run(self, inputs: TrackInputs) -> EvaluationReport:
         t0 = time.time()
-        safety_gate, red_team = run_track_semantics(inputs)
+        # Config-loaded thresholds override the doc-F defaults; absent, gate on the
+        # module-default THRESHOLDS (the byte-stable behaviour).
+        th: dict[str, float] = (
+            self.config.thresholds if self.config is not None else dict(THRESHOLDS)
+        )
+        safety_gate, red_team = run_track_semantics(inputs, th)
         counterfactual = run_track_counterfactual(inputs)
         # Build the strongest of the six doc-F baselines (when per-window baseline
         # decision inputs are supplied) so the planning-utility threshold is
@@ -720,10 +895,10 @@ class BenchmarkRunner:
         planning = run_track_planning(inputs, strongest_baseline)
         predictive = run_track_predictive(inputs)
         calibration = run_track_calibration(inputs)
-        coverage_slice = run_coverage_by_slice(inputs)
+        coverage_slice = run_coverage_by_slice(inputs, th)
         operator = run_operator_usefulness(inputs)
-        risk_cov, shift_ab = run_abstention(inputs)
-        slices = compute_slices(inputs)
+        risk_cov, shift_ab = run_abstention(inputs, th)
+        slices = compute_slices(inputs, th)
         # Fairness hooks (doc V H9): the v2 fairness report is carried inside the
         # report's `slices` surface under a dedicated `_fairness` key so it is
         # published slice-wise alongside the safety-first slices without needing
@@ -745,6 +920,18 @@ class BenchmarkRunner:
         # main_readouts in the report so the ablation evidence ships with it.
         if inputs.ablation_report:
             slices["_ablations"] = dict(inputs.ablation_report)
+
+        # Config-declared benchmark profile (doc H configs/eval): publish the
+        # author-editable slice / baseline / ablation declarations so the report
+        # records which YAML profile the gating numbers came from (doc F: say
+        # which thresholds / slices / baselines a claim was scored against).
+        if self.config is not None:
+            slices["_benchmark_profile"] = {
+                "config_id": self.config.raw.get("config_id"),
+                "slices": self.config.slices,
+                "baselines": self.config.baselines,
+                "ablations": self.config.ablations,
+            }
 
         cf_coverage = (
             counterfactual_coverage(inputs.branch_windows)
@@ -781,6 +968,7 @@ class BenchmarkRunner:
             counterfactual_coverage_value=cf_coverage,
             coverage_by_slice=coverage_slice,
             operator_usefulness=operator,
+            thresholds=th,
         )
 
         # Merge the abstention readouts into one dict for the report.
@@ -831,17 +1019,31 @@ class BenchmarkRunner:
                     if inputs.ablation_report
                     else 0
                 ),
-                "thresholds": dict(THRESHOLDS),
+                "thresholds": dict(th),
+                "benchmark_config_id": (
+                    self.config.raw.get("config_id")
+                    if self.config is not None
+                    else None
+                ),
             },
         )
         return report
 
 
 def run_benchmark(
-    inputs: TrackInputs, *, run_id: str = "eval", track: str = "all"
+    inputs: TrackInputs,
+    *,
+    run_id: str = "eval",
+    track: str = "all",
+    config: BenchmarkConfig | None = None,
 ) -> EvaluationReport:
-    """Convenience one-shot: build a runner and produce the report."""
-    return BenchmarkRunner(run_id=run_id, track=track).run(inputs)
+    """Convenience one-shot: build a runner and produce the report.
+
+    ``config`` optionally supplies a parsed ``configs/eval/benchmark.yaml`` profile
+    (doc H) whose acceptance thresholds replace the doc-F defaults; absent, the
+    byte-stable default gating runs.
+    """
+    return BenchmarkRunner(run_id=run_id, track=track, config=config).run(inputs)
 
 
 # Backwards-friendly aliases for the track names used in benchmarks/.
@@ -943,7 +1145,8 @@ def _planning_window_from(rec: Mapping[str, object]) -> PlanningWindow:
 
 def _fairness_window_from(rec: Mapping[str, object]) -> FairnessEvalWindow:
     per_debt = {
-        str(k): float(v) for k, v in dict(rec.get("per_tenant_debt", {})).items()  # type: ignore[arg-type]
+        str(k): float(v)
+        for k, v in dict(rec.get("per_tenant_debt", {})).items()  # type: ignore[arg-type]
     }
     per_gaming = {
         str(t): {str(s): float(x) for s, x in dict(d).items()}
@@ -988,14 +1191,16 @@ def _red_team_case_from(rec: Mapping[str, object]) -> RedTeamCase:
         fragmentation_trap=_b(rec, "fragmentation_trap"),
         derate_occurred=_b(rec, "derate_occurred"),
         triggers_present=frozenset(
-            str(x) for x in rec.get("triggers_present", [])  # type: ignore[union-attr]
+            str(x)
+            for x in rec.get("triggers_present", [])  # type: ignore[union-attr]
         ),
     )
 
 
 def _predictive_report_from(rec: Mapping[str, object]) -> PredictiveReport:
     pinball = {
-        float(k): float(v) for k, v in dict(rec.get("pinball", {})).items()  # type: ignore[arg-type]
+        float(k): float(v)
+        for k, v in dict(rec.get("pinball", {})).items()  # type: ignore[arg-type]
     }
     pr_at_budget = {
         float(k): {str(kk): float(vv) for kk, vv in dict(v).items()}
@@ -1054,10 +1259,12 @@ def _operator_case_from(rec: Mapping[str, object]) -> OperatorCase:
         unaided_decision_unsafe=_b(rec, "unaided_decision_unsafe"),
         is_blocked_case=_b(rec, "is_blocked_case"),
         emitted_blockers=frozenset(
-            str(x) for x in rec.get("emitted_blockers", [])  # type: ignore[union-attr]
+            str(x)
+            for x in rec.get("emitted_blockers", [])  # type: ignore[union-attr]
         ),
         operator_blockers=frozenset(
-            str(x) for x in rec.get("operator_blockers", [])  # type: ignore[union-attr]
+            str(x)
+            for x in rec.get("operator_blockers", [])  # type: ignore[union-attr]
         ),
     )
 
@@ -1148,7 +1355,8 @@ def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
     if isinstance(rt_payload, Mapping):
         for scen, cases in rt_payload.items():
             red_team_cases[str(scen)] = [
-                _red_team_case_from(c) for c in cases  # type: ignore[union-attr]
+                _red_team_case_from(c)
+                for c in cases  # type: ignore[union-attr]
             ]
     elif rt_payload:
         # accept a flat list of cases carrying their own ``scenario`` field
@@ -1181,9 +1389,7 @@ def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
             _planning_window_from(r) for r in _seq("baseline_planning_windows")
         ],
         operator_cases=[_operator_case_from(r) for r in _seq("operator_cases")],
-        fairness_windows=[
-            _fairness_window_from(r) for r in _seq("fairness_windows")
-        ],
+        fairness_windows=[_fairness_window_from(r) for r in _seq("fairness_windows")],
         fairness_slice_labels={
             str(k): str(v)
             for k, v in dict(payload.get("fairness_slice_labels", {})).items()  # type: ignore[arg-type]
@@ -1196,7 +1402,8 @@ def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
         risk_score=[float(x) for x in payload.get("risk_score", [])],  # type: ignore[union-attr]
         selective_error=[float(x) for x in payload.get("selective_error", [])],  # type: ignore[union-attr]
         shift_abstained_or_fellback=[
-            float(x) for x in payload.get("shift_abstained_or_fellback", [])  # type: ignore[union-attr]
+            float(x)
+            for x in payload.get("shift_abstained_or_fellback", [])  # type: ignore[union-attr]
         ],
         shift_false_safe=[float(x) for x in payload.get("shift_false_safe", [])],  # type: ignore[union-attr]
         window_features=[dict(r) for r in _seq("window_features")],
@@ -1219,6 +1426,7 @@ def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
 __all__ = [
     "THRESHOLDS",
     "TRACKS",
+    "BenchmarkConfig",
     "BenchmarkRunner",
     "TrackInputs",
     "apply_acceptance",
@@ -1226,6 +1434,9 @@ __all__ = [
     "compute_slices",
     "compute_strongest_baseline",
     "counterfactual_coverage",
+    "load_benchmark_config",
+    "load_benchmark_config_from_yaml",
+    "load_thresholds",
     "run_abstention",
     "run_benchmark",
     "run_coverage_by_slice",

@@ -183,6 +183,14 @@ class CandidateResult(BaseModel):
     ``safe`` and ``exact_blockers`` come from the exact kernel (the safety gate);
     ``rank``, ``delta_kpis`` and ``uncertainty`` come from the learned model and
     are populated *only over the kernel-certified safe set* (docs C, F, M).
+
+    ``passes_risk_gate`` / ``risk_gate`` carry the *statistical*-safety verdict,
+    kept structurally **separate** from the exact-kernel ``safe`` flag (doc M T1:
+    hard safety is certified; statistical safety is a calibrated gate). ``risk_gate``
+    is a per-family breakdown of the three doc-M E1 tests — the chance constraint
+    ``P(Z_ℓ>0)≤δ_ℓ`` (E4), the conformal margin ``U_ℓ=score+q̂≤tol`` (E2), and the
+    CVaR tail ``CVaR_α≤β_ℓ`` (E5) — so the UI can show *which* statistical gate a
+    candidate cleared or failed, rather than collapsing them into one number.
     """
 
     action_id: str
@@ -192,6 +200,14 @@ class CandidateResult(BaseModel):
     delta_kpis: dict[str, Any] = Field(default_factory=dict)
     uncertainty: dict[str, Any] = Field(default_factory=dict)
     rollout: Rollout | None = None
+    #: ``True`` iff every statistical-safety gate cleared (doc M E1). ``None`` when
+    #: the candidate was not risk-assessed (e.g. hard-infeasible, so the gate never
+    #: ran). Distinct from ``safe`` (the exact-kernel hard-feasibility flag).
+    passes_risk_gate: bool | None = None
+    #: Per-family statistical-safety breakdown keyed ``"chance"`` / ``"margin"`` /
+    #: ``"cvar"`` → ``{channel: {value, budget, exceeds}}`` (doc M E2/E4/E5). Empty
+    #: when no statistical gate was evaluated.
+    risk_gate: dict[str, Any] = Field(default_factory=dict)
 
 
 class CompareResponse(BaseModel):
@@ -219,7 +235,16 @@ class WhyNotRequest(BaseModel):
 
 
 class WhyNotResponse(BaseModel):
-    """Exact blockers + predicted downside for a rejected action (doc G)."""
+    """Exact blockers + predicted downside for a rejected action (doc G).
+
+    The three reasons an action does not get recommended are kept *separate* (doc
+    F / doc M E1): a hard-infeasibility certificate (``minimal_groups``), the
+    statistical-risk rejection (``risk_filtered`` + ``risk_notes``), and the
+    out-ranking note. ``risk_notes`` names each over-budget hazard *and which gate*
+    it tripped — chance ``P(Z_ℓ>0)≤δ_ℓ`` (E4), conformal margin ``U_ℓ≤tol`` (E2),
+    or CVaR tail ``CVaR_α≤β_ℓ`` (E5) — so a calibrated-probability why-not is never
+    conflated with a hard block.
+    """
 
     safe: bool
     exact_blockers: list[str] = Field(default_factory=list)
@@ -227,6 +252,12 @@ class WhyNotResponse(BaseModel):
     supporting_entities: list[str] = Field(default_factory=list)
     # minimal infeasibility certificate groups (doc S IIS analogue)
     minimal_groups: list[str] = Field(default_factory=list)
+    #: ``True`` iff the action was hard-feasible but a statistical gate rejected it
+    #: (doc M E1) — kept distinct from ``not safe`` (a hard block).
+    risk_filtered: bool = False
+    #: Per-over-budget-hazard notes: ``{channel, kind ("chance"|"margin"|"cvar"),
+    #: value, budget}`` (doc M E2/E4/E5). Empty unless ``risk_filtered``.
+    risk_notes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

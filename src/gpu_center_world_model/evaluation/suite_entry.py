@@ -21,7 +21,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .runner import TRACKS, TrackInputs, run_benchmark, track_inputs_from_records
+from .runner import (
+    TRACKS,
+    TrackInputs,
+    load_benchmark_config_from_yaml,
+    run_benchmark,
+    track_inputs_from_records,
+)
 
 
 def _load_inputs(data: str | None) -> tuple[TrackInputs, str]:
@@ -80,6 +86,7 @@ def run_suite(
     suite: str = "all",
     data: str | None = None,
     out: str = "./eval_report",
+    config: str | None = None,
 ) -> str:
     """Run the offline evaluation suite and write JSON + Markdown reports.
 
@@ -87,14 +94,26 @@ def run_suite(
     (``all`` or one of :data:`TRACKS`), ``data`` optionally points at a
     benchmark pack, and ``out`` is the report output directory. Returns the
     path to the written Markdown report.
+
+    The acceptance thresholds, slice definitions, and skeptical baselines are
+    read from ``configs/eval/benchmark.yaml`` (doc H configs/eval): the run
+    *replaces the hardcoded threshold defaults* with the YAML's
+    ``acceptance_thresholds`` so the gating can be re-parameterised without
+    editing Python. ``config`` overrides that default path; a missing config
+    degrades gracefully to the doc-F default thresholds (still a valid run).
     """
     from .reports.report import write_reports  # local import: keep load light
 
     track = suite if suite in TRACKS else "all"
     inputs, note = _load_inputs(data)
-    report = run_benchmark(inputs, run_id="cli-eval", track=track)
+    bench_config = load_benchmark_config_from_yaml(config)
+    report = run_benchmark(
+        inputs, run_id="cli-eval", track=track, config=bench_config
+    )
     paths = write_reports(report, out, stem="eval")
+    cfg_id = bench_config.raw.get("config_id", "doc-F defaults")
     print(f"[gcwm eval] {note}")
+    print(f"[gcwm eval] acceptance profile: {cfg_id}")
     print(f"[gcwm eval] safety-gate-first report written: {paths}")
     return paths.get("markdown") or paths.get("md") or str(Path(out) / "eval.md")
 

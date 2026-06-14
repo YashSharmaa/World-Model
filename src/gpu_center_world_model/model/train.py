@@ -45,7 +45,7 @@ paired-branch **action-separation** ratio ``A_h``. They are returned in the
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -189,6 +189,138 @@ class TrainConfig:
     eff_rank_frac: float = 0.3  # alarm threshold r_eff < 0.3·d (doc J D1)
     seed: int = 0
     verbose: bool = False
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> TrainConfig:
+        """Build a :class:`TrainConfig` from a ``configs/train/*.yaml`` mapping.
+
+        Doc H ships ``configs/train/`` as human-editable YAML so a training recipe
+        can be authored *without editing Python*. This adapter maps the published
+        ``baseline.yaml`` / ``mlx_smoke.yaml`` keys onto the dataclass fields,
+        **additively**: every field whose key is absent keeps its dataclass
+        default, so a partial config is valid and the public ``TrainConfig()``
+        constructor stays byte-stable. The mapping is faithful to the YAML's
+        documented intent (doc E micro-batch / accumulation / schedules; doc J
+        C1-C5 stage budgets, EMA decay, rollout horizon curriculum):
+
+        * ``seed`` → ``seed``;
+        * ``optim.{micro_batch_size, grad_accum_steps, learning_rate,
+          weight_decay, grad_clip_norm}`` → ``{micro_batch, accum_steps, lr,
+          weight_decay, grad_clip}``; ``optim.warmup_steps`` + ``optim.epochs``
+          set ``warmup_frac = warmup_steps / max(total_updates, 1)`` (doc E LR
+          warmup over the first fraction of updates);
+        * ``temporal.{t_fast, t_slow}`` set the BPTT clock ``h_slow`` and the
+          rollout-horizon cap (the slow lane bounds H, doc J B3);
+        * ``ema.decay`` → ``ema_end`` and ``ema.warmup_steps`` raises
+          ``ema_start`` only when explicitly larger (the cosine τ schedule,
+          doc J C1/C4);
+        * ``uncertainty.var_floor`` / diagnostics → ``var_floor`` /
+          ``eff_rank_frac`` when present.
+
+        Stage budgets (``steps_per_stage``) are taken verbatim when a config
+        supplies a ``steps_per_stage`` block; otherwise the demo-scale defaults
+        (which keep the smoke loop in CI seconds) are preserved.
+        """
+        cfg = cls()
+        if not config:
+            return cfg
+        if "seed" in config:
+            cfg.seed = int(config["seed"])
+        if "verbose" in config:
+            cfg.verbose = bool(config["verbose"])
+
+        optim = config.get("optim") or {}
+        if "micro_batch_size" in optim:
+            cfg.micro_batch = int(optim["micro_batch_size"])
+        if "grad_accum_steps" in optim:
+            cfg.accum_steps = int(optim["grad_accum_steps"])
+        if "learning_rate" in optim:
+            cfg.lr = float(optim["learning_rate"])
+        if "weight_decay" in optim:
+            cfg.weight_decay = float(optim["weight_decay"])
+        if "grad_clip_norm" in optim:
+            cfg.grad_clip = float(optim["grad_clip_norm"])
+        # warmup_frac = warmup_steps / total optimizer updates (epochs × accum),
+        # so the published step count becomes the doc-E LR-warmup fraction.
+        warmup_steps = optim.get("warmup_steps")
+        if warmup_steps is not None:
+            epochs = int(optim.get("epochs", 1) or 1)
+            total_updates = max(epochs * max(cfg.accum_steps, 1), 1)
+            cfg.warmup_frac = min(1.0, float(warmup_steps) / total_updates)
+
+        temporal = config.get("temporal") or {}
+        if "t_slow" in temporal:
+            t_slow = int(temporal["t_slow"])
+            cfg.h_slow = t_slow
+            # the slow lane bounds the rollout horizon curriculum (doc J B3): the
+            # end horizon never exceeds the slow-lane clock, and the per-stage cap
+            # follows it so a shrunk smoke config rolls out fewer steps.
+            cfg.curriculum_h_end = min(cfg.curriculum_h_end, t_slow)
+            cfg.rollout_horizon = min(cfg.rollout_horizon, t_slow)
+
+        ema = config.get("ema") or {}
+        if "decay" in ema:
+            cfg.ema_end = float(ema["decay"])
+        # an explicit start decay (larger than the default floor) tightens the
+        # cosine schedule's initial τ; absent, the default 0.99 floor stands.
+        if "start_decay" in ema:
+            cfg.ema_start = float(ema["start_decay"])
+
+        unc = config.get("uncertainty") or {}
+        if "var_floor" in unc:
+            cfg.var_floor = float(unc["var_floor"])
+        if "eff_rank_frac" in unc:
+            cfg.eff_rank_frac = float(unc["eff_rank_frac"])
+
+        diag = config.get("diagnostics") or {}
+        if "diag_every" in diag:
+            cfg.diag_every = int(diag["diag_every"])
+
+        sps = config.get("steps_per_stage")
+        if isinstance(sps, Mapping):
+            # verbatim per-stage budgets, but only for the known stages so an
+            # unknown key cannot smuggle an undefined stage into the loop.
+            for stage in STAGES:
+                if stage in sps:
+                    cfg.steps_per_stage[stage] = int(sps[stage])
+        return cfg
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> TrainConfig:
+        """Load ``configs/train/*.yaml`` from disk into a :class:`TrainConfig`.
+
+        Thin convenience over :meth:`from_config` + the dependency-light
+        :func:`utils.config.load_config` loader. ``path`` may be absolute, or a
+        ``configs/train/...`` path relative to the repo root (resolved via
+        :func:`resolve_repo_config`).
+        """
+        from ..utils.config import load_config
+
+        raw = load_config(resolve_repo_config(path))
+        return cls.from_config(raw if isinstance(raw, Mapping) else {})
+
+
+def resolve_repo_config(path: str | Path) -> Path:
+    """Resolve a ``configs/...`` path against the repo root (doc H configs/).
+
+    Accepts an absolute path (returned unchanged) or a path relative to the
+    repository root that ships ``configs/{train,eval,demo}``. Because the package
+    is installed from ``src/``, the repo root is found by walking up from this
+    module until a directory containing a ``configs`` folder is reached; if none
+    is found the path is returned relative to the current working directory so the
+    caller still gets a clear :class:`FileNotFoundError` from the loader.
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / p
+        if candidate.exists() and (parent / "configs").is_dir():
+            return candidate
+        if (parent / "configs").is_dir() and str(p).startswith("configs"):
+            return parent / p
+    return p
 
 
 # --------------------------------------------------------------------------- #
@@ -592,9 +724,7 @@ def _kpi_delta_labels(
     return out
 
 
-def _query_pool(
-    be: Backend, h: ArrayLike, mask: ArrayLike | None
-) -> np.ndarray:
+def _query_pool(be: Backend, h: ArrayLike, mask: ArrayLike | None) -> np.ndarray:
     """Masked-mean pool an entity latent block into one query vector (doc Q V4)."""
     a = np.asarray(be.to_numpy(h), dtype=np.float64)
     if a.ndim == 1:
@@ -1113,9 +1243,7 @@ def train(
             if global_step % cfg.diag_every == 0:
                 ts = model.feature_builder.build(windows[0].state, None)
                 report.diagnostics.append(
-                    _diag_snapshot(
-                        model, ts, accum[0], global_step, cfg, target_model
-                    )
+                    _diag_snapshot(model, ts, accum[0], global_step, cfg, target_model)
                 )
             if cfg.verbose:
                 print(f"[{stage}] step {global_step} loss={step_loss:.5f} τ={tau:.4f}")
@@ -1211,9 +1339,7 @@ def _mlx_differentiable_loss(  # pragma: no cover - Apple-silicon only
         nb = max(len(batch), 1)
         for w in batch:
             ts = model.feature_builder.build(w.state, None)
-            feats = apply_typed_mask(
-                ts.features, _MASK_TYPES, mask_rng, 0.15, be
-            )
+            feats = apply_typed_mask(ts.features, _MASK_TYPES, mask_rng, 0.15, be)
             masked_ts = replace(ts, features=feats)
             online = model.backbone.encode(masked_ts, w.action.type.value)
             target_state = w.future_state or w.state
@@ -1267,9 +1393,7 @@ def _mlx_differentiable_loss(  # pragma: no cover - Apple-silicon only
                 # G5 exact-state consistency (doc J Eq. 18) over the rollout
                 fd = model.backbone.field_decoders
                 if fd is not None:
-                    targets = exact_field_targets(
-                        target_state, ts.order, ts.masks, be
-                    )
+                    targets = exact_field_targets(target_state, ts.order, ts.masks, be)
                     flavor = {nm: fl for nm, _lt, _od, fl in fd.spec}
                     for zh in pred_traj:
                         preds = fd.decode(zh, be)
@@ -1282,9 +1406,7 @@ def _mlx_differentiable_loss(  # pragma: no cover - Apple-silicon only
                             if flavor.get(name) == "huber":
                                 r = p - y
                                 a = mx.abs(r)
-                                per = mx.where(
-                                    a <= 1.0, 0.5 * r * r, a - 0.5
-                                )
+                                per = mx.where(a <= 1.0, 0.5 * r * r, a - 0.5)
                             else:  # bce-with-logits
                                 per = (
                                     mx.maximum(p, 0.0)
@@ -1416,9 +1538,7 @@ def _fit_calibration(
     cal = model.calibrator
     # marginal CQR rows + per-slice Mondrian rows keyed by channel/horizon.
     by_channel: dict[tuple[str, int], list[tuple[float, float, float]]] = {}
-    mondrian_rows: dict[
-        tuple[str, int], dict[str, list[float]]
-    ] = {}
+    mondrian_rows: dict[tuple[str, int], dict[str, list[float]]] = {}
     parent_of: dict[object, object] = {}
     for w in windows:
         if w.future_state is None:
@@ -1582,6 +1702,7 @@ def smoke_train(
     n_windows: int = 16,
     backend: Backend | None = None,
     cfg: TrainConfig | None = None,
+    config_path: str | Path | None = None,
 ) -> TrainReport:
     """End-to-end smoke train: build → train all stages → (optionally) checkpoint.
 
@@ -1589,8 +1710,15 @@ def smoke_train(
     "stage zero: tensor-pipeline smoke tests"). Returns the :class:`TrainReport`;
     if ``out_dir`` is given the trained model is checkpointed via
     :func:`serialization.save_checkpoint`.
+
+    ``config_path`` optionally points at a ``configs/train/*.yaml`` recipe (doc H):
+    when supplied and no explicit ``cfg`` is passed, the recipe is loaded into a
+    :class:`TrainConfig` via :meth:`TrainConfig.from_yaml` so a training run can be
+    re-parameterised from YAML without editing Python.
     """
     be = backend or get_backend()
+    if cfg is None and config_path is not None:
+        cfg = TrainConfig.from_yaml(config_path)
     cfg = cfg or TrainConfig()
     model = ResidualWorldModel.build(
         arch=ArchConfig(seed=cfg.seed), n_ensemble=2, backend=be
@@ -1603,12 +1731,22 @@ def smoke_train(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI shim: ``python -m gpu_center_world_model.model.train [out_dir]``."""
+    """CLI shim: ``python -m ...model.train [out_dir] [--config P]``.
+
+    A trailing ``--config <path>`` loads a ``configs/train/*.yaml`` recipe (doc H)
+    into the :class:`TrainConfig`; otherwise the demo-scale default config runs.
+    """
     import sys
 
     args = list(argv if argv is not None else sys.argv[1:])
+    config_path: str | None = None
+    if "--config" in args:
+        i = args.index("--config")
+        config_path = args[i + 1] if i + 1 < len(args) else None
+        del args[i : i + 2]
     out_dir = args[0] if args else None
-    cfg = TrainConfig(verbose=True)
+    cfg = TrainConfig.from_yaml(config_path) if config_path else TrainConfig()
+    cfg.verbose = True
     report = smoke_train(out_dir=out_dir, cfg=cfg)
     print(
         f"smoke_train done: backend={report.backend} steps={report.steps} "
@@ -1633,6 +1771,7 @@ __all__ = [
     "main",
     "make_smoke_windows",
     "min_dim_variance",
+    "resolve_repo_config",
     "smoke_train",
     "stage_loss",
     "train",
