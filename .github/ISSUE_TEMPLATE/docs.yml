@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — documentation issue (issue FORM, not free text)
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Covers prose docs, the architecture/ADR set, API + schema reference, and the
+#  data/model cards. Docs are CC-BY-4.0; embedded code snippets are Apache-2.0.
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Documentation issue"
+description: "Report unclear, missing, or incorrect documentation."
+title: "[docs]: "
+labels: ["kind/docs", "area/docs"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for improving the docs. Note: prose/diagrams are **CC-BY-4.0**,
+        and code snippets embedded in docs are **Apache-2.0**.
+
+  - type: dropdown
+    id: doc-area
+    attributes:
+      label: Which document?
+      options:
+        - "README / quickstart"
+        - "Architecture / ADR"
+        - "API & schema reference"
+        - "Data card"
+        - "Model card"
+        - "Benchmark report"
+        - "Getting started"
+        - "Theory docs"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Page / path / URL
+      description: The file path under docs/ or the rendered page URL.
+      placeholder: "docs/architecture/overview.md"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Issue type
+      options:
+        - "Incorrect / outdated"
+        - "Missing content"
+        - "Unclear / confusing"
+        - "Broken link"
+        - "Typo / formatting"
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: What is wrong, and what would good look like?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix (optional)
+      description: Paste proposed wording if you have it.
+    validations:
+      required: false

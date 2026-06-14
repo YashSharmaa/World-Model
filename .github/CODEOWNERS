@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — code ownership / review routing
+#  Author:  Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Assigns review responsibility at path level (GitHub CODEOWNERS). Every
+#  top-level package is owned by @yashsharmaa for v0.1. Schema, simulator,
+#  planner, evaluation, and the release workflow are safety/contract-critical
+#  and require an owner review before merge (enforce via branch protection).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default owner for everything not matched below.
+*                                   @yashsharmaa
+
+# ── Frozen contracts & canonical schema (changes need explicit sign-off) ──────
+/src/gpu_center_world_model/schema/         @yashsharmaa
+/src/gpu_center_world_model/**/contracts.py @yashsharmaa
+/src/gpu_center_world_model/utils/          @yashsharmaa
+
+# ── Core packages ─────────────────────────────────────────────────────────────
+/src/gpu_center_world_model/ingest/         @yashsharmaa
+/src/gpu_center_world_model/data_engine/    @yashsharmaa
+/src/gpu_center_world_model/simulator/      @yashsharmaa
+/src/gpu_center_world_model/model/          @yashsharmaa
+/src/gpu_center_world_model/planner/        @yashsharmaa
+/src/gpu_center_world_model/serving/        @yashsharmaa
+/src/gpu_center_world_model/evaluation/     @yashsharmaa
+/src/gpu_center_world_model/uncertainty/    @yashsharmaa
+/src/gpu_center_world_model/reliability/    @yashsharmaa
+/src/gpu_center_world_model/fairness/       @yashsharmaa
+
+# ── Frontend, benchmarks, configs, scenarios, examples, docs ──────────────────
+/apps/web/        @yashsharmaa
+/benchmarks/      @yashsharmaa
+/configs/         @yashsharmaa
+/scenarios/       @yashsharmaa
+/examples/        @yashsharmaa
+/sample_data/     @yashsharmaa
+/docs/            @yashsharmaa
+/tests/           @yashsharmaa
+
+# ── CI / meta / release (release workflow is gate-critical) ───────────────────
+/.github/                       @yashsharmaa
+/.github/workflows/release.yml  @yashsharmaa
+/pyproject.toml                 @yashsharmaa
+/REUSE.toml                     @yashsharmaa
+/CITATION.cff                   @yashsharmaa

@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — REUSE / SPDX licensing metadata
+#  Author:  Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Per-file licensing is intentionally mixed (design doc H, "licensing"):
+#    * code              → Apache-2.0      (explicit patent grant)
+#    * docs / diagrams   → CC-BY-4.0       (quote/adapt with attribution)
+#    * data / packs      → CDLA-Permissive-2.0  (data-specific, permissive)
+#  REUSE makes that file-level intent machine-readable and unambiguous.
+#  Copyright holder for all annotations: "Yash Sharma".
+#
+#  REUSE.toml format version 1 (REUSE spec 3.3+). Place the referenced license
+#  texts under LICENSES/ (Apache-2.0.txt, CC-BY-4.0.txt, CDLA-Permissive-2.0.txt)
+#  to make `reuse lint` fully green.
+# ─────────────────────────────────────────────────────────────────────────────
+version = 1
+SPDX-PackageName = "gpu-center-world-model"
+SPDX-PackageSupplier = "Yash Sharma <yash.sharma.contact@gmail.com>"
+SPDX-PackageDownloadLocation = "https://github.com/yashsharmaa/gpu-center-world-model"
+
+# ── Source code: Apache-2.0 ───────────────────────────────────────────────────
+[[annotations]]
+path = [
+  "src/**",
+  "tests/**",
+  "examples/**",
+  "benchmarks/**",
+  "apps/web/src/**",
+  "apps/web/*.ts",
+  "apps/web/*.json",
+  "apps/web/*.html",
+  "pyproject.toml",
+  "Makefile",
+  "mkdocs.yml",
+  ".github/**",
+  "REUSE.toml",
+  ".editorconfig",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Yash Sharma <https://www.linkedin.com/in/yashsharmaa/>"
+SPDX-License-Identifier = "Apache-2.0"
+
+# ── Documentation, diagrams, screenshots, demo narration: CC-BY-4.0 ───────────
+# Executable code snippets embedded in docs remain Apache-2.0; mark those
+# in-file with an SPDX header where they appear.
+[[annotations]]
+path = [
+  "docs/**",
+  "README.md",
+  "ARCHITECTURE.md",
+  "ROADMAP.md",
+  "CONTRIBUTING.md",
+  "CODE_OF_CONDUCT.md",
+  "SECURITY.md",
+  "**/*.svg",
+  "**/*.png",
+  "**/*.jpg",
+  "**/*.jpeg",
+  "**/*.gif",
+  "**/*.webp",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Yash Sharma <https://www.linkedin.com/in/yashsharmaa/>"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# ── Synthetic example datasets & public benchmark packs: CDLA-Permissive-2.0 ──
+# Mixed-source or locally calibrated packs must NOT inherit this blanket grant;
+# preserve their upstream notices pack-by-pack in the data card instead.
+[[annotations]]
+path = [
+  "sample_data/**",
+  "scenarios/**",
+  "configs/**",
+  "**/*.parquet",
+  "**/*.arrow",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Yash Sharma <https://www.linkedin.com/in/yashsharmaa/>"
+SPDX-License-Identifier = "CDLA-Permissive-2.0"

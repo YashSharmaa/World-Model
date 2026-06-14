@@ -1,0 +1,338 @@
+[
+  {
+    "action_id": "0:hold:wl-demo-0:",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [],
+    "feasible": true,
+    "hazards": {
+      "headroom_violation": 0.0,
+      "hotspot": 0.0,
+      "pods_ready_timeout": 0.0,
+      "requeue": 0.0,
+      "xid_fault": 0.0
+    },
+    "horizon_s": 300,
+    "kpi_quantiles": {
+      "admitted_gpu_hours_delta": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "completion_time_delta_s": {
+        "0.05": -0.0,
+        "0.1": -0.0,
+        "0.5": -0.0,
+        "0.9": -0.0,
+        "0.95": -0.0
+      },
+      "cross_rack_rate": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "rack_power_kw": {
+        "0.05": 4.898299534106455,
+        "0.1": 4.898299534106455,
+        "0.5": 4.898299534106455,
+        "0.9": 4.898299534106455,
+        "0.95": 4.898299534106455
+      },
+      "rack_thermal_headroom_c": {
+        "0.05": 22.78609328470988,
+        "0.1": 22.78609328470988,
+        "0.5": 22.78609328470988,
+        "0.9": 22.78609328470988,
+        "0.95": 22.78609328470988
+      }
+    }
+  },
+  {
+    "action_id": "0:hold:wl-demo-0:",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [],
+    "feasible": true,
+    "hazards": {
+      "headroom_violation": 0.0,
+      "hotspot": 0.0,
+      "pods_ready_timeout": 0.0,
+      "requeue": 0.0,
+      "xid_fault": 0.0
+    },
+    "horizon_s": 900,
+    "kpi_quantiles": {
+      "admitted_gpu_hours_delta": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "completion_time_delta_s": {
+        "0.05": -0.0,
+        "0.1": -0.0,
+        "0.5": -0.0,
+        "0.9": -0.0,
+        "0.95": -0.0
+      },
+      "cross_rack_rate": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "rack_power_kw": {
+        "0.05": 4.898299534106455,
+        "0.1": 4.898299534106455,
+        "0.5": 4.898299534106455,
+        "0.9": 4.898299534106455,
+        "0.95": 4.898299534106455
+      },
+      "rack_thermal_headroom_c": {
+        "0.05": 22.78609328470988,
+        "0.1": 22.78609328470988,
+        "0.5": 22.78609328470988,
+        "0.9": 22.78609328470988,
+        "0.95": 22.78609328470988
+      }
+    }
+  },
+  {
+    "action_id": "0:hold:wl-demo-0:",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [],
+    "feasible": true,
+    "hazards": {
+      "headroom_violation": 0.0,
+      "hotspot": 0.0,
+      "pods_ready_timeout": 0.0,
+      "requeue": 0.0,
+      "xid_fault": 0.0
+    },
+    "horizon_s": 1800,
+    "kpi_quantiles": {
+      "admitted_gpu_hours_delta": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "completion_time_delta_s": {
+        "0.05": -0.0,
+        "0.1": -0.0,
+        "0.5": -0.0,
+        "0.9": -0.0,
+        "0.95": -0.0
+      },
+      "cross_rack_rate": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "rack_power_kw": {
+        "0.05": 4.898299534106455,
+        "0.1": 4.898299534106455,
+        "0.5": 4.898299534106455,
+        "0.9": 4.898299534106455,
+        "0.95": 4.898299534106455
+      },
+      "rack_thermal_headroom_c": {
+        "0.05": 22.78609328470988,
+        "0.1": 22.78609328470988,
+        "0.5": 22.78609328470988,
+        "0.9": 22.78609328470988,
+        "0.95": 22.78609328470988
+      }
+    }
+  },
+  {
+    "action_id": "0:hold:wl-demo-0:",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [],
+    "feasible": true,
+    "hazards": {
+      "headroom_violation": 0.0,
+      "hotspot": 0.0,
+      "pods_ready_timeout": 0.0,
+      "requeue": 0.0,
+      "xid_fault": 0.0
+    },
+    "horizon_s": 3600,
+    "kpi_quantiles": {
+      "admitted_gpu_hours_delta": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "completion_time_delta_s": {
+        "0.05": -0.0,
+        "0.1": -0.0,
+        "0.5": -0.0,
+        "0.9": -0.0,
+        "0.95": -0.0
+      },
+      "cross_rack_rate": {
+        "0.05": 0.0,
+        "0.1": 0.0,
+        "0.5": 0.0,
+        "0.9": 0.0,
+        "0.95": 0.0
+      },
+      "rack_power_kw": {
+        "0.05": 4.898299534106455,
+        "0.1": 4.898299534106455,
+        "0.5": 4.898299534106455,
+        "0.9": 4.898299534106455,
+        "0.95": 4.898299534106455
+      },
+      "rack_thermal_headroom_c": {
+        "0.05": 22.78609328470988,
+        "0.1": 22.78609328470988,
+        "0.5": 22.78609328470988,
+        "0.9": 22.78609328470988,
+        "0.95": 22.78609328470988
+      }
+    }
+  },
+  {
+    "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 300,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 900,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 1800,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "1:admit_and_place:wl-demo-0:dom-rack-0",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 3600,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 300,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 900,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 1800,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "2:admit_and_place:wl-demo-0:dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 3600,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 300,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 900,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 1800,
+    "kpi_quantiles": {}
+  },
+  {
+    "action_id": "3:place:wl-demo-0:dom-rack-0,dom-rack-1",
+    "decision_id": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+    "explanation_tags": [
+      "gang_atomicity"
+    ],
+    "feasible": false,
+    "hazards": {},
+    "horizon_s": 3600,
+    "kpi_quantiles": {}
+  }
+]

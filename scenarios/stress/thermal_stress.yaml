@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# thermal_stress — a hot, power-dense pod near its cooling envelope.
+#
+# Same topology family as steady_pod but the row runs hot: high ambient, reduced
+# cooling margin, and thin rack thermal margins, so admitting another heavy
+# all-reduce gang risks delayed hotspot emergence through shared thermal inertia
+# (doc D: temperature lags power through shared zone/rack state). No discrete
+# rare-event injection — the *baseline conditions* are the stress.
+
+scenario_id: thermal_stress
+scenario_family: stress
+seed: 2001
+base_ts: 0.0
+tick: 0
+
+context:
+  regime: conservative
+  ambient_temp_c: 30.0          # hot aisle
+  arrival_burst_regime: steady
+  workload_mix_regime: training_heavy
+
+pod:
+  block_id: block-0
+  flavor: gpu-h100
+  gpus_per_node: 8
+  gpu_memory_mb: 81920
+  node_cpu: 128.0
+  node_mem_gb: 2048.0
+  racks:
+    - id: rack-a
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-a
+      cooling_zone: zone-hot
+      switch: tor-a
+      power_cap_kw: 120.0
+      cooling_cap_kw: 110.0       # under-provisioned cooling
+      inlet_temp_c: 30.0
+      thermal_margin_c: 4.0       # already thin
+      cooling_margin: 0.6
+    - id: rack-b
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-b
+      cooling_zone: zone-hot      # coupled to rack-a's thermal state
+      switch: tor-b
+      power_cap_kw: 120.0
+      cooling_cap_kw: 110.0
+      inlet_temp_c: 30.0
+      thermal_margin_c: 6.0
+      cooling_margin: 0.7
+
+flavors:
+  - name: gpu-h100
+    topology: block-0
+
+cluster_queues:
+  - name: cq-research
+    fairshare_weight: 1.0
+    preemption_policy: never
+    flavor_order: [gpu-h100]
+    nominal_quota:
+      gpu-h100:
+        nvidia.com/gpu: 56.0
+
+local_queues:
+  - name: lq-team-train
+    namespace: train
+    cluster_queue: cq-research
+    tenant_id: tenant-train
+
+# Running fleet already occupies rack-a; pending gangs would tip the thermal load.
+jobs:
+  - uid: wl-run-train-a
+    local_queue: lq-team-train
+    status: running
+    priority: 50
+    gpus: 8
+    replicas: 1
+    comm_class: allreduce_heavy
+    topology_policy: required
+    est_remaining_s: 5400.0
+    max_exec_s: 14400.0
+    labels: {class: training}
+  - uid: wl-train-016
+    local_queue: lq-team-train
+    priority: 40
+    gpus: 16
+    replicas: 2
+    comm_class: allreduce_heavy
+    topology_policy: required
+    max_exec_s: 21600.0
+    labels: {class: training}
+  - uid: wl-finetune-004
+    local_queue: lq-team-train
+    priority: 20
+    gpus: 4
+    replicas: 1
+    comm_class: light
+    topology_policy: preferred
+    max_exec_s: 5400.0
+    labels: {class: fine_tune}
+
+operator_policy:
+  policy_id: conservative
+  allowed_actions: [hold, admit, place, admit_and_place]
+  risk_thresholds:
+    max_hotspot_prob: 0.08
+    max_headroom_violation_prob: 0.04

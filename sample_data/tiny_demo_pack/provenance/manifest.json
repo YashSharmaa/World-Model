@@ -1,0 +1,29 @@
+{
+  "author": "Yash Sharma",
+  "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+  "calibration_window": "synthetic (fitted-posterior bounds, not a real window)",
+  "generator_commit": "tiny-demo-pack@0.1.0.dev0",
+  "known_invalid_uses": [
+    "Do not use synthetic-only test slices to claim real-world reliability; they measure generator agreement, not sim-to-real transfer (doc D).",
+    "Do not feed `origin` / scenario metadata as default model features; it lets the model learn generator identity instead of dynamics (doc D).",
+    "Do not treat teacher-forced realized futures as action-conditioned targets \u2014 always use the paired counterfactual deltas (doc R).",
+    "Do not zero-fill missing telemetry; missingness is first-class state."
+  ],
+  "real_fraction": 0.0,
+  "schema_version": "1.0.0",
+  "seed_registry": {
+    "gpu_fault_burst": 3001,
+    "scheduling_stress": 2002,
+    "steady_pod": 1001,
+    "thermal_stress": 2001
+  },
+  "simulator_version": "0.1.0.dev0",
+  "source_inventory": {
+    "dcgm": "per-GPU util/power/energy/temp/xid telemetry channels",
+    "kubernetes_dra": "gang / topology-aware placement semantics",
+    "kueue": "scheduler/admission/quota surface (exact-kernel semantics)",
+    "node_exporter": "host cpu/mem/net/thermal/powercap context",
+    "redfish": "optional out-of-band power/cooling/fabric metadata",
+    "synthetic_scm": "generative SCM (docs R/N): phases, health, thermal RC"
+  }
+}

@@ -1,0 +1,85 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Private research / planning material — never publish to the open-source repo
+# ──────────────────────────────────────────────────────────────────────────
+Research_Docs/
+research_docs/
+Research_Documentation/
+
+# ── macOS ──
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.uv/
+.python-version
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── MLX / ML artifacts ──
+*.safetensors
+*.npz
+*.npy
+*.gguf
+checkpoints/
+runs/
+wandb/
+mlruns/
+.cache/
+
+# ── Large data & benchmark packs (publish as release assets, not in Git) ──
+data/
+datasets/
+sample_data/large/
+*.parquet
+*.arrow
+*.duckdb
+*.sqlite
+
+# ── Node / TypeScript / three.js front-end (apps/web) ──
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ── Secrets & local env ──
+.env
+.env.*
+!.env.example
+*.local
+
+# ── Editor / IDE ──
+.vscode/
+.idea/
+*.swp
+*~
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+eval_report/
+/tmp_pack/

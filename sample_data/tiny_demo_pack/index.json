@@ -1,0 +1,85 @@
+{
+  "author": "Yash Sharma",
+  "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+  "credit": "GPU-Center World Model \u00b7 Done by Yash Sharma \u2014 https://www.linkedin.com/in/yashsharmaa/",
+  "generator_commit": "tiny-demo-pack@0.1.0.dev0",
+  "project": "GPU-Center World Model",
+  "schema_version": "1.0.0",
+  "windows": [
+    {
+      "branch_state_hash": "eb6fd165b9224b3b245978b25bb74ddaed8c00b15ab6ccb1bb7482337128691d",
+      "family": "normal",
+      "label_uri": "label_packs/steady_pod.json",
+      "n_branches": 4,
+      "n_gpus": 64,
+      "n_labels": 16,
+      "n_nodes": 8,
+      "pending_queue": [
+        "wl-train-016",
+        "wl-train-008",
+        "wl-finetune-004",
+        "wl-infer-001"
+      ],
+      "rare_event": null,
+      "scenario_id": "steady_pod",
+      "scenario_state_hash": "cfc981f213f1ceb77c74e9be3a90a31630d77f6de2f45a0b37b2f7598a61244a",
+      "split": "train",
+      "window_uri": "decision_windows/steady_pod.json"
+    },
+    {
+      "branch_state_hash": "eb6fd165b9224b3b245978b25bb74ddaed8c00b15ab6ccb1bb7482337128691d",
+      "family": "stress",
+      "label_uri": "label_packs/thermal_stress.json",
+      "n_branches": 4,
+      "n_gpus": 64,
+      "n_labels": 16,
+      "n_nodes": 8,
+      "pending_queue": [
+        "wl-train-016",
+        "wl-finetune-004"
+      ],
+      "rare_event": null,
+      "scenario_id": "thermal_stress",
+      "scenario_state_hash": "5894c999e04023c87860376e16ae4eaa3e127eeb978937a7e45fe995116b9e2d",
+      "split": "val",
+      "window_uri": "decision_windows/thermal_stress.json"
+    },
+    {
+      "branch_state_hash": "7512df0a0a15f0dc9c746e46878c29ff77db7593cd1d9f6fcc9dbd9c73fcc787",
+      "family": "stress",
+      "label_uri": "label_packs/scheduling_stress.json",
+      "n_branches": 4,
+      "n_gpus": 48,
+      "n_labels": 16,
+      "n_nodes": 12,
+      "pending_queue": [
+        "wl-train-016",
+        "wl-finetune-004",
+        "wl-infer-001"
+      ],
+      "rare_event": null,
+      "scenario_id": "scheduling_stress",
+      "scenario_state_hash": "f4012bd12fa89927faee40bd481bb34938794872985931ead720566abc04e1d6",
+      "split": "train",
+      "window_uri": "decision_windows/scheduling_stress.json"
+    },
+    {
+      "branch_state_hash": "eb6fd165b9224b3b245978b25bb74ddaed8c00b15ab6ccb1bb7482337128691d",
+      "family": "rare_events",
+      "label_uri": "label_packs/gpu_fault_burst.json",
+      "n_branches": 4,
+      "n_gpus": 64,
+      "n_labels": 16,
+      "n_nodes": 8,
+      "pending_queue": [
+        "wl-train-016",
+        "wl-infer-001"
+      ],
+      "rare_event": "gpu_fault_burst",
+      "scenario_id": "gpu_fault_burst",
+      "scenario_state_hash": "c2c117e777a0e77139b18b3c9839a236b3e1312b1933e9ca115d14cf0d780fb6",
+      "split": "test_rare_event",
+      "window_uri": "decision_windows/gpu_fault_burst.json"
+    }
+  ]
+}

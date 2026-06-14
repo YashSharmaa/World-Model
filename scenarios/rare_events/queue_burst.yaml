@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# queue_burst — synchronized tenant arrival spike / campaign launch (doc D).
+#
+# A tenant launches a synchronized training campaign: a cluster of gangs arrives
+# in a tight window rather than as IID jobs. Because aggregate power and
+# variability depend on workload composition, the burst is coupled to a
+# training-heavy mix. The arrival regime is stamped onto the context so the
+# simulator's arrival process is regime-conditioned (doc D randomize aggressively
+# at the scenario layer, keep arithmetic invariant).
+
+scenario_id: queue_burst
+scenario_family: rare_events
+seed: 3005
+base_ts: 0.0
+tick: 0
+
+context:
+  regime: normal
+  ambient_temp_c: 23.0
+  arrival_burst_regime: campaign
+  workload_mix_regime: training_heavy
+
+pod:
+  block_id: block-0
+  flavor: gpu-h100
+  gpus_per_node: 8
+  racks:
+    - id: rack-a
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-a
+      cooling_zone: zone-row-0
+      switch: tor-a
+    - id: rack-b
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-b
+      cooling_zone: zone-row-0
+      switch: tor-b
+
+flavors:
+  - name: gpu-h100
+    topology: block-0
+
+cluster_queues:
+  - name: cq-research
+    flavor_order: [gpu-h100]
+    nominal_quota:
+      gpu-h100:
+        nvidia.com/gpu: 48.0
+
+local_queues:
+  - name: lq-campaign
+    namespace: campaign
+    cluster_queue: cq-research
+    tenant_id: tenant-campaign
+
+# A synchronized campaign: many same-tenant gangs arriving in a tight window.
+jobs:
+  - uid: wl-campaign-08-a
+    local_queue: lq-campaign
+    priority: 40
+    submit_offset_s: 0.0
+    gpus: 8
+    replicas: 1
+    comm_class: allreduce_heavy
+    topology_policy: required
+    max_exec_s: 14400.0
+    labels: {class: training, campaign: sweep-1}
+  - uid: wl-campaign-08-b
+    local_queue: lq-campaign
+    priority: 40
+    submit_offset_s: 5.0
+    gpus: 8
+    replicas: 1
+    comm_class: allreduce_heavy
+    topology_policy: required
+    max_exec_s: 14400.0
+    labels: {class: training, campaign: sweep-1}
+  - uid: wl-campaign-16
+    local_queue: lq-campaign
+    priority: 45
+    submit_offset_s: 10.0
+    gpus: 16
+    replicas: 2
+    comm_class: allreduce_heavy
+    topology_policy: required
+    max_exec_s: 21600.0
+    labels: {class: training, campaign: sweep-1}
+  - uid: wl-campaign-04
+    local_queue: lq-campaign
+    priority: 30
+    submit_offset_s: 15.0
+    gpus: 4
+    replicas: 1
+    comm_class: light
+    topology_policy: preferred
+    max_exec_s: 5400.0
+    labels: {class: fine_tune, campaign: sweep-1}
+
+rare_event:
+  kind: queue_burst
+  severity: 0.6
+  onset_s: 0.0
+  burst_regime: campaign
+  arrivals_per_min: 12          # campaign launch rate for the simulator
+
+operator_policy:
+  policy_id: default
+  allowed_actions: [hold, admit, place, admit_and_place]
+  risk_thresholds:
+    max_requeue_prob: 0.10

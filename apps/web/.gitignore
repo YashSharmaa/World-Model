@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — Decision Studio (apps/web) ignore rules
+#  Author:  Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Scoped ignores so the three.js front-end stays self-contained. The repo-root
+#  .gitignore already covers these globally; this keeps the web subtree clean
+#  even when developed in isolation. The committed package-lock.json is kept
+#  (do NOT ignore it) for reproducible installs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.vite/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Vite / dev caches
+.cache/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local env overrides
+.env
+.env.*
+!.env.example
+
+# Editor / OS cruft
+.DS_Store
+*.swp

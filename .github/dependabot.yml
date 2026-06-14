@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — Dependabot configuration
+#  Author:  Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Keeps the supply chain current across all three ecosystems in the repo:
+#    * GitHub Actions used by the workflows in .github/workflows/
+#    * Python dependencies declared in pyproject.toml
+#    * npm dependencies for the three.js Decision Studio in apps/web/
+#  Weekly cadence with grouped minor/patch bumps to keep PR noise low.
+# ─────────────────────────────────────────────────────────────────────────────
+version: 2
+updates:
+  # ── GitHub Actions (pinned-by-major; Dependabot proposes safe bumps) ─────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "kind/refactor"
+      - "area/docs"
+    reviewers:
+      - "yashsharmaa"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── Python (pyproject.toml + optional extras) ────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "kind/refactor"
+    reviewers:
+      - "yashsharmaa"
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── npm (three.js Decision Studio front-end) ────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/apps/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(web)"
+    labels:
+      - "kind/refactor"
+      - "area/frontend"
+    reviewers:
+      - "yashsharmaa"
+    groups:
+      web-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

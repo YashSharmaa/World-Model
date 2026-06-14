@@ -1,0 +1,129 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# steady_pod — the canonical "normal operations" baseline.
+#
+# A calm 2-rack demo pod under a steady arrival regime with a mixed gang queue
+# (1-GPU inference, 4-GPU fine-tune, 8/16-GPU training). No rare-event injection:
+# this is the reference branch every stress / rare-event pack perturbs against,
+# and the default golden-path demo state (doc D normal slice; doc G storyboard).
+
+scenario_id: steady_pod
+scenario_family: normal
+seed: 1001
+base_ts: 0.0
+tick: 0
+
+context:
+  regime: normal
+  ambient_temp_c: 22.0
+  arrival_burst_regime: steady
+  workload_mix_regime: mixed
+
+# 2-rack demo pod: 2 racks x 4 nodes x 8 GPUs = 64 GPUs (within G_max=256).
+pod:
+  block_id: block-0
+  flavor: gpu-h100
+  gpus_per_node: 8
+  gpu_memory_mb: 81920
+  node_cpu: 128.0
+  node_mem_gb: 2048.0
+  interconnect_class: nvlink
+  racks:
+    - id: rack-a
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-a
+      cooling_zone: zone-row-0
+      switch: tor-a
+      power_cap_kw: 120.0
+      cooling_cap_kw: 150.0
+      inlet_temp_c: 24.0
+      thermal_margin_c: 12.0
+    - id: rack-b
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-b
+      cooling_zone: zone-row-0      # shared cooling row with rack-a
+      switch: tor-b
+      power_cap_kw: 120.0
+      cooling_cap_kw: 150.0
+      inlet_temp_c: 24.0
+      thermal_margin_c: 12.0
+
+flavors:
+  - name: gpu-h100
+    topology: block-0
+    node_labels:
+      accelerator: h100
+
+cluster_queues:
+  - name: cq-research
+    fairshare_weight: 1.0
+    preemption_policy: never
+    flavor_order: [gpu-h100]
+    nominal_quota:
+      gpu-h100:
+        nvidia.com/gpu: 48.0
+
+local_queues:
+  - name: lq-team-vision
+    namespace: vision
+    cluster_queue: cq-research
+    tenant_id: tenant-vision
+  - name: lq-team-nlp
+    namespace: nlp
+    cluster_queue: cq-research
+    tenant_id: tenant-nlp
+
+# Mixed gang queue — the demo's pending decision set.
+jobs:
+  - uid: wl-infer-001
+    local_queue: lq-team-vision
+    priority: 10
+    gpus: 1
+    replicas: 1
+    comm_class: none
+    topology_policy: unconstrained
+    max_exec_s: 1800.0
+    labels: {class: inference}
+  - uid: wl-finetune-004
+    local_queue: lq-team-nlp
+    priority: 20
+    gpus: 4
+    replicas: 1
+    comm_class: light
+    topology_policy: preferred
+    max_exec_s: 5400.0
+    labels: {class: fine_tune}
+  - uid: wl-train-008
+    local_queue: lq-team-vision
+    priority: 30
+    gpus: 8
+    replicas: 1
+    comm_class: allreduce_heavy
+    topology_policy: required
+    max_exec_s: 14400.0
+    labels: {class: training}
+  - uid: wl-train-016
+    local_queue: lq-team-nlp
+    priority: 40
+    submit_offset_s: 60.0
+    gpus: 16
+    replicas: 2
+    comm_class: allreduce_heavy
+    topology_policy: required
+    max_exec_s: 21600.0
+    labels: {class: training}
+
+operator_policy:
+  policy_id: default
+  allowed_actions: [hold, admit, place, admit_and_place]
+  protected_domains: []
+  risk_thresholds:
+    max_hotspot_prob: 0.10
+    max_headroom_violation_prob: 0.05

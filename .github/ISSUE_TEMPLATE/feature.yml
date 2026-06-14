@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — feature request (issue FORM, not free text)
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Feature intake that keeps proposals inside the v0.1 scope guardrails: the
+#  spine (exact symbolic kernel owns hard feasibility; learned residual owns
+#  uncertain dynamics; safety is a gate, not a weighted metric) must be
+#  preserved.
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Feature request"
+description: "Propose a new capability or enhancement."
+title: "[feature]: "
+labels: ["kind/feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please keep proposals aligned with the **spine**:
+        the exact symbolic kernel owns hard feasibility (quota, gang atomicity,
+        topology, health, operator policy); the learned residual owns uncertain
+        dynamics with calibrated uncertainty; and **safety is a gate, not a
+        weighted metric** — the model only ranks/forecasts/abstains over the
+        kernel-certified safe set.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues / the ROADMAP and this is not already tracked.
+          required: true
+        - label: This does not move hard-feasibility logic into the learned model.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Target area
+      options:
+        - "area/schema"
+        - "area/ingest"
+        - "area/data-engine"
+        - "area/simulator (exact kernel)"
+        - "area/model (learned residual / MLX)"
+        - "area/planner"
+        - "area/backend (serving)"
+        - "area/frontend (apps/web)"
+        - "area/eval (benchmarks)"
+        - "area/uncertainty"
+        - "area/reliability"
+        - "area/fairness"
+        - "area/docs"
+        - "cross-cutting"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What gap or pain does this address? Who benefits?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Sketch the change. Note any new schema/contract, action, or API surface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope fit
+      description: v0.1 is narrow — counterfactual admission control + topology-aware placement advice for a 2-4 rack pod, offline/shadow only.
+      options:
+        - "Fits v0.1 scope"
+        - "Post-v0.1 (next)"
+        - "Future / aspirational (later)"
+    validations:
+      required: true

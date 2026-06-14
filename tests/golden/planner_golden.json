@@ -1,0 +1,87 @@
+{
+  "_attribution": {
+    "author": "Yash Sharma",
+    "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+    "license": "Apache-2.0"
+  },
+  "abstain": false,
+  "abstain_reason": null,
+  "baseline_action_id": "hold:c0ad90776936",
+  "candidates": [
+    {
+      "action_id": "admit_and_place:0fe557d1b8be",
+      "lex_key": [
+        0.0,
+        0.0,
+        98.4,
+        -2.0,
+        0.0,
+        0.0
+      ],
+      "rank": 0,
+      "type": "admit_and_place"
+    },
+    {
+      "action_id": "admit_and_place:3d5e642c848b",
+      "lex_key": [
+        0.0,
+        0.0,
+        98.4,
+        -2.0,
+        0.0,
+        0.0
+      ],
+      "rank": 1,
+      "type": "admit_and_place"
+    },
+    {
+      "action_id": "admit_and_place:228823f39597",
+      "lex_key": [
+        0.0,
+        0.0,
+        98.4,
+        -2.0,
+        0.0,
+        0.0
+      ],
+      "rank": 2,
+      "type": "admit_and_place"
+    },
+    {
+      "action_id": "admit_and_place:8707bf11cc3d",
+      "lex_key": [
+        0.0,
+        0.0,
+        98.4,
+        -2.0,
+        0.0,
+        0.0
+      ],
+      "rank": 3,
+      "type": "admit_and_place"
+    },
+    {
+      "action_id": "hold:c0ad90776936",
+      "lex_key": [
+        0.0,
+        0.0,
+        98.4,
+        -0.0,
+        0.0,
+        0.0
+      ],
+      "rank": 4,
+      "type": "hold"
+    }
+  ],
+  "recommended_action_id": "admit_and_place:0fe557d1b8be",
+  "scenario": {
+    "gang_gpu": 4,
+    "gpus_per_node": 4,
+    "horizon_s": 1800,
+    "n_racks": 2,
+    "nodes_per_rack": 2,
+    "seed": 7
+  },
+  "state_hash": "8094553c11537d42d7895e5facefa6132c445fbc766a384b3568b50214a266c1"
+}

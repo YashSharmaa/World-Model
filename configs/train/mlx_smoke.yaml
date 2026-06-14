@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# mlx_smoke.yaml — a tiny end-to-end smoke config (examples/03_train_mlx_smoke).
+#
+# Purpose is *pipeline validation*, not accuracy: it exercises ETL -> tensorize
+# -> compiled MLX step -> metrics on the single smallest bucket, in a couple of
+# minutes on a laptop, and degrades to the NumPy reference backend if MLX is not
+# installed (doc E stage-zero smoke test). It inherits the baseline recipe and
+# overrides only what must shrink so CI on plain Linux stays green.
+
+author: Yash Sharma
+author_url: https://www.linkedin.com/in/yashsharmaa/
+license: Apache-2.0
+
+config_id: train_mlx_smoke
+schema_version: "1.0.0"
+stage: smoke
+inherits: train/baseline.yaml    # advisory; loaders may merge or ignore
+
+seed: 7
+deterministic: true
+
+# Use the single smallest compile bucket only — fast, one compilation.
+latent_dims:
+  use_schema_defaults: true
+buckets:
+  use_schema_defaults: false
+  shapes:
+    - {name: small, J_max: 16, N_max: 8, G_max: 64, R_max: 1, S_max: 2, D_max: 4}
+
+temporal:
+  t_fast: 8                      # shortened lanes keep activations tiny
+  t_slow: 4
+  message_passing_rounds: 2
+
+# Single near-horizon + median-only quantile keeps the smoke graph minimal.
+horizons_s: [300, 900]
+quantiles: [0.10, 0.50, 0.90]
+kpi_channels: [queue_wait_delta_s, rack_thermal_headroom_c]
+hazard_channels: [hotspot, pods_ready_timeout]
+
+loss_mixture:
+  one_step_residual: 1.0
+  multi_step_rollout: 1.0
+  quantile_pinball: 1.0
+  hazard_survival: 1.0
+teacher_forcing:
+  schedule: constant
+  start_ratio: 0.5
+  end_ratio: 0.5
+
+data_mixture:
+  phase: zero                    # supervised baselines + tensor-pipeline smoke
+  origins:
+    real: 0.0
+    sim_observational: 1.0
+    sim_counterfactual: 0.0
+  scenario_family_weights:
+    normal: 1.0
+  counterfactual_actions_per_window: 3
+  # Drive the smoke run straight off the tiny demo pack.
+  source: sample_data/tiny_demo_pack
+
+optim:
+  optimizer: adamw
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  micro_batch_size: 4
+  grad_accum_steps: 1
+  epochs: 2                      # just enough to prove the loop runs
+  warmup_steps: 10
+  lr_schedule: constant
+  precision: fp32                # fp32 everywhere for a deterministic smoke
+
+ema:
+  enabled: false                 # not needed for a smoke run
+
+uncertainty:
+  ensemble_size: 1               # single model; no calibration in smoke
+  conformal: none
+
+runtime:
+  backend: auto                  # mlx if importable, else numpy reference
+  memory_limit_gb: 8
+  clear_cache_at_phase_boundary: true
+  log_peak_memory_each_epoch: true
+  max_train_seconds: 180         # hard wall so CI never hangs
+
+checkpoint:
+  dir: runs/mlx_smoke
+  save_every_epochs: 1
+  keep_last: 1
+  write_feature_stats: true
+  write_calibration: false
+  write_schema_hash: true
+
+# Lightweight assertions the example checks after the run (pipeline health).
+smoke_assertions:
+  expect_finite_loss: true
+  expect_no_compile_churn: true  # one compilation per bucket only
+  expect_runtime_under_s: 180

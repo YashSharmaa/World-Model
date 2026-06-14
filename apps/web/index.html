@@ -1,0 +1,146 @@
+<!doctype html>
+<!--
+  ─────────────────────────────────────────────────────────────────────────────
+   GPU-Center World Model — three.js Decision Studio
+   Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+   License: Apache-2.0
+  ─────────────────────────────────────────────────────────────────────────────
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="Decision Studio — a semantic, self-captioning three.js read-model over the GPU-Center World Model. Same state, different action, different future."
+    />
+    <meta name="author" content="Yash Sharma" />
+    <link rel="icon" href="./public/favicon.svg" type="image/svg+xml" />
+    <title>GPU-Center World Model · Decision Studio</title>
+    <style>
+      /* Base shell. Heavy UI lives in HTML overlay panels (doc G): CSS2DRenderer
+         only supports translation and breaks off-100%-zoom, so the explanation
+         layer is regular DOM, not in the scene graph. */
+      /* ── Professional LIGHT theme (default) ──────────────────────────────
+         Operator-dashboard grade: soft neutral canvas, frosted-white surfaces,
+         hairline borders, soft elevation, slate text, a single restrained blue
+         accent, semantic status colours tuned for AA contrast on light. */
+      :root {
+        --bg: #eef2f8;
+        --panel: rgba(255, 255, 255, 0.82);
+        --panel-solid: #ffffff;
+        --panel-strong: rgba(255, 255, 255, 0.94);
+        --surface-2: #f3f6fb;
+        --stroke: rgba(15, 23, 42, 0.1);
+        --text: #1f2733;
+        --muted: #5b6676;
+        --grounded: #2f6fed;
+        --predicted: #8b5cf6;
+        --alt: #c2790a;
+        --blocked: #e5484d;
+        --safe: #1a9c63;
+        --lowconf: #8a93a6;
+        --accent: #2f6fed;
+        --accent-soft: rgba(47, 111, 237, 0.12);
+        --chip-bg: rgba(15, 23, 42, 0.05);
+        --rail: rgba(15, 23, 42, 0.12);
+        --safe-bg: rgba(26, 156, 99, 0.14);
+        --blocked-bg: rgba(229, 72, 77, 0.12);
+        --alt-bg: rgba(194, 121, 10, 0.14);
+        --radius: 12px;
+        --shadow: 0 6px 24px rgba(15, 23, 42, 0.1),
+          0 1px 2px rgba(15, 23, 42, 0.06);
+        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      }
+
+      /* ── Dark theme (opt-in via the ☀/☾ toggle) ──────────────────────────── */
+      :root[data-theme="dark"] {
+        --bg: #0a0e16;
+        --panel: rgba(17, 23, 35, 0.86);
+        --panel-solid: #111723;
+        --panel-strong: rgba(10, 14, 22, 0.72);
+        --surface-2: rgba(20, 28, 42, 0.6);
+        --stroke: rgba(120, 150, 200, 0.22);
+        --text: #e8eef7;
+        --muted: #9fb0c8;
+        --grounded: #58c4ff;
+        --predicted: #c9a4ff;
+        --alt: #ffcf6b;
+        --blocked: #ff6b7a;
+        --safe: #5fe3a1;
+        --lowconf: #8a93a6;
+        --accent: #58c4ff;
+        --accent-soft: rgba(88, 196, 255, 0.18);
+        --chip-bg: rgba(120, 150, 200, 0.14);
+        --rail: rgba(120, 150, 200, 0.25);
+        --safe-bg: rgba(95, 227, 161, 0.18);
+        --blocked-bg: rgba(255, 107, 122, 0.18);
+        --alt-bg: rgba(255, 207, 107, 0.18);
+        --shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        -webkit-font-smoothing: antialiased;
+      }
+      #app-root {
+        position: fixed;
+        inset: 0;
+      }
+      #webgl-canvas {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      #dom-overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        z-index: 10;
+      }
+      #dom-overlay > * {
+        pointer-events: auto;
+      }
+      .noscript {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        font-size: 1.1rem;
+        color: var(--muted);
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app-root">
+      <canvas id="webgl-canvas"></canvas>
+      <div id="dom-overlay"></div>
+    </div>
+    <noscript>
+      <div class="noscript">
+        This Decision Studio needs JavaScript. Built by Yash Sharma —
+        linkedin.com/in/yashsharmaa
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

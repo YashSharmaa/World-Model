@@ -1,0 +1,136 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0 (docs content: CC-BY-4.0)
+# ─────────────────────────────────────────────────────────────────────────────
+site_name: GPU-Center World Model
+site_description: >-
+  An open-source, intervention-faithful world model for GPU datacenter
+  operations — built and maintained by Yash Sharma.
+site_author: Yash Sharma
+site_url: https://yashsharmaa.github.io/gpu-center-world-model/
+copyright: >-
+  Copyright &copy; Yash Sharma — code Apache-2.0, docs CC-BY-4.0.
+  Built by <a href="https://www.linkedin.com/in/yashsharmaa/">Yash Sharma</a>.
+
+repo_name: yashsharmaa/gpu-center-world-model
+repo_url: https://github.com/yashsharmaa/gpu-center-world-model
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.action.edit
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra:
+  author:
+    name: Yash Sharma
+    url: https://www.linkedin.com/in/yashsharmaa/
+  social:
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/in/yashsharmaa/
+      name: Yash Sharma on LinkedIn
+    - icon: fontawesome/brands/github
+      link: https://github.com/yashsharmaa
+      name: Yash Sharma on GitHub
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Install: getting-started/install.md
+      - Quickstart: getting-started/quickstart.md
+      - Demo (Decision Studio): getting-started/demo.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Modules & boundaries: architecture/modules.md
+      - Exact kernel vs learned residual: architecture/exact-kernel-vs-learned.md
+      - Data & control flow: architecture/data-flow.md
+      - Decision records:
+          - ADR-0001 Hybrid exact + residual: adr/0001-hybrid-exact-plus-residual.md
+          - ADR-0002 Safety as a gate: adr/0002-safety-as-a-gate.md
+          - ADR-0003 MLX + typed MPNN: adr/0003-mlx-and-typed-mpnn.md
+          - ADR-0004 Shadow-mode only (v1): adr/0004-shadow-mode-only-v1.md
+  - Schema contract:
+      - Overview: schema/overview.md
+      - Entities & relations: schema/entities.md
+      - Actions: schema/actions.md
+      - State & hashing: schema/state.md
+  - Serving API:
+      - REST: api/rest.md
+      - SSE stream: api/sse.md
+  - Benchmark:
+      - Philosophy: benchmark/philosophy.md
+      - Three tracks: benchmark/tracks.md
+      - Acceptance thresholds: benchmark/acceptance.md
+  - Cards:
+      - Model card: cards/model_card.md
+      - Data card: cards/data_card.md
+  - Theory foundations:
+      - Causal foundations: theory/causal-foundations.md
+      - Learning objective: theory/learning-objective.md
+      - Queueing & control dynamics: theory/queueing-dynamics.md
+      - Uncertainty & conformal: theory/uncertainty-conformal.md
+      - Constrained planning: theory/constrained-planning.md
+      - Physical surrogate: theory/physical-surrogate.md
+      - Generalization & sim2real: theory/generalization-sim2real.md
+      - Representation & information: theory/representation-information.md
+      - Relational architecture: theory/relational-architecture.md
+      - Synthetic fidelity: theory/synthetic-fidelity.md
+      - Exact-kernel shield: theory/exact-kernel-shield.md
+      - Bayesian filtering: theory/bayesian-filtering.md
+      - Reliability & changepoint: theory/reliability-changepoint.md
+      - Fairness & mechanism design: theory/fairness-mechanism.md

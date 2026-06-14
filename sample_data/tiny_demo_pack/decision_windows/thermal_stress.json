@@ -1,0 +1,21 @@
+{
+  "candidate_action_ids": [
+    "0:hold:wl-demo-0:",
+    "1:admit_and_place:wl-demo-0:dom-rack-0",
+    "2:admit_and_place:wl-demo-0:dom-rack-1",
+    "3:place:wl-demo-0:dom-rack-0,dom-rack-1"
+  ],
+  "counterfactual_pack_uri": "",
+  "decision_id": "eb6fd165b9224b3b245978b25bb74ddaed8c00b15ab6ccb1bb7482337128691d",
+  "generator_commit": "tiny-demo-pack@0.1.0.dev0",
+  "label_pack_id": "eb6fd165b9224b3b245978b25bb74ddaed8c00b15ab6ccb1bb7482337128691d:labels",
+  "observational_context_uri": "",
+  "provenance_uri": "provenance/manifest.json",
+  "realized_horizon_uri": "",
+  "scenario_family": "stress",
+  "seed_bundle": 2001,
+  "source_mix": "sim_counterfactual",
+  "split": "val",
+  "state_hash": "eb6fd165b9224b3b245978b25bb74ddaed8c00b15ab6ccb1bb7482337128691d",
+  "t0_ns": 1000000000000
+}

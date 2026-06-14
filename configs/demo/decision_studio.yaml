@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# decision_studio.yaml — the public 3-action / 30-60 min demo preset (doc G).
+#
+# Drives the Decision Studio: one pod scene, a pending workload, three action
+# chips (hold, admit into domain A, admit into domain B), compared over a 30-60
+# minute horizon with up to three ghost branches under one shared time cursor.
+# The branch count and rollout shapes are FIXED so the compiled MLX scorer never
+# recompiles mid-presentation (doc G shape contract; doc F live-demo gate).
+
+author: Yash Sharma
+author_url: https://www.linkedin.com/in/yashsharmaa/
+license: Apache-2.0
+
+config_id: demo_decision_studio
+schema_version: "1.0.0"
+api_version: v1
+
+# ── Scenario the demo opens on (the steady-pod golden path; doc G storyboard) ─
+scenario: scenarios/normal/steady_pod.yaml
+focus_workload: wl-train-016      # the headline pending 16-GPU training gang
+seed: 1001                        # match steady_pod so the state hash is stable
+
+# ── Action set — exactly three, fixed for recordability (doc G) ───────────────
+# "same current state, different action, different future".
+actions:
+  count: 3                        # FIXED: compare up to three branches only
+  candidates:
+    - id: hold
+      type: hold
+      label: "Hold"
+      caption: "Wait one window"
+    - id: admit_a
+      type: admit_and_place
+      label: "Admit -> Rack A"
+      domain_policy: required
+      domain_id_or_set: [rack-a]
+      caption: "Admit into domain A"
+    - id: admit_b
+      type: admit_and_place
+      label: "Admit -> Rack B"
+      domain_policy: required
+      domain_id_or_set: [rack-b]
+      caption: "Admit into domain B"
+  declared_baseline: hold         # KPI deltas are relative to hold (schema.kpis)
+
+# ── Horizons — the 30/60 min decision view plus a fast probe (doc C/F) ────────
+horizons_s: [300, 1800, 3600]     # 5 min probe + 30 / 60 min decision horizons
+default_horizon_s: 1800
+timeline:
+  scrub_min_s: 0
+  scrub_max_s: 3600               # 0-60 min cursor
+  freeze_on_recommendation: true
+  max_pinned_branches: 3
+
+# ── Headline branch-delta ribbon (doc G self-captioning strip) ────────────────
+delta_ribbon:
+  channels:
+    - queue_wait_delta_s
+    - admitted_gpu_hours_delta
+    - topology_fragmentation_delta
+    - rack_thermal_headroom_c
+  show_uncertainty_band: true     # quantile band, not a bare point
+  band_quantiles: [0.10, 0.90]
+
+# ── Hazards surfaced as probabilistic halos / badges (doc G visual language) ──
+hazards:
+  channels: [hotspot, pods_ready_timeout, headroom_violation]
+  show_conformal_upper: true      # one-sided bound drives the badge colour
+
+# ── Safety / abstention presentation (hard states vs learned risk; doc G) ─────
+shield:
+  show_exact_blockers: true       # locks, masks, stop-lines, blocker chips
+  why_not_card: true              # compact "why not this rack / why not admit"
+  learned_risk_as_halo: true      # learned risk is a halo, not a hard state
+abstention:
+  show_when_abstained: true
+  fallback: conservative_rule     # schema.policy.AbstentionConfig default
+
+# ── Operator policy for the demo (whitelist matches the 4-action alphabet) ────
+operator_policy:
+  policy_id: demo
+  allowed_actions: [hold, admit, place, admit_and_place]
+  protected_domains: []
+
+# ── Live-demo performance gate (doc F §35; must hold on Apple silicon) ─────────
+performance:
+  p95_score_actions_s_max: 2.0    # scripted 3-action target
+  p95_enumerated_set_s_max: 5.0   # larger enumerated candidate set
+  precompile_before_interaction: true   # compile the scorer ahead of the demo
+  no_compile_churn: true
+  peak_mlx_memory_gb_max: 8
+
+# ── Backend semantic-snapshot contract the frontend renders (doc G) ───────────
+serving:
+  backend: mlx                    # numpy reference fallback if mlx absent
+  emit_geometry: false            # backend sends semantic diffs, not frames
+  snapshot_fields:
+    - state_hash
+    - generated_at
+    - model_version
+    - policy_version
+    - horizon_options_s
+    - entities                    # racks/nodes/gpus/workloads/queues/domains
+    - relations
+    - current_kpis
+    - freshness
+  rollout_trace: compact          # compact rollout points, not a frame stream
+
+# ── Captioning (LinkedIn autoplay-muted; doc G distribution constraint) ───────
+captions:
+  always_on: true
+  max_words_per_beat: 8
+  persistent_legend: [now, predicted, alternative]

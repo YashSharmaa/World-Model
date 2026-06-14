@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — bug report (issue FORM, not free text)
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Structured intake so reports arrive with a reproduction and, where possible,
+#  the pre-action state hash + seed bundle that make a branch replay
+#  deterministic (design doc H: "Require repro artifacts or state hashes ...").
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Bug report"
+description: "Report incorrect behavior in the kernel, model, planner, serving, data engine, or web app."
+title: "[bug]: "
+labels: ["kind/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. v0.1 is **offline-replay / shadow-mode only**.
+        Please include enough to reproduce — ideally the **pre-action state hash**
+        and **seed bundle**, since the exact symbolic kernel replays branches
+        deterministically from those.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am on the latest `main` (or a tagged release I will name below).
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Which package surfaced the bug?
+      options:
+        - "area/schema"
+        - "area/ingest"
+        - "area/data-engine"
+        - "area/simulator (exact kernel)"
+        - "area/model (learned residual / MLX)"
+        - "area/planner"
+        - "area/backend (serving)"
+        - "area/frontend (apps/web)"
+        - "area/eval (benchmarks)"
+        - "area/uncertainty"
+        - "area/reliability"
+        - "area/fairness"
+        - "area/docs"
+        - "other / not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you observe vs. expect?
+      placeholder: "The planner returned `admit_and_place` for a candidate the kernel should have blocked on quota ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal, deterministic recipe. Paste the exact command(s).
+      placeholder: |
+        1. python examples/01_build_tiny_pack.py
+        2. gcwm replay --scenario scenarios/normal/...
+        3. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: state-hash
+    attributes:
+      label: Pre-action state hash (if applicable)
+      description: From the replay trace or DTO. Enables a deterministic branch replay.
+      placeholder: "sha256:..."
+    validations:
+      required: false
+
+  - type: input
+    id: seed-bundle
+    attributes:
+      label: Seed bundle (if applicable)
+      description: The RNG seed bundle used for the branch / scenario.
+      placeholder: "seed=1234 / bundle id ..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / traceback / blocker set
+      description: Paste the traceback, the exact blocker set, or the symbolic event trace.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS + arch, Python version, install method, optional extras present (mlx/serve/data).
+      placeholder: |
+        - OS/arch: macOS 15 (arm64) / Ubuntu 24.04 (x86_64)
+        - Python: 3.12.x
+        - Install: pip install -e ".[dev,serve,data]"
+        - Extras present: mlx? serve? data?
+      render: yaml
+    validations:
+      required: true

@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — citation metadata (rendered by GitHub, consumed by
+#  Zenodo for DOI-backed archival).
+#
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+# ─────────────────────────────────────────────────────────────────────────────
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "GPU-Center World Model"
+abstract: >-
+  An open-source, intervention-faithful world model for GPU datacenter
+  operations. The first proof-of-concept is a counterfactual admission-control
+  and topology-aware rack-placement advisor that pairs an exact symbolic
+  feasibility kernel with a learned residual world model under calibrated
+  uncertainty. Safety is enforced as a gate, not a weighted metric.
+type: software
+authors:
+  - family-names: Sharma
+    given-names: Yash
+    website: "https://www.linkedin.com/in/yashsharmaa/"
+license: Apache-2.0
+repository-code: "https://github.com/yashsharmaa/gpu-center-world-model"
+version: 0.1.0
+keywords:
+  - world model
+  - digital twin
+  - GPU datacenter
+  - counterfactual reasoning
+  - admission control
+  - topology-aware scheduling
+  - Apple MLX
+  - conformal prediction

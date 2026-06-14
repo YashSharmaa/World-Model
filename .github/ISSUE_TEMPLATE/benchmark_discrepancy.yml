@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — benchmark discrepancy (issue FORM, not free text)
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Evaluation is the source of truth for public technical claims, so reported
+#  numbers must be reproducible. This form captures the manifest, seeds, and
+#  exact metric values needed to triage a mismatch (design doc H: "Evaluation
+#  is the source of truth ...").
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Benchmark discrepancy"
+description: "Report a reported metric you cannot reproduce, or a suspected scoring error."
+title: "[benchmark]: "
+labels: ["kind/bug", "area/eval"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Evaluation is the **source of truth** for our public claims, so every
+        number must be reproducible. Please give us the manifest, seeds, and the
+        exact observed-vs-expected values so we can replay your run.
+
+  - type: dropdown
+    id: track
+    attributes:
+      label: Benchmark track
+      options:
+        - "semantics"
+        - "counterfactual_rollout"
+        - "safe_action_selection"
+        - "calibration"
+        - "red-team / rare events"
+        - "other"
+    validations:
+      required: true
+
+  - type: input
+    id: manifest
+    attributes:
+      label: Benchmark pack / manifest
+      description: Pack name + release tag, or the manifest path.
+      placeholder: "tiny_demo_pack @ v0.1.0 (sample_data/tiny_demo_pack)"
+    validations:
+      required: true
+
+  - type: input
+    id: schema-hash
+    attributes:
+      label: Schema hash
+      description: From the release artifact / report header.
+      placeholder: "sha256:..."
+    validations:
+      required: false
+
+  - type: input
+    id: seeds
+    attributes:
+      label: RNG seed(s) / seed registry id
+      placeholder: "seed=1234"
+    validations:
+      required: true
+
+  - type: input
+    id: model-version
+    attributes:
+      label: Model / calibration bundle version
+      description: If the discrepancy involves a learned model or baseline.
+      placeholder: "model v0.1.0 / calib v0.1.0 / baseline=empirical-table"
+    validations:
+      required: false
+
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Reported vs. observed
+      description: Metric name, the published value, and the value you reproduced.
+      placeholder: |
+        Metric: top-1 safe-action accuracy (slice = stress/topology=fat-tree)
+        Reported: 0.91
+        Observed:  0.84
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command used
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "OS/arch, Python, extras present (mlx/serve/data/baselines), commit/tag"
+      render: yaml
+    validations:
+      required: true

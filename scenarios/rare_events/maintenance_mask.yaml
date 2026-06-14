@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# maintenance_mask — operator drain removing a rack/domain (doc D rare event).
+#
+# An operator drains one rack domain for maintenance, removing it from
+# eligibility, and the same workload arrivals are replayed under the alternative
+# actions. This is the rare event most aligned with the v1 admission-and-place
+# advisor: the safe candidate set shrinks, the kernel emits a protected-domain
+# blocker, and the planner must place into the remaining domain or hold. The mask
+# is recorded both as a manual drain (context) and as nodes drained at t0.
+
+scenario_id: maintenance_mask
+scenario_family: rare_events
+seed: 3006
+base_ts: 0.0
+tick: 0
+
+context:
+  regime: maintenance
+  ambient_temp_c: 23.0
+  arrival_burst_regime: steady
+  workload_mix_regime: mixed
+
+pod:
+  block_id: block-0
+  flavor: gpu-h100
+  gpus_per_node: 8
+  racks:
+    - id: rack-a
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-a
+      cooling_zone: zone-row-0
+      switch: tor-a
+    - id: rack-b
+      nodes: 4
+      gpus_per_node: 8
+      power_domain: pdu-b
+      cooling_zone: zone-row-0
+      switch: tor-b
+
+flavors:
+  - name: gpu-h100
+    topology: block-0
+
+cluster_queues:
+  - name: cq-research
+    flavor_order: [gpu-h100]
+    nominal_quota:
+      gpu-h100:
+        nvidia.com/gpu: 48.0
+
+local_queues:
+  - name: lq-team
+    namespace: team
+    cluster_queue: cq-research
+    tenant_id: tenant-team
+
+jobs:
+  - uid: wl-train-016
+    local_queue: lq-team
+    priority: 40
+    gpus: 16
+    replicas: 2
+    comm_class: allreduce_heavy
+    topology_policy: required        # can no longer fit if a rack is drained
+    max_exec_s: 21600.0
+    labels: {class: training}
+  - uid: wl-finetune-004
+    local_queue: lq-team
+    priority: 20
+    gpus: 4
+    replicas: 1
+    comm_class: light
+    topology_policy: preferred
+    max_exec_s: 5400.0
+    labels: {class: fine_tune}
+  - uid: wl-infer-001
+    local_queue: lq-team
+    priority: 10
+    gpus: 1
+    replicas: 1
+    topology_policy: unconstrained
+    max_exec_s: 1800.0
+    labels: {class: inference}
+
+# Drain rack-b for maintenance; only rack-a remains eligible at t0.
+rare_event:
+  kind: maintenance_mask
+  severity: 1.0
+  onset_s: 0.0
+  targets:
+    - rack-b
+
+operator_policy:
+  policy_id: maintenance
+  allowed_actions: [hold, admit, place, admit_and_place]
+  # The drained rack is also a protected domain so the kernel forbids placement.
+  protected_domains:
+    - rack-b
+  risk_thresholds:
+    max_requeue_prob: 0.10

@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — supply-chain security
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Two best-effort tracks per design doc H ("Supply-chain checks"):
+#    * OpenSSF Scorecard — automated OSS security-risk checks, uploaded to the
+#      code-scanning dashboard. Best-effort: it needs repo settings that may not
+#      be live on a fork, so it never blocks the merge gate.
+#    * pip-audit — scans the resolved dependency closure for known CVEs.
+#
+#  Both jobs are continue-on-error so a transient advisory-feed hiccup cannot
+#  break contributor PRs. Actions are pinned by major version.
+# ─────────────────────────────────────────────────────────────────────────────
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday sweep so newly disclosed CVEs surface without a push.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scorecard:
+    name: OpenSSF Scorecard
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+          publish_results: false
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-sarif
+          path: scorecard-results.sarif
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard-results.sarif
+
+  pip-audit:
+    name: pip-audit (dependency CVEs)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[serve,data]"
+          python -m pip install pip-audit
+
+      # Audit the installed environment (the package plus its resolved deps).
+      - name: Audit dependency closure
+        run: pip-audit --strict --progress-spinner off

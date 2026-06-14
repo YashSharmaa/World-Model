@@ -1,0 +1,122 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — continuous integration
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Two-platform matrix per design doc H ("CI runner matrix"):
+#    * pinned ubuntu-24.04 — the authoritative gate: ruff lint, pyright
+#      typecheck, the pytest core suite, and a wheel build. The exact kernel,
+#      data engine, planner, and evaluation all run here without MLX, so this
+#      lane must always be green.
+#    * pinned macos-15 (arm64) — MLX smoke + local-demo parity. MLX is an
+#      optional, Apple-silicon-only path, so this lane is best-effort
+#      (continue-on-error) and never blocks the merge gate.
+#
+#  We avoid `macos-latest` deliberately: GitHub is migrating that label to
+#  macos-26 starting 2026-06-15, so a pinned label keeps CI reproducible.
+#  Actions are pinned by major version.
+# ─────────────────────────────────────────────────────────────────────────────
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Linux: authoritative lint / typecheck / test / build gate.
+  # ───────────────────────────────────────────────────────────────────────────
+  linux:
+    name: linux (ubuntu-24.04, py${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Upgrade build tooling
+        run: python -m pip install --upgrade pip
+
+      # serve + data extras keep FastAPI / pyarrow / polars importable so the
+      # serving and data-engine tests do not skip. MLX is intentionally absent
+      # on Linux; the source tree guards every MLX import.
+      - name: Install package (dev, serve, data)
+        run: python -m pip install -e ".[dev,serve,data]"
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Format check (ruff)
+        run: ruff format --check src tests
+
+      - name: Typecheck (pyright)
+        run: pyright
+
+      - name: Test (pytest core, no MLX/slow)
+        run: pytest -ra -q -m "not mlx and not slow" --cov=gpu_center_world_model --cov-report=xml
+
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Upload distribution artifacts
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-py312
+          path: dist/*
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # macOS arm64: MLX smoke + local-demo parity. Best-effort only.
+  # ───────────────────────────────────────────────────────────────────────────
+  macos-mlx:
+    name: macos (macos-15, MLX smoke)
+    runs-on: macos-15
+    # The public promise is a local Apple-silicon reference path, but MLX
+    # availability on hosted runners can drift; never block the merge gate.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Upgrade build tooling
+        run: python -m pip install --upgrade pip
+
+      # Include the mlx extra here — it is gated to Darwin in pyproject and is
+      # the whole point of this lane.
+      - name: Install package (dev, serve, data, mlx)
+        run: python -m pip install -e ".[dev,serve,data,mlx]"
+
+      - name: MLX smoke (one tiny train + inference step)
+        run: pytest -ra -q -m "mlx"
+
+      - name: Local-demo parity (deterministic safe-set replay)
+        run: pytest -ra -q -m "not slow" tests/golden tests/integration

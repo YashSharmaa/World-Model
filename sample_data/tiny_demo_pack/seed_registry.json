@@ -1,0 +1,6 @@
+{
+  "gpu_fault_burst": 3001,
+  "scheduling_stress": 2002,
+  "steady_pod": 1001,
+  "thermal_stress": 2001
+}

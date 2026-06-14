@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpu-center-world-model"
+dynamic = ["version"]
+description = "An open-source, intervention-faithful world model for GPU datacenter operations."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Yash Sharma", email = "yash.sharma.contact@gmail.com" }]
+maintainers = [{ name = "Yash Sharma" }]
+keywords = [
+  "world-model", "digital-twin", "gpu", "datacenter", "scheduling",
+  "kueue", "counterfactual", "mlx", "apple-silicon", "planning",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Distributed Computing",
+]
+
+# Core runtime stays dependency-light and backend-neutral. MLX is an optional
+# extra so the data engine, exact kernel, planner, and evaluation run anywhere
+# (Linux CI included) while the learned reference path targets Apple silicon.
+dependencies = [
+  "numpy>=1.26",
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.31; platform_system == 'Darwin'"]
+serve = ["fastapi>=0.111", "uvicorn[standard]>=0.30", "sse-starlette>=2.1"]
+data = ["pyarrow>=16", "polars>=1.0"]
+baselines = ["scikit-learn>=1.5", "lightgbm>=4.3"]
+dev = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "hypothesis>=6.100",
+  "ruff>=0.5",
+  "pyright>=1.1.370",
+  "mkdocs-material>=9.5",
+]
+all = [
+  "gpu-center-world-model[serve,data,baselines]",
+]
+
+[project.urls]
+Homepage = "https://github.com/yashsharmaa/gpu-center-world-model"
+Author = "https://www.linkedin.com/in/yashsharmaa/"
+Documentation = "https://github.com/yashsharmaa/gpu-center-world-model/tree/main/docs"
+Issues = "https://github.com/yashsharmaa/gpu-center-world-model/issues"
+
+[project.scripts]
+gcwm = "gpu_center_world_model.cli:main"
+
+[tool.hatch.version]
+path = "src/gpu_center_world_model/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpu_center_world_model"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "N802", "N803", "N806",  # math-style names (X_t, A_k, S_r) are intentional
+  "RUF002", "RUF003",       # Greek / unicode math notation (θ, λ, ·, —) in docs is intentional
+  "UP042",                  # `class X(str, Enum)` is intentional for JSON-serializable enums
+]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+markers = [
+  "mlx: tests that require the MLX backend (Apple silicon)",
+  "slow: long-running tests",
+]

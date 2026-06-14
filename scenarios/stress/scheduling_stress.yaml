@@ -1,0 +1,154 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# scheduling_stress — a fragmented, quota-contended pod.
+#
+# The fleet is fragmented by running jobs scattered across racks so no single
+# rack domain can host a required-locality gang, and quota is tight relative to
+# pending demand. This stresses gang atomicity, topology-domain feasibility, and
+# borrowing/lending arithmetic — the exact-kernel surfaces the planner must
+# respect (doc D scheduling-stress slice; doc C Kueue quota semantics).
+
+scenario_id: scheduling_stress
+scenario_family: stress
+seed: 2002
+base_ts: 0.0
+tick: 0
+
+context:
+  regime: normal
+  ambient_temp_c: 23.0
+  arrival_burst_regime: bursty
+  workload_mix_regime: mixed
+
+# 3-rack pod, smaller nodes, to make fragmentation bite (3 x 4 x 4 = 48 GPUs).
+pod:
+  block_id: block-0
+  flavor: gpu-a100
+  gpus_per_node: 4
+  gpu_memory_mb: 40960
+  node_cpu: 96.0
+  node_mem_gb: 1024.0
+  racks:
+    - id: rack-a
+      nodes: 4
+      gpus_per_node: 4
+      power_domain: pdu-a
+      cooling_zone: zone-row-0
+      switch: tor-a
+    - id: rack-b
+      nodes: 4
+      gpus_per_node: 4
+      power_domain: pdu-b
+      cooling_zone: zone-row-0
+      switch: tor-b
+    - id: rack-c
+      nodes: 4
+      gpus_per_node: 4
+      power_domain: pdu-c
+      cooling_zone: zone-row-1
+      switch: tor-c
+
+flavors:
+  - name: gpu-a100
+    topology: block-0
+
+cluster_queues:
+  - name: cq-shared
+    cohort: pod-cohort
+    fairshare_weight: 1.0
+    preemption_policy: never
+    flavor_order: [gpu-a100]
+    nominal_quota:
+      gpu-a100:
+        nvidia.com/gpu: 24.0       # tight: well under 48 installed GPUs
+    borrowing_limit:
+      gpu-a100:
+        nvidia.com/gpu: 8.0
+  - name: cq-priority
+    cohort: pod-cohort
+    fairshare_weight: 2.0
+    preemption_policy: never
+    flavor_order: [gpu-a100]
+    nominal_quota:
+      gpu-a100:
+        nvidia.com/gpu: 16.0
+
+local_queues:
+  - name: lq-shared
+    namespace: shared
+    cluster_queue: cq-shared
+    tenant_id: tenant-shared
+  - name: lq-priority
+    namespace: priority
+    cluster_queue: cq-priority
+    tenant_id: tenant-priority
+
+# Many small running jobs fragment every rack; pending gangs need locality.
+jobs:
+  # One small running job in every rack so no single rack can host a 16-GPU
+  # required-locality gang (each rack has 16 GPUs; a 2-GPU resident leaves 14).
+  - uid: wl-frag-a
+    local_queue: lq-shared
+    status: running
+    place_on: rack-a
+    priority: 5
+    gpus: 2
+    replicas: 1
+    est_remaining_s: 3600.0
+    labels: {class: inference}
+  - uid: wl-frag-b
+    local_queue: lq-shared
+    status: running
+    place_on: rack-b
+    priority: 5
+    gpus: 2
+    replicas: 1
+    est_remaining_s: 3600.0
+    labels: {class: inference}
+  - uid: wl-frag-c
+    local_queue: lq-shared
+    status: running
+    place_on: rack-c
+    priority: 5
+    gpus: 2
+    replicas: 1
+    est_remaining_s: 3600.0
+    labels: {class: inference}
+  - uid: wl-train-016
+    local_queue: lq-priority
+    priority: 40
+    gpus: 16
+    replicas: 4
+    comm_class: allreduce_heavy
+    topology_policy: required        # needs a contiguous domain
+    max_exec_s: 21600.0
+    labels: {class: training}
+  - uid: wl-finetune-004
+    local_queue: lq-shared
+    priority: 20
+    gpus: 4
+    replicas: 1
+    comm_class: light
+    topology_policy: preferred
+    max_exec_s: 5400.0
+    labels: {class: fine_tune}
+  - uid: wl-infer-001
+    local_queue: lq-shared
+    priority: 10
+    gpus: 1
+    replicas: 1
+    comm_class: none
+    topology_policy: unconstrained
+    max_exec_s: 1800.0
+    labels: {class: inference}
+
+operator_policy:
+  policy_id: default
+  allowed_actions: [hold, admit, place, admit_and_place]
+  risk_thresholds:
+    max_requeue_prob: 0.10

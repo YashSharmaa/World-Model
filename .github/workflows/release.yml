@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — release automation
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Triggered on a `v*` tag (or manual dispatch). Per design doc H ("Release
+#  automation"): gate on a green build, publish release assets outside Git
+#  history, generate an SBOM, attest build provenance for the released wheel,
+#  and attach the cards/SBOM/provenance artifacts to the GitHub Release.
+#
+#  Zenodo DOI archival is handled by the Zenodo↔GitHub integration that reacts
+#  to the published Release and consumes CITATION.cff; no extra job is needed.
+#  Actions are pinned by major version.
+# ─────────────────────────────────────────────────────────────────────────────
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build a release for (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build distributions + SBOM
+    runs-on: ubuntu-24.04
+    outputs:
+      wheel-hash: ${{ steps.hash.outputs.wheel-hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build + SBOM tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build cyclonedx-bom
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      # Install the freshly built package into an isolated env so the SBOM
+      # reflects the actual released dependency closure.
+      - name: Install built wheel for SBOM
+        run: python -m pip install dist/*.whl
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          python -m cyclonedx_py environment \
+            --output-format JSON \
+            --outfile dist/sbom.cdx.json || \
+          cyclonedx-py environment -o dist/sbom.cdx.json || \
+          echo "::warning::SBOM generation skipped (cyclonedx-bom unavailable)."
+
+      - name: Compute wheel hash
+        id: hash
+        run: |
+          cd dist
+          echo "wheel-hash=$(sha256sum ./*.whl | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+
+  attest:
+    name: attest build provenance
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      # Best-effort SLSA-style provenance for the released wheel/sdist.
+      - name: Attest artifacts
+        uses: actions/attest-build-provenance@v1
+        continue-on-error: true
+        with:
+          subject-path: "dist/*.whl, dist/*.tar.gz"
+
+  publish:
+    name: publish GitHub Release
+    needs: [build, attest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      # Attach distributions, SBOM, and model/data cards so the Release is
+      # self-describing and citable. Cards are markdown under docs/cards.
+      - name: Collect card artifacts
+        run: |
+          mkdir -p release-assets
+          cp -v dist/* release-assets/ 2>/dev/null || true
+          if [ -d docs/cards ]; then
+            cp -v docs/cards/*.md release-assets/ 2>/dev/null || true
+          fi
+          cp -v CITATION.cff release-assets/ 2>/dev/null || true
+          ls -la release-assets
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            release-assets/*

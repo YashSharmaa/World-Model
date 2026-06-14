@@ -1,0 +1,155 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# baseline.yaml — the reference training-stage config for the v1 world model.
+#
+# This is the full-fidelity training recipe (doc E MLX implementation plan, doc D
+# three-phase data mixture, doc P latent-dimension budget). It references schema
+# defaults rather than re-declaring them: latent widths come from
+# schema.tensors.LatentDims, shape caps / buckets from schema.tensors.ShapeCaps /
+# DEFAULT_BUCKETS, horizons & quantiles from schema.kpis. Anything here only
+# *overrides or selects* schema defaults; it never contradicts the frozen schema.
+
+author: Yash Sharma
+author_url: https://www.linkedin.com/in/yashsharmaa/
+license: Apache-2.0
+
+config_id: train_baseline
+schema_version: "1.0.0"          # must match version.SCHEMA_VERSION
+stage: baseline
+
+# ── Reproducibility ──────────────────────────────────────────────────────────
+seed: 20260614                   # master seed -> utils.seeding.SeedBundle
+deterministic: true
+
+# ── Latent dimensions (schema.tensors.LatentDims v1 defaults; doc P) ──────────
+# Listed for transparency; "use_schema_defaults: true" means the trainer reads
+# DEFAULT_LATENT_DIMS and these values are an asserted echo, not a redefinition.
+latent_dims:
+  use_schema_defaults: true
+  workload: 64
+  podset: 32
+  queue: 24
+  node: 48
+  gpu: 32
+  rack: 32
+  switch: 24
+  global: 32
+
+# ── Compile buckets (schema.tensors.DEFAULT_BUCKETS; doc E bucketing) ─────────
+# 3 padded pod shapes so the hot MLX path compiles once per bucket and never
+# churns. Selecting "default" uses schema.tensors.DEFAULT_BUCKETS verbatim.
+buckets:
+  use_schema_defaults: true
+  shapes:
+    - {name: small, J_max: 16, N_max: 8,  G_max: 64,  R_max: 1, S_max: 2, D_max: 4}
+    - {name: medium, J_max: 32, N_max: 16, G_max: 128, R_max: 2, S_max: 4, D_max: 8}
+    - {name: full,  J_max: 64, N_max: 32, G_max: 256, R_max: 4, S_max: 8, D_max: 16}
+
+# ── Temporal lanes (schema.tensors.ShapeCaps T_fast/T_slow; doc C/E) ──────────
+temporal:
+  t_fast: 24                     # 30 s bins over 12 min
+  t_slow: 12                     # 5 min bins over 60 min
+  message_passing_rounds: 2      # schema.tensors.MESSAGE_PASSING_ROUNDS
+
+# ── Forecast targets (schema.kpis.HORIZONS_S / QUANTILES; doc F) ──────────────
+horizons_s: [300, 900, 1800, 3600]
+quantiles: [0.05, 0.10, 0.50, 0.90, 0.95]
+kpi_channels:
+  - queue_wait_delta_s
+  - admitted_gpu_hours_delta
+  - topology_fragmentation_delta
+  - rack_power_kw
+  - rack_thermal_headroom_c
+  - completion_time_delta_s
+  - slowdown
+  - cross_rack_rate
+hazard_channels:
+  - hotspot
+  - pods_ready_timeout
+  - requeue
+  - xid_fault
+  - headroom_violation
+  - node_failure
+
+# ── Loss mixture (doc J differentiable rollout; doc F multi-task) ─────────────
+# Weights are relative; the trainer normalises. Counterfactual-rollout loss is
+# weighted heavily because action sensitivity collapses under pure teacher
+# forcing (doc F UWM-JEPA warning; doc J rollout objective).
+loss_mixture:
+  one_step_residual: 1.0         # short-horizon factual transition
+  multi_step_rollout: 2.0        # action-conditioned counterfactual rollout
+  quantile_pinball: 1.0          # KPI-delta quantile heads
+  hazard_survival: 1.0           # discrete-time survival / competing risks
+  representation_aux: 0.25       # auxiliary predictive-sufficiency probes
+  consistency_kernel: 0.5        # residual must respect exact-kernel feasibility
+teacher_forcing:
+  schedule: linear_decay         # decay TF ratio so rollout supervision dominates
+  start_ratio: 0.9
+  end_ratio: 0.1
+  decay_epochs: 20
+
+# ── Data mixture (doc D three-phase curriculum) ───────────────────────────────
+# Phase weights over the three origins (real / sim-observational / sim-cf). v1
+# ships synthetic-dominant; later phases reweight toward real as it lands.
+data_mixture:
+  phase: one                     # zero | one | two | three (doc E stages)
+  origins:
+    real: 0.0
+    sim_observational: 0.6
+    sim_counterfactual: 0.4
+  scenario_family_weights:
+    normal: 0.55
+    stress: 0.25
+    rare_events: 0.20
+  counterfactual_actions_per_window: 3   # hold + 2 admit/place branches (doc D)
+  rare_event_holdout: [severe_shift]     # families withheld for the rare slice
+
+# ── Optimization (doc E: micro-batch 8-16, accumulate to 32-64, fp16/bf16) ────
+optim:
+  optimizer: adamw
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  grad_clip_norm: 1.0
+  micro_batch_size: 12
+  grad_accum_steps: 4            # effective batch 48
+  epochs: 60
+  warmup_steps: 500
+  lr_schedule: cosine
+  precision: bf16               # fp32-sensitive loss/optimizer state (doc E)
+
+# ── EMA of weights (stabilises rollout scorer used at serving) ────────────────
+ema:
+  enabled: true
+  decay: 0.999
+  warmup_steps: 1000            # start EMA accumulation after warmup
+  update_every: 1
+  eval_with_ema: true           # the served/compiled scorer reads EMA weights
+
+# ── Uncertainty / calibration (doc L conformal) ───────────────────────────────
+uncertainty:
+  ensemble_size: 5              # deep ensemble for epistemic disagreement
+  conformal: split             # split-conformal calibration on a held lane
+  conformal_alpha: 0.10        # one-sided 90% bound for hazard upper limits
+  optimism_gate_alpha: 0.05    # one-sided excess-risk gate (policy.RiskThresholds)
+
+# ── MLX runtime memory discipline (doc E 36 GB unified-memory envelope) ───────
+runtime:
+  backend: mlx                  # falls back to numpy reference if mlx absent
+  memory_limit_gb: 24          # mx.set_memory_limit cap during training
+  clear_cache_at_phase_boundary: true
+  log_peak_memory_each_epoch: true
+
+# ── Checkpoint artifacts (doc E release bundle) ───────────────────────────────
+checkpoint:
+  dir: runs/baseline
+  save_every_epochs: 5
+  keep_last: 3
+  write_feature_stats: true
+  write_calibration: true
+  write_schema_hash: true

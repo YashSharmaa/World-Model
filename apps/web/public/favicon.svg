@@ -1,0 +1,14 @@
+<!--
+  GPU-Center World Model — three.js Decision Studio
+  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+  License: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="12" fill="#0a0e16" />
+  <!-- grounded present (opaque) -->
+  <rect x="14" y="14" width="14" height="36" rx="3" fill="#58c4ff" />
+  <!-- predicted future (translucent ghost) -->
+  <rect x="36" y="20" width="14" height="30" rx="3" fill="#c9a4ff" opacity="0.5" />
+  <!-- shared time cursor -->
+  <rect x="13" y="52" width="38" height="3" rx="1.5" fill="#ffcf6b" />
+</svg>

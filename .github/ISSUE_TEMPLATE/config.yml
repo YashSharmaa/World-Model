@@ -1,0 +1,20 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — issue chooser configuration
+#  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+#
+#  Disables blank free-text issues so every report comes through a structured
+#  form (design doc H: "Use GitHub issue forms, not free-form issue templates").
+#  Vague support questions are routed off the tracker.
+# ─────────────────────────────────────────────────────────────────────────────
+blank_issues_enabled: false
+contact_links:
+  - name: "Security vulnerability (private)"
+    url: "https://github.com/yashsharmaa/gpu-center-world-model/security/advisories/new"
+    about: "Do NOT open a public issue for vulnerabilities. Report privately via a GitHub Security Advisory (see SECURITY.md)."
+  - name: "Question / usage help"
+    url: "https://github.com/yashsharmaa/gpu-center-world-model/discussions"
+    about: "For how-to and usage questions, please start a Discussion instead of an issue."
+  - name: "Author — Yash Sharma"
+    url: "https://www.linkedin.com/in/yashsharmaa/"
+    about: "Project author and maintainer."

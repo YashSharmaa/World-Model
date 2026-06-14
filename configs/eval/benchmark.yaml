@@ -1,0 +1,175 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — An open-source, intervention-faithful world model
+#  for GPU datacenter operations.
+#  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
+#  License: Apache-2.0
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# benchmark.yaml — acceptance thresholds + slice definitions (doc F eval plan).
+#
+# Evaluation is GATED, not a weighted average (doc F): hard safety is a
+# release-blocking gate, then counterfactual fidelity, then planning utility,
+# then factual replay diagnostics, then operator usefulness. Hard-safety
+# failures are NEVER hidden inside a blended score. Every metric is reported
+# sliced by horizon, workload class, topology depth, and stress regime.
+
+author: Yash Sharma
+author_url: https://www.linkedin.com/in/yashsharmaa/
+license: Apache-2.0
+
+config_id: eval_benchmark
+schema_version: "1.0.0"
+
+# ── Decision-window protocol (doc F atomic unit) ──────────────────────────────
+protocol:
+  unit: decision_window          # pre-action state hash + safe candidate set
+  horizons_s: [300, 900, 1800, 3600]      # 5 / 15 / 30 / 60 min
+  candidate_actions_per_window: {min: 3, max: 8}
+  shared_seed_bundle: true       # branches differ only by the clamped action
+  shield_first: true             # kernel certifies the safe set before scoring
+
+# ── Benchmark tracks (doc F three-track release) ──────────────────────────────
+tracks:
+  semantics:
+    description: feasibility, blocker prediction, safe-candidate generation
+    metrics: [feasibility_accuracy, blocker_set_exact_match, safe_set_recall]
+  counterfactual_rollout:
+    description: 3+ branched safe actions scored at 15/30/60 min
+    metrics:
+      - delta_error_vs_reference
+      - pairwise_sign_accuracy
+      - action_ranking_ndcg
+      - top1_near_oracle_rate
+      - counterfactual_interval_coverage
+      - optimism_bias_rate
+  safe_action_selection:
+    description: choose / defer / abstain over a candidate set
+    metrics: [safe_regret, lexicographic_violations, coverage_vs_winrate]
+
+# ── Test splits (doc D/F shift partitions) ────────────────────────────────────
+splits:
+  - test_temporal                # later contiguous time blocks
+  - test_topology                # held-out topology family
+  - test_intervention            # held-out action regime
+  - test_rare_event              # held-out fault families / severities
+  - test_severe_shift            # combined severe distribution shift
+
+# ── Slice definitions (doc F: report by horizon, class, depth, regime) ────────
+slices:
+  horizon_s: [300, 900, 1800, 3600]
+  workload_class:
+    - inference                  # 1-GPU
+    - fine_tune                  # 4-GPU
+    - training                   # 8/16-GPU gangs
+  topology_depth:
+    - node
+    - rack
+    - block
+  stress_regime:
+    - normal
+    - thermal_stress
+    - scheduling_stress
+    - gpu_fault_burst
+    - cooling_derate
+    - pods_ready_timeout
+    - power_derate
+    - queue_burst
+    - maintenance_mask
+    - telemetry_degradation
+  report:
+    always_slice_wise: true      # never publish a single blended winner score
+    include_worst_case: true
+    include_tail: true           # p95 / CVaR tails per slice
+
+# ── Predictive-accuracy scoring (doc F factual replay diagnostics) ────────────
+predictive_accuracy:
+  continuous:
+    metrics: [median_abs_error, wape]
+    channels:
+      - queue_wait_delta_s
+      - admitted_gpu_hours_delta
+      - rack_power_kw
+      - rack_thermal_headroom_c
+      - completion_time_delta_s
+    probabilistic: [quantile_pinball, interval_coverage_90, sharpness]
+  hazards:
+    metrics: [brier, pr_auc_at_budget]
+    alert_budgets: [0.05, 0.10]  # realistic operator alert rates
+
+# ── ACCEPTANCE THRESHOLDS (doc F §35; release-blocking unless noted) ──────────
+# A run is "convincing" only if it clears ALL hard gates. Each gate is exact and
+# auditable; soft/provisional gates are flagged.
+acceptance_thresholds:
+  hard_safety:
+    blocking: true
+    exact_kernel_violations_max: 0          # zero quota / protected-domain /
+                                            # unhealthy-device / whitelist errors
+    blocker_set_discrepancy_max: 0          # emitted == exact kernel on blocks
+  counterfactual_ranking:
+    blocking: true
+    overall_pairwise_sign_accuracy_min: 0.70
+    non_abstained_sign_accuracy_min: 0.80
+    min_coverage: 0.60                      # retained while hitting 0.80 above
+  planning_utility:
+    blocking: true
+    safe_regret_reduction_vs_best_baseline_min: 0.15   # >=15% lower mean regret
+    pareto_alternative: "lower p95 queue wait at equal safety + more GPU-hours"
+  calibration_and_optimism:
+    blocking: true
+    interval_coverage_90_band: [0.85, 0.95]
+    non_abstained_optimism_bias_rate_max: 0.05
+    hazard_calibration_error_max: 0.05
+  shift_and_abstention:
+    blocking: true
+    abstain_or_fallback_rate_min: 0.80      # on severe-shift / degraded slices
+    false_safe_rate_max: 0.01
+  operator_usefulness:
+    blocking: false                         # provisional unless a study is run
+    median_decision_time_reduction_min: 0.20
+    unsafe_decision_increase_max: 0.0
+  live_demo_latency:
+    blocking: false                         # demo proves latency/stability only
+    p95_scripted_3action_s_max: 2.0
+    p95_enumerated_set_s_max: 5.0
+    compile_churn_allowed: false
+
+# ── Baselines the champion must beat (doc F skeptical comparators) ────────────
+baselines:
+  operations_grade:
+    - exact_kernel_branch_replay         # simulation-backed reference
+    - conservative_rule                  # hold-or-safest-domain heuristic
+  plain_ml:
+    - single_scale_recurrent             # no temporal hierarchy
+    - pooled_entity_encoder              # no object-centric typed state
+    - point_predictor                    # no uncertainty modelling
+
+# ── Ablations (doc F narrow-but-brutal set; matched budget) ───────────────────
+ablations:
+  set:
+    - remove_temporal_hierarchy
+    - remove_object_centric_state
+    - remove_uncertainty
+    - remove_rare_event_augmentation
+    - remove_counterfactual_rollout_loss
+  matched:
+    keep_exact_kernel: true
+    keep_splits: true
+    keep_training_budget: true
+
+# ── Red-team incident packs (doc F seeded-incident behaviour) ─────────────────
+red_team:
+  packs:
+    - gpu_fault_burst
+    - cooling_derate
+    - pods_ready_timeout
+    - power_derate
+    - maintenance_mask
+    - telemetry_degradation
+  expected_behavior: abstain_or_conservative_fallback
+  false_safe_rate_max: 0.01
+
+report:
+  emit: [safety_gate, counterfactual_sign_accuracy, safe_regret,
+         calibration, red_team_pass_rate, live_demo_latency]
+  single_leaderboard_score: false        # publish a profile, not one number
+  declare_branch_vs_observed: true       # say when a claim rests on simulation

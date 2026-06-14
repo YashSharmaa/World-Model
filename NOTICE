@@ -1,0 +1,16 @@
+GPU-Center World Model
+An open-source, intervention-faithful world model for GPU datacenter operations.
+
+Copyright 2026 Yash Sharma
+Author: Yash Sharma — https://www.linkedin.com/in/yashsharmaa/
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+the files in this project except in compliance with the License. A copy of the
+License is provided in the LICENSE file at the root of this repository.
+
+Documentation, diagrams, screenshots, and recorded demo narration are licensed
+under CC-BY-4.0. Synthetic example datasets and public benchmark packs are
+licensed under CDLA-Permissive-2.0. Per-file license metadata follows the REUSE
+specification (SPDX headers) where applicable.
+
+If you use this project in academic work, please cite it via CITATION.cff.
