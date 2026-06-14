@@ -36,8 +36,12 @@ from gpu_center_world_model.reliability import (
     cumulative_incidence,
     hazards_from_logits,
     interval_censored_log_likelihood,
+    ipcw_weights,
+    km_censoring_survival,
     logits_from_hazards,
+    median_rul,
     survival_from_q,
+    weighted_quantile,
 )
 
 ATOL = 1e-9
@@ -281,3 +285,117 @@ def test_censored_pinball_and_crps_are_finite():
     S = survival_from_q(q)
     crps = censored_crps(S, np.array([1.0, 2, 3, 4, 5]), y, obs)
     assert np.isfinite(crps) and crps >= 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IPCW RUL conformal coverage (doc U §rul REq4 / RT1) — the validity guarantee
+# ──────────────────────────────────────────────────────────────────────────────
+def _censored_rul_population(rng, n, *, cens_scale):
+    """Draw event times Y* and an *independent* censoring time C.
+
+    Returns observed times ``Y = min(Y*, C)``, the event indicator
+    ``Delta = 1{Y* <= C}``, and the *true* event time Y* (for evaluating coverage
+    only on the uncensored test units, where the realized RUL is known).
+    """
+    y_star = rng.uniform(1.0, 9.0, size=n)  # true RUL
+    c = rng.exponential(scale=cens_scale, size=n)  # independent censoring
+    observed = y_star <= c
+    y = np.where(observed, y_star, c)
+    return y, observed, y_star
+
+
+def test_km_censoring_survival_is_monotone_decreasing_in_unit_interval():
+    rng = _rng()
+    y, observed, _ = _censored_rul_population(rng, 400, cens_scale=8.0)
+    uniq, g = km_censoring_survival(y, observed)
+    assert uniq.shape == g.shape
+    assert g[0] <= 1.0 and np.all((g >= 0.0) & (g <= 1.0))
+    assert np.all(np.diff(g) <= 1e-12)  # reverse-KM survival is non-increasing
+
+
+def test_ipcw_weights_upweight_uncensored_units_to_undo_dropout():
+    rng = _rng()
+    y, observed, _ = _censored_rul_population(rng, 600, cens_scale=6.0)
+    w = ipcw_weights(y, observed)
+    assert np.all(w[~observed] == 0.0)  # only uncensored units carry weight
+    assert np.all(w[observed] >= 1.0 - 1e-9)  # 1/G(t-) >= 1
+    # heavier censoring (smaller scale) => smaller G => larger inverse weights.
+    y2, obs2, _ = _censored_rul_population(rng, 600, cens_scale=3.0)
+    w2 = ipcw_weights(y2, obs2)
+    assert w2[obs2].mean() > w[observed].mean()
+
+
+def test_ipcw_conformal_rul_interval_attains_marginal_coverage_under_censoring():
+    """The IPCW conformal RUL interval covers the realized RUL at ~``1 - alpha``.
+
+    Doc U RT1 / REq4: under conditionally-independent censoring the IPCW-weighted
+    split-conformal interval restores marginal coverage of the realized event time
+    on the (uncensored) test population. We calibrate on a censored sample and
+    evaluate coverage on a *fresh* uncensored test set; the empirical coverage must
+    sit at/above ``1 - alpha`` (up to sampling slack).
+    """
+    rng = _rng()
+    alpha = 0.1
+
+    # a biased point predictor (so the conformal correction has real work to do).
+    def point_of(y_true):
+        return y_true + rng.normal(scale=1.0, size=y_true.shape)
+
+    covers = []
+    for _ in range(30):
+        cal_y, cal_obs, _cal_ystar = _censored_rul_population(
+            rng, 1200, cens_scale=10.0
+        )
+        cal_pred = point_of(cal_y)  # predictor evaluated at the *observed* time
+        # build the interval at a fresh test point, evaluate coverage of its truth.
+        t_ystar = float(rng.uniform(1.0, 9.0))
+        t_pred = t_ystar + float(rng.normal(scale=1.0))
+        iv = conformal_rul_interval(
+            t_pred,
+            cal_point_preds=cal_pred,
+            cal_event_times=cal_y,
+            cal_observed=cal_obs,
+            alpha=alpha,
+        )
+        covers.append(iv.lower <= t_ystar <= iv.upper)
+    cov = float(np.mean(covers))
+    # marginal coverage at/above nominal (one-sided slack for the small batch).
+    assert cov >= (1.0 - alpha) - 0.05
+
+
+def test_ipcw_correction_widens_vs_ignoring_censoring_when_dropout_is_heavy():
+    """IPCW must widen the interval relative to dropping censored units naively.
+
+    Naively keeping only uncensored units with *equal* weights ignores informative
+    dropout and yields a too-tight (under-covering) quantile; the IPCW reweighting
+    up-weights the late-surviving uncensored units, widening the certified radius.
+    """
+    rng = _rng()
+    y, observed, _ = _censored_rul_population(rng, 2000, cens_scale=4.0)  # heavy
+    pred = y + rng.normal(scale=1.0, size=y.size)
+    scores = np.abs(pred - y)
+    w = ipcw_weights(y, observed)
+    q_ipcw = weighted_quantile(scores, w, 0.9)
+    # equal-weight quantile over the uncensored units only (the naive estimator).
+    q_naive = weighted_quantile(scores[observed], np.ones(int(observed.sum())), 0.9)
+    assert q_ipcw >= q_naive - 1e-9  # IPCW never tightens; under heavy dropout widens
+
+
+def test_full_forecast_to_ipcw_rul_interval_path_is_coherent():
+    # end-to-end: a coherent survival forecast -> median RUL -> calibrated interval.
+    head = CauseSpecificHazardModel.for_entity("gpu", n_features=3)
+    fc = head.forecast(np.zeros((8, 3)))
+    point = median_rul(fc)
+    assert 1 <= point <= 8
+    rng = _rng()
+    cal_y, cal_obs, _ = _censored_rul_population(rng, 300, cens_scale=8.0)
+    cal_pred = cal_y + rng.normal(scale=1.0, size=cal_y.size)
+    iv = conformal_rul_interval(
+        float(point),
+        cal_point_preds=cal_pred,
+        cal_event_times=cal_y,
+        cal_observed=cal_obs,
+        alpha=0.1,
+    )
+    assert 0.0 <= iv.lower <= float(point) <= iv.upper
+    assert np.isfinite(iv.q_hat) and iv.alpha == 0.1

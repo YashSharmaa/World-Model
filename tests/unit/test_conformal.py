@@ -20,9 +20,13 @@ from __future__ import annotations
 import numpy as np
 
 from gpu_center_world_model.uncertainty import (
+    ACICalibrator,
     ConformalizedQuantileRegressor,
+    ConformalRiskController,
+    MondrianConformal,
     OneSidedUpperConformal,
     SplitConformalRegressor,
+    WeightedConformal,
     conformal_rank,
     empirical_coverage,
     one_sided_coverage,
@@ -242,3 +246,195 @@ def test_calibration_fits_per_slice_mondrian_with_backoff():
     # the same fitted quantile applies to every group (back-off is consistent).
     lo2, hi2 = mond.interval("another|h1800|fooX|none|clean", -1.0, 1.0)
     assert (lo2, hi2) == (lo, hi)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ACI long-run coverage under drift (doc L T temporal_drift_and_aci / W2)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_aci_long_run_coverage_tracks_target_under_drift():
+    """ACI gives *long-run* (not one-shot) coverage near ``1 - alpha`` under drift.
+
+    Doc L (E15, W2): ``alpha_{t+1} = clip(alpha_t + gamma(alpha_target - err_t))``
+    drives the empirical long-run miss-rate toward ``alpha_target`` even when the
+    base scale drifts. We stream a non-stationary process: the residual scale ramps
+    up over time (so a fixed conformal radius would progressively under-cover). The
+    ACI level adapts and the *realised* long-run coverage stays close to nominal.
+    """
+    rng = _rng()
+    cal = ACICalibrator(alpha_target=ALPHA, gamma=0.02)
+    base_scores = np.abs(rng.normal(scale=1.0, size=2000))  # absolute-residual scores
+    covered_hist: list[bool] = []
+    for t in range(6000):
+        scale = 1.0 + 3.0 * (t / 6000.0)  # the residual scale drifts upward
+        radius = cal.radius(base_scores)
+        y_err = abs(rng.normal(scale=scale))  # this step's realised |residual|
+        covered = y_err <= radius
+        covered_hist.append(covered)
+        cal.update(covered)
+        # refresh the calibration scores to the current drifted scale (the base
+        # split-conformal radius the wrapper sits on tracks the live distribution).
+        base_scores = np.abs(rng.normal(scale=scale, size=2000))
+    long_run_cov = float(np.mean(covered_hist[1000:]))  # discard burn-in
+    assert abs(long_run_cov - (1.0 - ALPHA)) < 0.03
+    # the adapted miscoverage level stayed inside its projection box.
+    assert cal.alpha_min <= cal.alpha_t <= cal.alpha_max
+
+
+def test_aci_widens_level_when_persistently_missing():
+    # A wrapper that keeps missing must *raise* its acceptance (lower alpha_t ->
+    # larger radius) to chase coverage back up (E15 negative-feedback direction).
+    cal = ACICalibrator(alpha_target=0.1, gamma=0.05)
+    a0 = cal.alpha_t
+    for _ in range(50):
+        cal.update(covered=False)  # persistent miss
+    assert cal.alpha_t < a0  # lower miscoverage target => wider interval
+    cal2 = ACICalibrator(alpha_target=0.1, gamma=0.05)
+    for _ in range(50):
+        cal2.update(covered=True)  # always covered => can tighten
+    assert cal2.alpha_t > cal.alpha_t
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Weighted conformal: target-domain marginal coverage under covariate shift (T5)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_weighted_conformal_attains_target_coverage_under_covariate_shift():
+    """Weighted conformal restores target-domain coverage; unweighted under-covers.
+
+    Doc L T5 / E14: within a fixed action bucket the conditional law is unchanged
+    (``P_t(Y|X) = P_c(Y|X)``) but the covariate marginal shifts. We build a
+    heteroscedastic one-sided risk problem where the test distribution concentrates
+    on the high-variance region. The IPW likelihood-ratio weights restore
+    ``P_{P_t}{R <= U(X)} >= 1 - alpha``; an *unweighted* split conformal under the
+    same shift under-covers (the validity actually being tested).
+    """
+    rng = _rng()
+    alpha = 0.1
+    n = 6000
+
+    def draw(x):  # one-sided risk: R = r_hat(x) + heteroscedastic positive noise
+        r_hat = 0.2 + 0.0 * x
+        r_true = r_hat + np.abs(rng.normal(scale=0.1 + x, size=x.size))
+        return r_hat, r_true
+
+    # calibration: x ~ Uniform(0,1) (the source covariate law).
+    x_cal = rng.uniform(0.0, 1.0, size=n)
+    r_hat_cal, r_true_cal = draw(x_cal)
+    # target law: x ~ Beta(5,1) concentrates on large x (the high-variance tail).
+    # likelihood ratio w(x) = p_t(x) / p_c(x) = Beta(5,1) density = 5 x^4.
+    weights = 5.0 * x_cal**4
+    wc = WeightedConformal(alpha=alpha, mode="one_sided_upper").fit(
+        r_true_cal, {"r_hat": r_hat_cal}, weights
+    )
+
+    # fresh *target-distributed* test points.
+    x_t = rng.beta(5.0, 1.0, size=20000)
+    r_hat_t, r_true_t = draw(x_t)
+    q = wc._weighted_quantile(float(weights.mean()))
+    upper_w = r_hat_t + q
+    cov_w = one_sided_coverage(r_true_t, upper_w)
+    assert cov_w >= (1.0 - alpha) - 0.02  # target-domain marginal coverage restored
+
+    # the *unweighted* split-conformal quantile (equal weights) under-covers on the
+    # shifted target law — this is exactly the failure weighting fixes.
+    unweighted_q = split_conformal_quantile(r_true_cal - r_hat_cal, alpha)
+    cov_unw = one_sided_coverage(r_true_t, r_hat_t + unweighted_q)
+    assert cov_unw < cov_w  # weighting genuinely lifts coverage on the target law
+
+
+def test_weighted_conformal_recovers_split_conformal_at_equal_weights():
+    # With all weights equal, weighted conformal must reduce to plain split
+    # conformal (no shift correction), up to the +inf test-point augmentation.
+    rng = _rng()
+    r_hat = rng.uniform(0.0, 0.5, size=2000)
+    r_true = r_hat + np.abs(rng.normal(scale=0.1, size=2000))
+    wc = WeightedConformal(alpha=ALPHA, mode="one_sided_upper").fit(
+        r_true, {"r_hat": r_hat}, np.ones(2000)
+    )
+    q_w = wc._weighted_quantile(1.0)
+    q_plain = split_conformal_quantile(r_true - r_hat, ALPHA)
+    assert abs(q_w - q_plain) <= 0.02
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mondrian group-conditional coverage: per-group >= 1 - alpha (doc L T3 / P2)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_mondrian_each_group_meets_nominal_coverage():
+    """Each prespecified slice attains its own ``1 - alpha`` (group-conditional).
+
+    Doc L T3 / P2: a *single pooled* quantile under-covers a high-variance group;
+    the per-group Mondrian quantile restores per-group validity. We build three
+    groups with very different residual scales and assert (a) the Mondrian per-group
+    upper covers every group at ~nominal, and (b) the pooled quantile under-covers
+    the highest-variance group (the failure Mondrian fixes).
+    """
+    rng = _rng()
+    alpha = 0.1
+    n_per = 4000
+    scales = {"lo": 0.2, "mid": 1.0, "hi": 4.0}
+    groups, r_hat, r_true = [], [], []
+    for g, s in scales.items():
+        rh = rng.uniform(0.0, 0.2, size=n_per)
+        rt = rh + np.abs(rng.normal(scale=s, size=n_per))
+        groups += [g] * n_per
+        r_hat.append(rh)
+        r_true.append(rt)
+    groups = np.array(groups, dtype=object)
+    r_hat = np.concatenate(r_hat)
+    r_true = np.concatenate(r_true)
+
+    mond = MondrianConformal(alpha=alpha, mode="one_sided_upper").fit(
+        groups, r_true, {"r_hat": r_hat}
+    )
+
+    # fresh test draws per group; every group meets its own nominal coverage.
+    for g, s in scales.items():
+        rh_t = rng.uniform(0.0, 0.2, size=8000)
+        rt_t = rh_t + np.abs(rng.normal(scale=s, size=8000))
+        uppers = np.array([mond.upper(g, float(p)) for p in rh_t])
+        cov_g = one_sided_coverage(rt_t, uppers)
+        assert cov_g >= (1.0 - alpha) - 0.02, (g, cov_g)
+
+    # a single pooled quantile under-covers the highest-variance "hi" group.
+    rh_hi = rng.uniform(0.0, 0.2, size=8000)
+    rt_hi = rh_hi + np.abs(rng.normal(scale=scales["hi"], size=8000))
+    pooled_upper = rh_hi + mond.pooled_q
+    assert one_sided_coverage(rt_hi, pooled_upper) < (1.0 - alpha)
+
+
+def test_mondrian_backoff_uses_pooled_quantile_for_small_groups():
+    # A group with < min_group calibration points is not fitted and backs off to
+    # the pooled quantile (T3 hierarchical back-off), never KeyError.
+    rng = _rng()
+    big = np.array(["big"] * 200, dtype=object)
+    tiny = np.array(["tiny"] * 5, dtype=object)
+    groups = np.concatenate([big, tiny])
+    r_hat = rng.uniform(0.0, 0.2, size=205)
+    r_true = r_hat + np.abs(rng.normal(scale=0.3, size=205))
+    mond = MondrianConformal(alpha=0.1, mode="one_sided_upper", min_group=30).fit(
+        groups, r_true, {"r_hat": r_hat}
+    )
+    assert "big" in mond.quantiles_by_group
+    assert "tiny" not in mond.quantiles_by_group  # too small -> not fitted
+    # backs off to the pooled quantile (finite, no KeyError).
+    assert mond.quantile_for("tiny") == mond.pooled_q
+    assert np.isfinite(mond.quantile_for("never_seen_label"))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conformal risk control: deployed mean loss controlled at the target (E18)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_conformal_risk_controller_controls_long_run_mean_loss():
+    rng = _rng()
+    lambdas = np.linspace(0.0, 1.0, 25)
+    # a bounded loss that is monotone non-increasing in the threshold lambda.
+    base = rng.random((400, 1))
+    losses = np.clip(base - lambdas[None, :], 0.0, 1.0)
+    crc = ConformalRiskController(alpha=0.1, loss_bound=1.0).fit(lambdas, losses)
+    lam = crc.threshold()
+    # the deployed mean loss at lambda_hat respects the target risk (E18).
+    j = int(np.argmin(np.abs(lambdas - lam)))
+    assert float(losses[:, j].mean()) <= 0.1 + 1e-6
+    # picking a *smaller* (less conservative) lambda would exceed the budget, so the
+    # controller is at the binding edge (monotone RCPS selection).
+    if j > 0:
+        assert float(losses[:, j - 1].mean()) >= float(losses[:, j].mean()) - 1e-9

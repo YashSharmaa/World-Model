@@ -618,3 +618,292 @@ def test_c4_accepts_the_solvers_own_assignment(
     assert res.feasible
     # The placement solver's returned integer assignment passes the C4 recheck.
     assert kernel._c4_integer_recheck(state.symbolic, wl, res.assignment)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Safety shield projection Pi_s — soundness / idempotence / minimal-perturbation
+# (TEST-KERNEL-INGEST-SERVE-FE, doc S Theorems T10/T11/T12, Definitions D11-D13)
+# ──────────────────────────────────────────────────────────────────────────────
+def test_project_is_sound_returns_member_of_safe_set_T10(
+    kernel, demo_state, queued_workload_uid
+):
+    # T10: when S_s(w) is non-empty, Pi_s(proposal) must lie in S_s(w). We feed a
+    # proposal the kernel rejects (a masked/garbage domain under `required`
+    # locality) and assert the *repaired* action is individually feasible — the
+    # constructive zero-violation basis (doc S, Theorem T10).
+    state = copy.deepcopy(demo_state)
+    bad = AdmitAndPlace(
+        workload_uid=queued_workload_uid,
+        cluster_queue_id=_cq(state, queued_workload_uid),
+        resource_flavor_id=_flavor(state),
+        domain_policy="required",
+        domain_id_or_set=("no-such-domain",),  # cannot host the gang -> infeasible
+    )
+    assert not kernel.feasible(state, bad).feasible  # the proposal really is bad
+    projected = kernel.project(state, bad)
+    assert projected is not None
+    # Soundness: the projection is a member of the exact safe set.
+    assert kernel.feasible(state, projected).feasible
+    # And it is drawn from the kernel-certified candidate set (never enlarged).
+    safe = kernel.safe_candidates(state, queued_workload_uid)
+    assert any(
+        kernel._distance(projected, c) == (0, 0, 0, 0) for c in safe
+    ), "projection must be one of the enumerated safe candidates"
+
+
+def test_project_is_idempotent_T11(kernel, demo_state, queued_workload_uid):
+    # T11: Pi_s(Pi_s(alpha)) == Pi_s(alpha). A feasible action projects to itself
+    # (distance zero), and re-projecting a projection is a fixed point.
+    state = copy.deepcopy(demo_state)
+    feasible_action = AdmitAndPlace(
+        workload_uid=queued_workload_uid,
+        cluster_queue_id=_cq(state, queued_workload_uid),
+        resource_flavor_id=_flavor(state),
+        domain_policy="preferred",
+    )
+    assert kernel.feasible(state, feasible_action).feasible
+    once = kernel.project(state, feasible_action)
+    # A feasible proposal projects to *itself* (zero lexicographic distance, T11).
+    assert once is feasible_action
+    # Now repair an infeasible proposal, then re-project the repair: fixed point.
+    bad = AdmitAndPlace(
+        workload_uid=queued_workload_uid,
+        cluster_queue_id=_cq(state, queued_workload_uid),
+        resource_flavor_id=_flavor(state),
+        domain_policy="required",
+        domain_id_or_set=("no-such-domain",),
+    )
+    repaired = kernel.project(state, bad)
+    assert repaired is not None
+    twice = kernel.project(state, repaired)
+    # Idempotence: a projected action is a fixed point of the projection.
+    assert kernel._distance(twice, repaired) == (0, 0, 0, 0)
+
+
+def test_project_minimal_perturbation_prefers_same_type_queue_flavor_T12(
+    kernel, demo_state, queued_workload_uid
+):
+    # T12: the projection is the *nearest* feasible action under the lexicographic
+    # action distance (type, queue, flavor, topology-edit). The repair of a bad
+    # admit_and_place must therefore stay an admit_and_place on the same (q, f)
+    # whenever such a safe action exists — only the topology selection is edited.
+    state = copy.deepcopy(demo_state)
+    q = _cq(state, queued_workload_uid)
+    f = _flavor(state)
+    bad = AdmitAndPlace(
+        workload_uid=queued_workload_uid,
+        cluster_queue_id=q,
+        resource_flavor_id=f,
+        domain_policy="required",
+        domain_id_or_set=("no-such-domain",),
+    )
+    projected = kernel.project(state, bad)
+    assert projected is not None
+    # Minimal perturbation: same action type, same queue, same flavor are all
+    # preserved (the three highest-priority components of dist are zero).
+    type_diff, queue_diff, flavor_diff, _topo = kernel._distance(bad, projected)
+    assert type_diff == 0, "nearest repair keeps the same action type"
+    assert queue_diff == 0, "nearest repair keeps the same cluster queue"
+    assert flavor_diff == 0, "nearest repair keeps the same resource flavor"
+    # It is the global argmin over the safe set under the lexicographic metric.
+    safe = kernel.safe_candidates(state, queued_workload_uid)
+    best = min(kernel._distance(bad, c) for c in safe)
+    assert kernel._distance(bad, projected) == best
+
+
+def test_project_abstains_when_even_hold_is_unavailable(
+    kernel, demo_state, queued_workload_uid
+):
+    # When S_s(w) is empty (no whitelisted action, not even hold), Pi_s abstains
+    # by returning None rather than emitting an unsafe action (doc S step 6).
+    state = copy.deepcopy(demo_state)
+    pol = state.symbolic.operator_policy
+    state.symbolic.operator_policy = type(pol)(
+        policy_id=pol.policy_id,
+        allowed_actions=[],  # nothing whitelisted, not even hold
+        protected_domains=list(pol.protected_domains),
+        risk_thresholds=dict(pol.risk_thresholds),
+        active_since_ts=pol.active_since_ts,
+    )
+    bad = AdmitAndPlace(
+        workload_uid=queued_workload_uid,
+        cluster_queue_id=_cq(state, queued_workload_uid),
+        resource_flavor_id=_flavor(state),
+        domain_policy="required",
+        domain_id_or_set=("no-such-domain",),
+    )
+    assert kernel.project(state, bad) is None
+
+
+def test_project_falls_back_to_hold_when_no_placement_is_safe(
+    kernel, demo_state, queued_workload_uid
+):
+    # When placement is impossible but hold is whitelisted, the nearest safe
+    # action is hold (doc S step 6: hold weakly dominates irrevocable reject).
+    from gpu_center_world_model.schema import ActionType
+
+    state = copy.deepcopy(demo_state)
+    pol = state.symbolic.operator_policy
+    # Mask every domain so admit_and_place has no feasible target, leave hold on.
+    state.symbolic.operator_policy = type(pol)(
+        policy_id=pol.policy_id,
+        allowed_actions=list(pol.allowed_actions),
+        protected_domains=list(state.symbolic.domains),
+        risk_thresholds=dict(pol.risk_thresholds),
+        active_since_ts=pol.active_since_ts,
+    )
+    bad = AdmitAndPlace(
+        workload_uid=queued_workload_uid,
+        cluster_queue_id=_cq(state, queued_workload_uid),
+        resource_flavor_id=_flavor(state),
+        domain_policy="required",
+        domain_id_or_set=(next(iter(state.symbolic.domains)),),
+    )
+    projected = kernel.project(state, bad)
+    assert projected is not None
+    assert projected.type is ActionType.HOLD
+    assert kernel.feasible(state, projected).feasible
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Quota / borrowing / lending / cohort arithmetic
+# (TEST-KERNEL-INGEST-SERVE-FE, doc S Eq. E11 / E12 / E13)
+# ──────────────────────────────────────────────────────────────────────────────
+def _two_queue_cohort():
+    """Build a 2-queue cohort sharing flavor `f0`, resource `gpu`.
+
+    `q-borrow` has a small nominal quota; `q-lend` declares a lending limit so the
+    borrower's cohort headroom is bounded by both unused cohort nominal and the
+    lender's lending cap (doc S, Eq. E13).
+    """
+    from gpu_center_world_model.schema.entities import ClusterQueue
+
+    borrower = ClusterQueue(
+        name="q-borrow",
+        cohort_id="coh",
+        nominal_quota={"f0": {"gpu": 4.0}},
+        borrowing_limit={"f0": {"gpu": 8.0}},
+    )
+    lender = ClusterQueue(
+        name="q-lend",
+        cohort_id="coh",
+        nominal_quota={"f0": {"gpu": 10.0}},
+        lending_limit={"f0": {"gpu": 6.0}},
+    )
+    return borrower, lender
+
+
+def test_E11_demand_within_nominal_needs_no_borrow():
+    # E11: d_wr <= U_nom_qfr -> admissible with beta = 0 (no borrowing recorded).
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    borrower, lender = _two_queue_cohort()
+    cohort = [borrower, lender]
+    dec = q.quota_check(borrower, cohort, "f0", {"gpu": 4.0})  # exactly nominal
+    assert dec.feasible
+    assert dec.borrow.get("gpu", 0.0) == 0.0
+    assert dec.borrowed_resources == []
+
+
+def test_E11_E12_borrowing_is_exact_and_bounded_by_cohort_headroom():
+    # E11/E12: a demand above nominal borrows exactly need = d - U_nom, and that
+    # borrow is admissible only because it is within min(borrowing_limit,
+    # cohort_headroom). Borrower nominal=4, demand=9 -> need=5; cohort headroom is
+    # min(lender unused nominal 10, lender lending limit 6) = 6, borrowing_limit
+    # 8, so cap = min(8, 6) = 6 >= 5 -> feasible with beta_gpu = 5.
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    borrower, lender = _two_queue_cohort()
+    cohort = [borrower, lender]
+    assert q.cohort_headroom(borrower, cohort, "f0", "gpu") == 6.0
+    dec = q.quota_check(borrower, cohort, "f0", {"gpu": 9.0})
+    assert dec.feasible
+    assert dec.borrow["gpu"] == 5.0  # exact need = 9 - 4
+    assert dec.borrowed_resources == ["gpu"]
+
+
+def test_E12_E13_lending_limit_caps_cohort_borrow_and_yields_deficit():
+    # E13: the cohort cap is the conservative min of unused cohort nominal and the
+    # lenders' aggregate lending limit. The lender lends at most 6, so a demand
+    # needing 7 of borrow (nominal 4, demand 11) cannot be satisfied even though
+    # borrowing_limit (8) alone would allow it -> infeasible with exact deficit.
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    borrower, lender = _two_queue_cohort()
+    cohort = [borrower, lender]
+    dec = q.quota_check(borrower, cohort, "f0", {"gpu": 11.0})  # need = 7 > cap 6
+    assert not dec.feasible
+    assert "gpu" not in dec.borrow
+    # deficit = need - cap = 7 - 6 = 1 (doc S feasibility-relaxation shortage).
+    assert dec.deficit["gpu"] == 1.0
+
+
+def test_E13_lending_drops_when_lender_consumes_its_own_quota():
+    # Lending headroom is *conservative*: as the lender reserves its own nominal
+    # quota, the unused-cohort-nominal term of E13 shrinks, so the borrower's
+    # cohort headroom can fall below the static lending_limit. Reserving 8 of the
+    # lender's 10 nominal leaves unused cohort nominal = 2, so cohort headroom =
+    # min(2, lending 6) = 2 (down from 6).
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    borrower, lender = _two_queue_cohort()
+    cohort = [borrower, lender]
+    q.apply_admission(lender, 8.0, 0.0, flavor_id="f0", demand={"gpu": 8.0}, borrow={})
+    assert q.reserved_for(lender, "f0", "gpu") == 8.0
+    assert q.cohort_headroom(borrower, cohort, "f0", "gpu") == 2.0
+    # A borrow of need=5 (demand 9, nominal 4) now exceeds the 2-GPU cohort cap.
+    dec = q.quota_check(borrower, cohort, "f0", {"gpu": 9.0})
+    assert not dec.feasible
+    assert dec.deficit["gpu"] == 3.0  # need 5 - cohort cap 2
+
+
+def test_singleton_cohort_cannot_borrow():
+    # A queue with no cohort_id is its own singleton cohort: it can neither borrow
+    # nor lend, so a demand above its nominal quota is infeasible (Kueue cohort
+    # semantics; doc S resolve_cohort).
+    from gpu_center_world_model.schema.entities import ClusterQueue
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    solo = ClusterQueue(
+        name="solo",
+        cohort_id=None,
+        nominal_quota={"f0": {"gpu": 4.0}},
+        borrowing_limit={"f0": {"gpu": 8.0}},
+    )
+    cohort = q.resolve_cohort({"solo": solo}, solo)
+    assert cohort == [solo]
+    assert q.cohort_headroom(solo, cohort, "f0", "gpu") == 0.0
+    dec = q.quota_check(solo, cohort, "f0", {"gpu": 6.0})  # 2 over nominal, no lend
+    assert not dec.feasible
+    assert dec.deficit["gpu"] == 2.0
+
+
+def test_resolve_cohort_groups_only_same_cohort_id():
+    # resolve_cohort returns exactly the queues sharing the cohort id (incl self),
+    # so cohort arithmetic never pulls in an unrelated cohort's lendable quota.
+    from gpu_center_world_model.schema.entities import ClusterQueue
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    a = ClusterQueue(name="a", cohort_id="coh-1")
+    b = ClusterQueue(name="b", cohort_id="coh-1")
+    c = ClusterQueue(name="c", cohort_id="coh-2")
+    queues = {"a": a, "b": b, "c": c}
+    cohort = q.resolve_cohort(queues, a)
+    names = {x.name for x in cohort}
+    assert names == {"a", "b"}  # c is in a different cohort, excluded
+
+
+def test_workload_demand_aggregates_podset_counts():
+    # d_wr = sum_p c_p * a_pr (doc S, Eq. E11): the aggregate per-resource demand
+    # is the count-weighted sum across podsets, not a re-learned estimate.
+    from gpu_center_world_model.simulator.exact_kernel import quota as q
+
+    demand = q.workload_demand(
+        [
+            (4, {"gpu": 1.0, "cpu": 8.0, "mem": 64.0}),
+            (2, {"gpu": 0.0, "cpu": 4.0, "mem": 16.0}),
+        ]
+    )
+    assert demand["gpu"] == 4.0  # 4*1 + 2*0
+    assert demand["cpu"] == 40.0  # 4*8 + 2*4
+    assert demand["mem"] == 288.0  # 4*64 + 2*16
