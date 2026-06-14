@@ -1,0 +1,67 @@
+{
+  "author": "Yash Sharma",
+  "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+  "doc_basis": "doc F slice plan; doc O Mondrian slices",
+  "families": [
+    {
+      "cells": [
+        "hold",
+        "admit",
+        "place",
+        "admit_and_place"
+      ],
+      "fallback": "other",
+      "feature": "action_family",
+      "name": "action_family"
+    },
+    {
+      "cells": [
+        "h300s",
+        "h900s",
+        "h1800s",
+        "h3600s"
+      ],
+      "fallback": "other",
+      "feature": "horizon_s",
+      "name": "horizon"
+    },
+    {
+      "cells": [
+        "single_pod",
+        "small_gang",
+        "allreduce_heavy",
+        "pipeline",
+        "other"
+      ],
+      "fallback": "other",
+      "feature": "workload_family",
+      "name": "workload_family"
+    },
+    {
+      "cells": [
+        "intra_node",
+        "intra_rack",
+        "cross_rack",
+        "cross_block",
+        "unconstrained"
+      ],
+      "fallback": "unconstrained",
+      "feature": "topology_family",
+      "name": "topology_family"
+    },
+    {
+      "cells": [
+        "observed",
+        "stale",
+        "delayed",
+        "dropped"
+      ],
+      "fallback": "observed",
+      "feature": "source_health",
+      "name": "source_health"
+    }
+  ],
+  "min_effective_windows_per_slice": 750,
+  "project": "gpu-center-world-model",
+  "schema_version": "1.0.0"
+}

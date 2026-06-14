@@ -145,21 +145,27 @@ def censored_log_likelihood(
     event_bucket: np.ndarray,
     cause_index: np.ndarray,
     observed: np.ndarray,
+    entry_bucket: np.ndarray | None = None,
     eps: float = 1e-12,
 ) -> np.ndarray:
     """Per-unit discrete competing-risks log-likelihood (doc U Eq4).
 
     For unit ``u`` with observed-or-censored bucket ``Y_u = event_bucket`` (a
     1-based bucket index in ``1..M``), cause ``J_u = cause_index`` (ignored when
-    censored), and event indicator ``Delta_u = observed``::
+    censored), event indicator ``Delta_u = observed``, and optional **entry bucket**
+    ``E_u = entry_bucket`` (1-based, left-truncation)::
 
-        L_u = [prod_{r < Y_u} q_r] * ( h_{J_u, Y_u}   if Delta_u = 1
-                                       q_{Y_u}         if Delta_u = 0 )
+        L_u = [prod_{E_u <= r < Y_u} q_r] * ( h_{J_u, Y_u}   if Delta_u = 1
+                                              q_{Y_u}         if Delta_u = 0 )
 
-    The leading product is the survival of *every fully-survived prior bucket*;
+    The leading product is the survival of every fully-survived *at-risk* bucket;
     an event then contributes its cause hazard, a (right-)censoring contributes
     the no-event step probability of the final at-risk bucket (A4: censoring is
-    conditionally independent given history + actions).
+    conditionally independent given history + actions). With ``entry_bucket`` the
+    **risk set excludes pre-entry buckets** ``r < E_u`` (left-truncation / delayed
+    entry, doc U §rul): the survival product starts at the unit's entry time, so a
+    unit that joined the risk set late is not penalised for buckets it was never
+    exposed to.
 
     Parameters
     ----------
@@ -172,6 +178,9 @@ def censored_log_likelihood(
         0-based cause column per unit, shape ``(B,)``. Unused for censored units.
     observed
         Boolean event indicator per unit, shape ``(B,)``.
+    entry_bucket
+        Optional 1-based entry bucket per unit, shape ``(B,)`` (default: all 1,
+        i.e. every unit entered at the first bucket — no truncation).
 
     Returns
     -------
@@ -185,10 +194,14 @@ def censored_log_likelihood(
     observed = np.asarray(observed, dtype=bool)
 
     b, m = q.shape
+    if entry_bucket is None:
+        entry = np.ones(b, dtype=np.int64)
+    else:
+        entry = np.clip(np.asarray(entry_bucket, dtype=np.int64), 1, m)
     log_q = np.log(q)  # (B, M)
-    # Mask of buckets strictly before Y_u (fully survived): r in 1..Y_u-1.
+    # Mask of at-risk fully-survived buckets: E_u <= r < Y_u (left-truncated).
     bucket_ix = np.arange(1, m + 1)[None, :]  # 1-based, (1, M)
-    survived = bucket_ix < event_bucket[:, None]  # (B, M)
+    survived = (bucket_ix < event_bucket[:, None]) & (bucket_ix >= entry[:, None])
     ll = np.sum(np.where(survived, log_q, 0.0), axis=-1)  # (B,)
 
     rows = np.arange(b)
@@ -198,6 +211,67 @@ def censored_log_likelihood(
     censor_term = log_q[rows, last]
     ll = ll + np.where(observed, event_term, censor_term)
     return ll
+
+
+def interval_censored_log_likelihood(
+    h: np.ndarray,
+    q: np.ndarray,
+    *,
+    left_bucket: np.ndarray,
+    right_bucket: np.ndarray,
+    cause_index: np.ndarray | None = None,
+    entry_bucket: np.ndarray | None = None,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Interval-censored competing-risks log-likelihood (doc U §rul, partial bucket).
+
+    When the event time is only known to lie in a bucket interval ``(L_u, R_u]``
+    (e.g. a **reporting-delay / interval-censored onset**: the fault is observed at
+    a later bucket but actually occurred sometime after the last clean reading),
+    the contribution is the *probability mass of the first event landing in that
+    interval* — the partial-bucket survival contribution:
+
+        L_u = sum_{r = L_u+1}^{R_u} S(r-1) * ( sum_j h_{j,r}   (any cause)
+                                               h_{cause, r}    (known cause) )
+
+    i.e. the increment of the all-cause (or cause-specific) cumulative incidence
+    over the censoring interval, conditioned on entry (left-truncation via
+    ``entry_bucket``). For a point event ``L_u = R_u - 1`` this reduces to the
+    exact :func:`censored_log_likelihood` event term; for a wide interval it
+    correctly integrates the onset uncertainty instead of pinning it to one
+    bucket. Returns the per-unit log-likelihood, shape ``(B,)``.
+    """
+    h = np.clip(np.asarray(h, dtype=np.float64), eps, 1.0)
+    q = np.clip(np.asarray(q, dtype=np.float64), eps, 1.0)
+    left = np.asarray(left_bucket, dtype=np.int64)
+    right = np.asarray(right_bucket, dtype=np.int64)
+    b, m = q.shape
+    if entry_bucket is None:
+        entry = np.ones(b, dtype=np.int64)
+    else:
+        entry = np.clip(np.asarray(entry_bucket, dtype=np.int64), 1, m)
+    cause = None if cause_index is None else np.asarray(cause_index, dtype=np.int64)
+
+    s_full = survival_from_q(q)  # S(r), (B, M)
+    ones = np.ones((b, 1), dtype=np.float64)
+    s_prev = np.concatenate([ones, s_full[:, :-1]], axis=1)  # S(r-1), (B, M)
+    # entry-conditioned survival: divide by S(E-1) so the product starts at entry.
+    rows = np.arange(b)
+    s_entry = np.where(entry > 1, s_full[rows, np.clip(entry - 2, 0, m - 1)], 1.0)
+    s_prev_cond = s_prev / np.clip(s_entry[:, None], eps, None)
+
+    bucket_ix = np.arange(1, m + 1)[None, :]  # 1-based
+    in_interval = (bucket_ix > left[:, None]) & (bucket_ix <= right[:, None]) & (
+        bucket_ix >= entry[:, None]
+    )
+    if cause is None:
+        h_r = h.sum(axis=-1)  # all-cause per-bucket hazard (B, M)
+    else:
+        col = np.clip(cause, 0, h.shape[-1] - 1)[:, None]
+        h_r = h[rows[:, None], np.arange(m)[None, :], col]
+    increments = s_prev_cond * h_r  # (B, M)
+    mass = np.sum(np.where(in_interval, increments, 0.0), axis=1)
+    return np.log(np.clip(mass, eps, 1.0))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -335,10 +409,12 @@ class CauseSpecificHazardModel:
         event_bucket: np.ndarray,
         cause_index: np.ndarray,
         observed: np.ndarray,
+        entry_bucket: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Right-censored batch log-likelihood (doc U Eq4).
+        """Right-censored (optionally left-truncated) batch LL (doc U Eq4).
 
         ``features`` has shape ``(B, M, d)``; the labels are per-unit arrays.
+        ``entry_bucket`` (optional) supplies the left-truncation entry bucket.
         """
         eta = self.logits(features)  # (B, M, K)
         h, q = hazards_from_logits(eta)
@@ -348,7 +424,82 @@ class CauseSpecificHazardModel:
             event_bucket=event_bucket,
             cause_index=cause_index,
             observed=observed,
+            entry_bucket=entry_bucket,
         )
+
+    # -- training ------------------------------------------------------------
+    def fit_censored(
+        self,
+        features: np.ndarray,
+        *,
+        event_bucket: np.ndarray,
+        cause_index: np.ndarray,
+        observed: np.ndarray,
+        lr: float = 0.05,
+        n_steps: int = 200,
+        l2: float = 1e-3,
+        eps: float = 1e-6,
+    ) -> CauseSpecificHazardModel:
+        """Fit ``coef``/``intercept`` by maximizing the censored log-likelihood.
+
+        Replaces the all-zero head with parameters trained on labelled
+        (right-censored) competing-risks data (doc U Eq4). The objective is the
+        mean per-unit censored log-likelihood with a small L2 ridge; the gradient
+        is obtained by central finite differences over the (K·d + K) parameters,
+        which is exact-to-machine-precision at demo-pod head sizes (K ∈ {1, 2},
+        small d) and keeps the module pure-NumPy with zero autodiff dependency.
+
+        ``features`` has shape ``(B, M, d)``; the labels are per-unit arrays. The
+        fit is in-place (``self`` is mutated and returned) so a backend may call
+        it on a labelled replay split and then serve the trained head directly.
+        """
+        features = np.asarray(features, dtype=np.float64)
+
+        def neg_ll(coef: np.ndarray, intercept: np.ndarray) -> float:
+            eta = features @ coef.T + intercept
+            h, q = hazards_from_logits(eta)
+            ll = censored_log_likelihood(
+                h,
+                q,
+                event_bucket=event_bucket,
+                cause_index=cause_index,
+                observed=observed,
+            )
+            ridge = l2 * (float(np.sum(coef * coef)) + float(np.sum(intercept**2)))
+            return -float(np.mean(ll)) + ridge
+
+        coef = self.coef.copy()
+        intercept = self.intercept.copy()
+        for _ in range(n_steps):
+            base = neg_ll(coef, intercept)
+            g_coef = np.zeros_like(coef)
+            for i in range(coef.shape[0]):
+                for j in range(coef.shape[1]):
+                    cp = coef.copy()
+                    cp[i, j] += eps
+                    cm = coef.copy()
+                    cm[i, j] -= eps
+                    g_coef[i, j] = (neg_ll(cp, intercept) - neg_ll(cm, intercept)) / (
+                        2.0 * eps
+                    )
+            g_int = np.zeros_like(intercept)
+            for i in range(intercept.shape[0]):
+                ip = intercept.copy()
+                ip[i] += eps
+                im = intercept.copy()
+                im[i] -= eps
+                g_int[i] = (neg_ll(coef, ip) - neg_ll(coef, im)) / (2.0 * eps)
+            new_coef = coef - lr * g_coef
+            new_int = intercept - lr * g_int
+            if neg_ll(new_coef, new_int) > base + 1e-12:
+                lr *= 0.5  # backtrack on a non-improving step
+                if lr < 1e-6:
+                    break
+                continue
+            coef, intercept = new_coef, new_int
+        self.coef = coef
+        self.intercept = intercept
+        return self
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -393,6 +544,7 @@ __all__ = [
     "cumulative_incidence",
     "device_health_hazard_prior",
     "hazards_from_logits",
+    "interval_censored_log_likelihood",
     "logits_from_hazards",
     "survival_from_q",
 ]

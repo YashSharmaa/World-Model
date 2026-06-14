@@ -366,6 +366,37 @@ class ObservabilityMonitor:
             weak_directions=weak,
         )
 
+    def covariance_floor(
+        self, report: ObservabilityReport, *, base_floor: float = 1.0
+    ) -> float:
+        """Per-direction variance floor for the weakly-observable subspace (C11).
+
+        The floor scales inversely with the observability (smaller smallest
+        singular value -> larger floor) so the filter retains *more* uncertainty
+        exactly where it can observe least (doc T C11). A filter consuming
+        ``report.weak_directions`` calls its ``floor_weak_directions(weak, floor)``
+        with this value to keep the covariance from collapsing in unobservable
+        directions and to enforce the bounded-gain rule across no-observation gaps.
+        """
+        s = max(report.min_singular_value, self.tol)
+        return float(base_floor / s)
+
+    def bounded_gain_scale(
+        self, n_missed_steps: int, *, half_life: int = 5
+    ) -> float:
+        """Bounded-gain inflation factor across a no-observation gap (doc T C12).
+
+        After ``n_missed_steps`` consecutive steps with no assimilated measurement
+        the predicted covariance must keep growing (the filter cannot become more
+        certain without data). Returns a multiplicative inflation ``>= 1`` that
+        grows toward a saturating cap with the gap length, so the gain on the next
+        observation stays bounded and the bands widen monotonically during a
+        telemetry blackout.
+        """
+        if n_missed_steps <= 0:
+            return 1.0
+        return float(2.0 - 2.0 ** (-n_missed_steps / max(half_life, 1)))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Planner-facing calibration coverage by slice

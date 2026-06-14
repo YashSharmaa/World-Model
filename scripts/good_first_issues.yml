@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  GPU-Center World Model — tracked good-first-issue catalog
+#  Author:  Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+#
+#  SPDX-FileCopyrightText: 2026 Yash Sharma <https://www.linkedin.com/in/yashsharmaa/>
+#  SPDX-License-Identifier: Apache-2.0
+#
+#  The contributor on-ramp (doc H contributor_experience_plan / launch_checklist):
+#  "Seed 10-15 starter issues before launch", "at least one per major area",
+#  and "good first issues avoid private data, production clusters, or deeply
+#  coupled ML internals."
+#
+#  This file is the SOURCE OF TRUTH for those starter issues. It is tracked in git
+#  so the catalog is reviewable, and `scripts/seed_starter_issues.sh` materialises
+#  it into real GitHub issues + labels with the `gh` CLI. Each entry names the
+#  major area it covers, so the "one per area" requirement is auditable here.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The launch label set (doc H labels_and_triage).
+labels:
+  - name: good-first-issue
+    color: "7057ff"
+    description: "Good for newcomers — scoped, no private data or cluster access."
+  - name: help-wanted
+    color: "008672"
+    description: "Extra attention is welcome on this issue."
+  - name: needs-design
+    color: "d4c5f9"
+    description: "Needs a design decision or ADR before implementation."
+  - name: blocked
+    color: "b60205"
+    description: "Blocked on another change, decision, or upstream dependency."
+  - name: "release/v0.1.0"
+    color: "0e8a16"
+    description: "Scoped for the v0.1.0 public proof-of-concept release."
+
+# 12 starter issues, ≥1 per major area. `area` is the major subsystem; `labels`
+# are applied on creation. None require private data or a production cluster.
+issues:
+  - title: "docs: add a worked end-to-end example to the Quickstart"
+    area: docs
+    labels: [good-first-issue, help-wanted]
+    body: |
+      Extend `docs/getting-started/quickstart.md` with a copy-pasteable session
+      that fetches `/state/current`, runs a 3-action compare, and prints the
+      recommended action + why-not. Use the dependency-free reference engine so
+      it runs without MLX or a backend. No private data needed.
+
+  - title: "schema: add a property test for resource conservation on admit_and_place"
+    area: schema
+    labels: [good-first-issue]
+    body: |
+      Add a Hypothesis property under `tests/property/` asserting that a feasible
+      `admit_and_place` conserves total GPU count across the transition (free +
+      allocated is invariant). The exact kernel is the oracle. See CONTRIBUTING
+      for the conservation/gang-atomicity/determinism property requirements.
+
+  - title: "data-engine: add a new synthetic scenario preset (degraded telemetry burst)"
+    area: data_engine
+    labels: [good-first-issue, help-wanted]
+    body: |
+      Add a scenario preset under `scenarios/` that injects a short degraded-
+      telemetry burst on one rack. Wire it into the synthetic generator and add a
+      smoke test that the pack builds. Purely synthetic — no real cluster traces.
+
+  - title: "evaluation: add a report slice for the 5-minute fast-probe horizon"
+    area: evaluation
+    labels: [good-first-issue]
+    body: |
+      The counterfactual track scores 15/30/60-minute targets plus a 5-minute
+      probe. Add a reported slice that surfaces the 5-minute-probe metrics
+      separately in the Markdown report. Reuse `evaluation.slice_defs`; do not
+      change the runner's public signatures.
+
+  - title: "benchmarks: add a second counterfactual window to the demo pack"
+    area: benchmarks
+    labels: [good-first-issue, help-wanted]
+    body: |
+      Extend `scripts/build_benchmark_packs.py` to emit one more
+      counterfactual_rollout window (a different topology family) and refresh the
+      pack with `python scripts/build_benchmark_packs.py`. Confirm
+      `benchmarks/counterfactual_rollout/score.py` still scores it.
+
+  - title: "web: add a keyboard shortcut to toggle the why-not card"
+    area: web
+    labels: [good-first-issue]
+    body: |
+      In the three.js Decision Studio (`apps/web`), add a keyboard shortcut (e.g.
+      `w`) that opens/closes the why-not card for the focused blocked branch.
+      Add a Playwright assertion under `tests/frontend_e2e/`. UI-only, no backend.
+
+  - title: "serving: add a /healthz field for the loaded benchmark pack id"
+    area: serving
+    labels: [good-first-issue, help-wanted]
+    body: |
+      Extend the `/healthz` response DTO with the currently loaded replay/pack
+      identifier (nullable). Keep the existing fields byte-stable (add only) and
+      update `docs/api/rest.md`. Unit-test the handler without FastAPI.
+
+  - title: "planner: document the lexicographic key levels in the planner docstring"
+    area: planner
+    labels: [good-first-issue, needs-design]
+    body: |
+      The planner ranks over the safe set with a lexicographic key (hard safety →
+      statistical safety → p95 queue wait → GPU-hours → locality → fragmentation).
+      Add a clear docstring + a docs table enumerating the levels. Docs/comment
+      only — do not change ranking behaviour.
+
+  - title: "uncertainty: add a unit test for conformal-upper monotonicity"
+    area: uncertainty
+    labels: [good-first-issue]
+    body: |
+      Add a unit test asserting the hazard channel's conformal-upper bound is
+      monotone non-decreasing in the nominal coverage level. Use the existing
+      public scoring helpers; no model training required.
+
+  - title: "reliability: add a changepoint-detector smoke test on a synthetic step"
+    area: reliability
+    labels: [good-first-issue, help-wanted]
+    body: |
+      Add a smoke test feeding a synthetic step-change signal to the reliability
+      changepoint surveillance and asserting it flags the step within a bounded
+      delay. Synthetic input only.
+
+  - title: "ci: add an editorconfig check step to the lint job"
+    area: ci
+    labels: [good-first-issue]
+    body: |
+      Add a lightweight `.editorconfig` consistency check (e.g. `editorconfig-checker`)
+      as a non-blocking step. Keep it best-effort so it never breaks a contributor
+      PR. Touches `.github/workflows/` only.
+
+  - title: "fairness: add a docs page sketching the v2 DRF/PF/NBS ranking objective"
+    area: fairness
+    labels: [good-first-issue, needs-design]
+    body: |
+      Write a short `docs/` page outlining the planned v2 fairness layer (DRF /
+      PF / NBS over the safe set) and how it would compose with the lexicographic
+      key WITHOUT weakening the safety gate. Docs only; this is a design sketch.

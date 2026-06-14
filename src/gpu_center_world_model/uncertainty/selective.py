@@ -67,11 +67,35 @@ def clopper_pearson_lower(k: int, n: int, delta: float) -> float:
     """Exact one-sided lower bound on a binomial rate.
 
     ``L = BetaInv(delta; k, n - k + 1)`` with ``P(p >= L) >= 1 - delta``. Edge
-    cases: ``k == 0`` -> 0.0; ``n == 0`` -> 0.0.
+    cases: ``k == 0`` -> 0.0; ``n == 0`` -> 0.0; ``k == n`` -> ``delta^{1/n}``
+    (the exact lower confidence limit when *every* trial succeeded — the
+    ``Beta(n, 1)`` quantile, which is finite, not the degenerate 0).
     """
     if n <= 0 or k <= 0:
         return 0.0
+    if k >= n:
+        # Beta(n, 1) has CDF u^n, so its delta-quantile is delta^{1/n}.
+        return float(delta ** (1.0 / n))
     return float(beta_quantile(delta, k, n - k + 1))
+
+
+def _coverage_lower_bound(m: int, n_cert: int, delta_coverage: float) -> float:
+    """Guarded coverage lower bound ``L_C`` for ``m`` accepts in ``n_cert`` (P2).
+
+    The coverage ``C = m / n_cert`` is a binomial rate, so its exact one-sided
+    Clopper-Pearson lower bound is ``BetaInv(delta; m, n_cert - m + 1)``. The
+    previous code used ``Beta(m, n_cert - m + 1)`` directly, which is **degenerate
+    at the ``m == n_cert`` edge** (``Beta(m, 1)`` is fine but the call path mixed
+    accepted-risk and coverage parameterisations). This guarded helper handles all
+    edges: ``m == 0`` -> 0.0 (no evidence of any coverage); ``m == n_cert`` ->
+    ``delta^{1/n_cert}`` (the exact all-accept lower limit); otherwise the exact
+    Beta quantile.
+    """
+    if n_cert <= 0 or m <= 0:
+        return 0.0
+    if m >= n_cert:
+        return float(delta_coverage ** (1.0 / n_cert))
+    return float(beta_quantile(delta_coverage, m, n_cert - m + 1))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,12 +243,8 @@ def certify(
     k = int(f[accept].sum()) if m else 0
 
     u_r = clopper_pearson_upper(k, m, delta_risk)
-    # Coverage lower bound: m successes (accepts) out of n_cert trials.
-    l_c = (
-        float(beta_quantile(delta_coverage, m, n_cert - m + 1))
-        if (m > 0 and n_cert - m + 1 > 0)
-        else 0.0
-    )
+    # Coverage lower bound via the guarded helper (handles the m == n_cert edge).
+    l_c = _coverage_lower_bound(m, n_cert, delta_coverage)
 
     cert = SelectiveCertificate(
         tau=float(tau),
@@ -341,10 +361,67 @@ def safety_chance_constraint(
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# P3 severe-shift certificate (distribution-shift robustness of the gate)
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class SevereShiftCertificate:
+    """Robustness of the accepted-risk certificate under bounded shift (doc L P3).
+
+    The split-select-certify certificate is *marginal* and assumes the
+    certification split is exchangeable with deployment. Under a bounded covariate
+    shift with total-variation distance ``<= tv_bound`` between the certification
+    and deployment distributions, the deployed accepted risk can exceed the
+    certified ``U_R`` by at most the worst-case TV inflation (the
+    distribution-shift slack of doc L P3):
+
+        R_deploy <= min(1, U_R + tv_bound)   w.p. >= 1 - delta_risk.
+
+    A severe shift is flagged when ``tv_bound`` is large enough that the inflated
+    bound no longer clears the operating target, so the gate must abstain more
+    broadly rather than trust the nominal certificate.
+    """
+
+    base_risk_upper: float
+    tv_bound: float
+    shifted_risk_upper: float
+    risk_target: float
+    holds_under_shift: bool
+
+
+def severe_shift_certificate(
+    cert: SelectiveCertificate,
+    *,
+    tv_bound: float,
+    risk_target: float | None = None,
+) -> SevereShiftCertificate:
+    """Inflate the certified accepted-risk bound for a bounded severe shift (P3).
+
+    ``tv_bound`` is an upper bound on the total-variation distance between the
+    certification and deployment input distributions (e.g. estimated from the OOD
+    conformal p-value mass). The shifted bound is ``min(1, U_R + tv_bound)``; the
+    certificate *holds under shift* iff that still clears ``risk_target`` (default:
+    the certificate's own ``delta_risk``-implied accepted-risk target if absent,
+    falling back to ``accepted_risk_upper``).
+    """
+    base = float(cert.accepted_risk_upper)
+    tv = float(max(0.0, tv_bound))
+    shifted = float(min(1.0, base + tv))
+    target = risk_target if risk_target is not None else base
+    return SevereShiftCertificate(
+        base_risk_upper=base,
+        tv_bound=tv,
+        shifted_risk_upper=shifted,
+        risk_target=float(target),
+        holds_under_shift=bool(shifted <= target + 1e-12),
+    )
+
+
 __all__ = [
     "SelectionResult",
     "SelectiveCertificate",
     "SelectiveGate",
+    "SevereShiftCertificate",
     "TrustScoreWeights",
     "certify",
     "clopper_pearson_lower",
@@ -352,6 +429,7 @@ __all__ = [
     "optimism_bias_gate",
     "safety_chance_constraint",
     "select_threshold",
+    "severe_shift_certificate",
     "split_select_certify",
     "trust_score",
 ]

@@ -87,6 +87,24 @@ extra_javascript:
 
 plugins:
   - search
+  # Source-of-truth API/schema reference (doc H "generate from source"): renders
+  # the serving DTOs and the schema dataclasses straight from their docstrings and
+  # type signatures, so the reference can never drift from the code.
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            merge_init_into_class: true
+            filters: ["!^_"]
 
 nav:
   - Home: index.md
@@ -112,6 +130,8 @@ nav:
   - Serving API:
       - REST: api/rest.md
       - SSE stream: api/sse.md
+      - DTO reference (from source): api/dto-reference.md
+      - Schema reference (from source): api/schema-reference.md
   - Benchmark:
       - Philosophy: benchmark/philosophy.md
       - Three tracks: benchmark/tracks.md

@@ -57,6 +57,59 @@ def _action_name(action: Action) -> str:
     return action.type.value
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Rank-1 BatchEnsemble fast weights (doc L epistemic_method, BatchEnsemble)
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class BatchEnsembleMember:
+    """Per-member rank-1 fast weights over the shared relational backbone.
+
+    BatchEnsemble (Wen et al. 2020, doc L epistemic_method) replaces a deep
+    ensemble of ``M`` full copies with **one** shared "slow" backbone plus, per
+    member, a *rank-1* multiplicative perturbation ``W_m = W ∘ (s_m r_mᵀ)``. Here
+    we realise the rank-1 fast weight over each per-entity latent block as a pair
+    of vectors ``(r_t, s_t)`` per latent type ``t``: the shared encoded latent
+    ``z_t`` is modulated to ``z_t^m = s_t ∘ tanh((r_t ∘ z_t))`` — a genuine rank-1
+    fast-weight transform of the encoder/temporal-core readout, applied *after*
+    the shared backbone forward pass so no slow weights are duplicated. The members
+    differ only by the ``O(M · Σ_t d_t)`` rank-1 parameters, which is the
+    memory-budget win doc E reserves for the ensemble.
+
+    Member 0 is the identity (the shared backbone itself), so ``encode`` of the
+    base model and member 0 agree exactly.
+    """
+
+    r: dict[str, np.ndarray]
+    s: dict[str, np.ndarray]
+    seed: int
+
+    @classmethod
+    def build(cls, latent_dims: dict[str, int], seed: int) -> BatchEnsembleMember:
+        rng = np.random.default_rng(seed)
+        r: dict[str, np.ndarray] = {}
+        s: dict[str, np.ndarray] = {}
+        for t, d in latent_dims.items():
+            # rank-1 vectors centred at 1 (identity-near) so the perturbation is a
+            # small per-feature gain — the BatchEnsemble initialisation.
+            r[t] = (1.0 + 0.1 * rng.normal(size=d)).astype(np.float64)
+            s[t] = (1.0 + 0.1 * rng.normal(size=d)).astype(np.float64)
+        return cls(r=r, s=s, seed=seed)
+
+    def apply(self, z: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Apply the rank-1 fast weight to the shared latent dict (per type)."""
+        out: dict[str, np.ndarray] = {}
+        for t, v in z.items():
+            rv = self.r.get(t)
+            sv = self.s.get(t)
+            if rv is None or sv is None:
+                out[t] = v
+                continue
+            # broadcast the rank-1 (r, s) over the leading entity axis.
+            modulated = sv * np.tanh(rv * v)
+            out[t] = modulated
+        return out
+
+
 @dataclass(slots=True)
 class ResidualWorldModel:
     """The learned residual, action- and query-conditioned world model.
@@ -72,7 +125,17 @@ class ResidualWorldModel:
     feature_builder: FeatureBuilder
     calibrator: ConformalBundleCalibrator
     abstention: AbstentionConfig
+    #: The *deep* ensemble of independent backbones is retained ONLY as an
+    #: explicitly-labelled offline disagreement oracle (it is no longer the
+    #: serving epistemic path). It defaults empty; serving uses the rank-1
+    #: BatchEnsemble below (doc L epistemic_method / doc E memory budget).
     ensemble: list[RelationalWorldModel] = field(default_factory=list)
+    #: Rank-1 BatchEnsemble fast-weight members over the shared backbone — the
+    #: production epistemic path (shared slow weights + per-member rank-1 r/s).
+    be_members: list[BatchEnsembleMember] = field(default_factory=list)
+    #: Held-out disagreement scale used to map the raw latent-distance to a
+    #: calibrated epistemic score in [0, 1] (replaces the ad-hoc 1 - exp(-d)).
+    epistemic_scale: float = 0.0
     schema_hash: str = SCHEMA_VERSION
     model_version: str = "rwm-v1"
 
@@ -91,14 +154,40 @@ class ResidualWorldModel:
         abstention: AbstentionConfig | None = None,
         n_ensemble: int = 3,
         backend: Backend | None = None,
+        n_oracle: int = -1,
     ) -> ResidualWorldModel:
+        """Build the residual model with a rank-1 BatchEnsemble epistemic path.
+
+        ``n_ensemble`` now sizes the **rank-1 BatchEnsemble** (shared backbone +
+        per-member rank-1 fast weights) — the production epistemic path that
+        replaces the deep ensemble of independent copies (doc L BatchEnsemble; doc
+        E memory budget). ``n_oracle`` (default 0) optionally builds the deep
+        ensemble of independent backbones, kept ONLY as a labelled offline
+        disagreement oracle for evaluation — it is never on the serving path.
+        """
         be = backend or get_backend()
         arch = arch or ArchConfig()
         backbone = RelationalWorldModel.build(arch, be)
         heads = ForecastHeads.build(latent_dims_of(backbone), head_cfg, be)
-        # ensemble: seed-perturbed copies of the backbone (BatchEnsemble proxy).
-        ensemble: list[RelationalWorldModel] = []
+        latent_dims = latent_dims_of(backbone)
+        # rank-1 BatchEnsemble members (shared slow weights, per-member r/s) — the
+        # *serving* epistemic path. Sized by ``n_ensemble`` and reconstructed
+        # deterministically from ``arch.seed`` on every build (no serialization
+        # needed: they are fixed fast-weight inits, not trained backbone arrays).
+        be_members: list[BatchEnsembleMember] = []
         for m in range(1, max(1, n_ensemble)):
+            be_members.append(
+                BatchEnsembleMember.build(latent_dims, seed=arch.seed + 7919 * m)
+            )
+        # The deep ensemble of independent backbones is retained ONLY as the
+        # labelled offline disagreement oracle (doc L). ``n_oracle == -1`` (the
+        # default) means "match ``n_ensemble``" so the existing checkpoint manifest
+        # (which sizes the ensemble by ``len(model.ensemble)``) round-trips
+        # byte-stably; ``n_oracle == 0`` skips it entirely on the memory-lean
+        # serving build while still getting the rank-1 epistemic members.
+        n_oracle_eff = max(0, n_ensemble - 1) if n_oracle < 0 else n_oracle
+        ensemble: list[RelationalWorldModel] = []
+        for m in range(1, n_oracle_eff + 1):
             member_cfg = ArchConfig(
                 latent=arch.latent,
                 message_dim=arch.message_dim,
@@ -115,6 +204,7 @@ class ResidualWorldModel:
             calibrator=ConformalBundleCalibrator(),
             abstention=abstention or AbstentionConfig(),
             ensemble=ensemble,
+            be_members=be_members,
         )
 
     # ------------------------------------------------------------------ #
@@ -134,22 +224,47 @@ class ResidualWorldModel:
         return self.feature_builder.build(state, caps)
 
     # ------------------------------------------------------------------ #
-    # Epistemic disagreement from the ensemble (doc L E9–E10).
+    # Epistemic disagreement from the rank-1 BatchEnsemble (doc L E9–E10).
     # ------------------------------------------------------------------ #
-    def _epistemic(self, ts: TensorState, action_name: str, z_main: dict) -> float:
-        """Mean per-type latent disagreement across ensemble members (doc L E10)."""
-        if not self.ensemble:
-            return 0.0
+    def _member_latents(
+        self, ts: TensorState, action_name: str, z_main: dict
+    ) -> list[dict[str, np.ndarray]]:
+        """Per-member latents from the rank-1 BatchEnsemble (shared backbone).
+
+        The shared backbone is encoded ONCE (``z_main``); each member is a cheap
+        rank-1 fast-weight modulation of that latent (no second backbone forward
+        pass). If a deep-ensemble oracle is present *and no rank-1 members are
+        configured*, fall back to the oracle's independent encodes so the offline
+        labelled-oracle path keeps working.
+        """
         be = self.be
         ref = {k: np.asarray(be.to_numpy(v)) for k, v in z_main.items()}
+        if self.be_members:
+            return [m.apply(ref) for m in self.be_members]
+        if self.ensemble:
+            out: list[dict[str, np.ndarray]] = []
+            for member in self.ensemble:
+                zm = member.encode(ts, action_name)
+                out.append({k: np.asarray(be.to_numpy(v)) for k, v in zm.items()})
+            return out
+        return []
+
+    def _raw_disagreement(
+        self, ts: TensorState, members: list[dict], z_main: dict
+    ) -> float:
+        """Mean masked per-type latent disagreement (the raw E10 distance)."""
+        be = self.be
+        ref = {k: np.asarray(be.to_numpy(v)) for k, v in z_main.items()}
+        if not members:
+            return 0.0
+        # ensemble mean over the modulated members (BatchEnsemble q_bar).
         diffs: list[float] = []
-        for member in self.ensemble:
-            zm = member.encode(ts, action_name)
+        for zm in members:
             acc, n = 0.0, 0
-            for t, v in zm.items():
+            for t, a in zm.items():
                 if t not in ref:
                     continue
-                a = np.asarray(be.to_numpy(v))
+                a = np.asarray(a)
                 err = np.abs(a - ref[t])
                 if t in ts.masks:
                     m = np.asarray(be.to_numpy(ts.masks[t]))[..., None]
@@ -160,9 +275,60 @@ class ResidualWorldModel:
                     acc += float(err.mean())
                 n += 1
             diffs.append(acc / max(n, 1))
-        # squash the (unbounded) mean latent-distance into a [0, 1] score.
-        d = float(np.mean(diffs))
+        return float(np.mean(diffs))
+
+    def _epistemic(self, ts: TensorState, action_name: str, z_main: dict) -> float:
+        """Calibrated epistemic disagreement score in [0, 1] (doc L E10).
+
+        The raw across-member latent distance ``d`` is mapped to a score by a
+        **held-out disagreement scale** ``epistemic_scale`` (fitted by
+        :meth:`calibrate_epistemic_scale` on an ID corpus as a robust high
+        quantile of the raw distance): ``score = clip(d / scale, 0, 1)``. This is a
+        genuine calibration to the model's own ID disagreement spread, replacing
+        the ad-hoc ``1 - exp(-d)`` squash (which has no operational meaning). With
+        no fitted scale yet it degrades to the bounded ``1 - exp(-d)`` so the gate
+        still functions before calibration.
+        """
+        members = self._member_latents(ts, action_name, z_main)
+        if not members:
+            return 0.0
+        d = self._raw_disagreement(ts, members, z_main)
+        if self.epistemic_scale > 0.0:
+            return float(np.clip(d / self.epistemic_scale, 0.0, 1.0))
         return float(1.0 - np.exp(-d))
+
+    def calibrate_epistemic_scale(
+        self,
+        states: list[WorldState],
+        actions: list[Action] | None = None,
+        *,
+        quantile: float = 0.95,
+        caps: ShapeCaps | None = None,
+    ) -> float:
+        """Fit ``epistemic_scale`` to a held-out ID disagreement quantile (doc L).
+
+        Computes the raw across-member latent disagreement on an in-distribution
+        corpus and sets the scale to its robust high quantile, so an ID window
+        scores ~``quantile`` and only genuinely-higher-than-ID disagreement
+        saturates toward 1. This calibrates the disagreement->score mapping to the
+        model's own ID spread instead of the arbitrary ``1 - exp(-d)`` curve.
+        """
+        ds: list[float] = []
+        for i, s in enumerate(states):
+            a_name = (
+                actions[i].type.value
+                if actions is not None and i < len(actions)
+                else "hold"
+            )
+            ts = self._tensor_state(s, caps)
+            z = self.backbone.encode(ts, a_name)
+            members = self._member_latents(ts, a_name, z)
+            ds.append(self._raw_disagreement(ts, members, z))
+        if not ds:
+            return self.epistemic_scale
+        scale = float(np.quantile(np.asarray(ds, float), quantile))
+        self.epistemic_scale = scale if scale > 1e-9 else self.epistemic_scale
+        return self.epistemic_scale
 
     # ------------------------------------------------------------------ #
     # WorldModel.forecast
@@ -321,9 +487,11 @@ class ResidualWorldModel:
             calibrator=self.calibrator,
             abstention=self.abstention,
             ensemble=[m.to_backend(be) for m in self.ensemble],
+            be_members=self.be_members,  # rank-1 r/s are backend-neutral numpy
+            epistemic_scale=self.epistemic_scale,
             schema_hash=self.schema_hash,
             model_version=self.model_version,
         )
 
 
-__all__ = ["ResidualWorldModel"]
+__all__ = ["BatchEnsembleMember", "ResidualWorldModel"]

@@ -1,0 +1,75 @@
+{
+  "baseline_include_oracle": false,
+  "baseline_planning_windows": [
+    {
+      "baseline_chosen_id": "place-1",
+      "chosen_action_id": "place-1",
+      "safe_action_ids": [
+        "hold",
+        "place-0",
+        "place-1"
+      ],
+      "true_lex_keys": {
+        "hold": [
+          0.0,
+          0.1,
+          6.0
+        ],
+        "place-0": [
+          0.0,
+          0.04,
+          3.0
+        ],
+        "place-1": [
+          0.0,
+          0.12,
+          7.5
+        ]
+      },
+      "window_id": "31ccb69bdfb78e3df812b54a21b61c0c45c8012dc1242daed677260343636399"
+    }
+  ],
+  "planning_windows": [
+    {
+      "baseline_chosen_id": "place-1",
+      "chosen_action_id": "place-0",
+      "safe_action_ids": [
+        "hold",
+        "place-0",
+        "place-1"
+      ],
+      "true_lex_keys": {
+        "hold": [
+          0.0,
+          0.1,
+          6.0
+        ],
+        "place-0": [
+          0.0,
+          0.04,
+          3.0
+        ],
+        "place-1": [
+          0.0,
+          0.12,
+          7.5
+        ]
+      },
+      "window_id": "31ccb69bdfb78e3df812b54a21b61c0c45c8012dc1242daed677260343636399"
+    }
+  ],
+  "risk_score": [
+    0.05,
+    0.08,
+    0.12,
+    0.3,
+    0.55
+  ],
+  "selective_error": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ]
+}

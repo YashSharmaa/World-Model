@@ -1363,33 +1363,89 @@ def _load_backbone(model: ResidualWorldModel, params: dict[str, np.ndarray]) -> 
 # --------------------------------------------------------------------------- #
 # Calibration stage (doc J C5 / doc L): freeze backbone, fit conformal heads.
 # --------------------------------------------------------------------------- #
+def _calibration_slice_key(window: DecisionWindow, horizon_s: int) -> str:
+    """Doc-L 5-tuple calibration slice key for one decision window.
+
+    The five facets (doc L MondrianConformal): action family, horizon, workload
+    family (median priority band), topology/flavor family (sorted node flavors),
+    and source-health bucket. Rendered as one hashable string so the Mondrian
+    back-off keys are clean. This is the exchangeability bucket the conformal
+    quantile is fitted within (doc L A2 / handoff: calibrate only on action-
+    conditioned decision windows).
+    """
+    x = window.state.symbolic
+    action_fam = window.action.type.value
+    flavors = "+".join(sorted({n.flavor_id for n in x.nodes.values()})) or "none"
+    wls = list(x.workloads.values())
+    if wls:
+        prio = int(np.median([getattr(w, "priority", 0) for w in wls]))
+        wl_fam = f"prio{prio}"
+    else:
+        wl_fam = "default"
+    src = window.state.source
+    bad_tokens = {"bad", "down", "degraded", "stale", "dropped", "delayed", "unhealthy"}
+    sh_bad = any(
+        str(v).lower() in bad_tokens for v in src.collector_health.values()
+    ) or any(p > 0.0 for p in src.channel_missing_prob.values())
+    sh_bucket = "degraded" if sh_bad else "clean"
+    return f"{action_fam}|h{int(horizon_s)}|{wl_fam}|{flavors}|{sh_bucket}"
+
+
 def _fit_calibration(
     model: ResidualWorldModel, windows: Sequence[DecisionWindow], cfg: TrainConfig
 ) -> None:
-    """Fit CQR + one-sided-upper calibrators on held-out windows (doc L).
+    """Fit CQR + per-slice Mondrian calibrators on held-out windows (doc L).
 
-    Uses each window's model forecast as the base quantile band and the realized
-    future (where available) as the calibration target. With no labelled futures
-    the calibrators stay unfitted and pass through unchanged (graceful degrade),
-    which is the honest never-undercover fallback (doc L T1).
+    Calibrates the model forecast band against the **actual branch-simulated
+    counterfactual KPI delta** from the labelled counterfactual table
+    (:func:`_kpi_delta_labels`) — *not* the model's own predicted median (the old
+    self-referential target, which made the conformal layer vacuous). With no
+    labelled futures the calibrators stay unfitted and pass through unchanged (the
+    honest never-undercover fallback, doc L T1).
+
+    In addition to the marginal CQR calibrators, a per-slice
+    :class:`uncertainty.conformal.MondrianConformal` is fitted using the doc-L
+    5-tuple slice key (action, horizon, workload, topology/flavor, source-health)
+    with hierarchical back-off, so serve-time widening is group-conditional (doc L
+    T3). The Mondrian calibrators are attached to ``model.calibrator.mondrian`` for
+    the serving layer to consume.
     """
     from ..schema.kpis import HORIZONS_S
+    from ..uncertainty.conformal import MondrianConformal
 
     cal = model.calibrator
+    # marginal CQR rows + per-slice Mondrian rows keyed by channel/horizon.
     by_channel: dict[tuple[str, int], list[tuple[float, float, float]]] = {}
+    mondrian_rows: dict[
+        tuple[str, int], dict[str, list[float]]
+    ] = {}
+    parent_of: dict[object, object] = {}
     for w in windows:
         if w.future_state is None:
             continue
-        bundle = model.forecast(w.state, w.action, HORIZONS_S[0])
-        for qf in bundle.quantiles:
-            lo = qf.quantiles.get(0.05, 0.0)
-            hi = qf.quantiles.get(0.95, 0.0)
-            # realized target proxy: the median (point) — replace with the true
-            # branch KPI delta when the labelled counterfactual table is present.
-            y = qf.quantiles.get(0.5, 0.0)
-            by_channel.setdefault((qf.channel.value, qf.horizon_s), []).append(
-                (lo, hi, y)
-            )
+        # the labelled, branch-simulated counterfactual KPI deltas (H1 labels).
+        y_labels = _kpi_delta_labels(model, w)
+        if not y_labels:
+            continue
+        for hz in HORIZONS_S:
+            bundle = model.forecast(w.state, w.action, hz)
+            slice_key = _calibration_slice_key(w, hz)
+            parent_of[slice_key] = "|".join(slice_key.split("|")[:3])
+            for qf in bundle.quantiles:
+                key = (qf.channel.value, qf.horizon_s)
+                y = y_labels.get((qf.channel.value, qf.horizon_s))
+                if y is None:
+                    continue
+                lo = qf.quantiles.get(0.05, 0.0)
+                hi = qf.quantiles.get(0.95, 0.0)
+                by_channel.setdefault(key, []).append((lo, hi, float(y)))
+                rows = mondrian_rows.setdefault(
+                    key, {"g": [], "lo": [], "hi": [], "y": []}
+                )
+                rows["g"].append(slice_key)
+                rows["lo"].append(lo)
+                rows["hi"].append(hi)
+                rows["y"].append(float(y))
     for (ch, h), rows in by_channel.items():
         if len(rows) < 3:
             continue
@@ -1397,6 +1453,22 @@ def _fit_calibration(
         hi = np.array([r[1] for r in rows])
         y = np.array([r[2] for r in rows])
         cal.fit_kpi(ch, h, lo, hi, y)
+    # per-slice Mondrian (CQR mode) with hierarchical back-off (doc L T3).
+    mondrian: dict[tuple[str, int], MondrianConformal] = {}
+    for key, rows in mondrian_rows.items():
+        if len(rows["y"]) < 3:
+            continue
+        groups = np.array(rows["g"], dtype=object)
+        mond = MondrianConformal(alpha=0.10, mode="cqr", min_group=8)
+        mond.fit(
+            groups,
+            np.array(rows["y"], float),
+            {"q_lo": np.array(rows["lo"], float), "q_hi": np.array(rows["hi"], float)},
+            parent_of=parent_of,
+        )
+        mondrian[key] = mond
+    if mondrian:
+        cal.mondrian = mondrian
 
 
 # --------------------------------------------------------------------------- #

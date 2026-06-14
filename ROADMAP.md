@@ -26,3 +26,15 @@
 
 **Always deferred for v1:** autonomous production actuation, full-facility CFD,
 photorealistic/video-first modeling.
+
+## Contributor on-ramp (launch checklist)
+Before the public announcement, the milestones, labels, and starter issues are
+live so outside interest has somewhere to go (doc H launch checklist). The
+starter issues are tracked in-repo at
+[`scripts/good_first_issues.yml`](scripts/good_first_issues.yml) — 12 scoped
+issues with at least one per major area, none requiring private data or a
+production cluster — and are materialised into GitHub (with the
+`good-first-issue` / `help-wanted` / `needs-design` / `blocked` / `release/v0.1.0`
+labels) via [`scripts/seed_starter_issues.sh`](scripts/seed_starter_issues.sh).
+See [CONTRIBUTING](CONTRIBUTING.md#good-first-issues) for the first-contribution
+path.

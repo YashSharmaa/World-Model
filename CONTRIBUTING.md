@@ -27,8 +27,21 @@ asked to refactor.
   gang atomicity, and deterministic branching.
 
 ## Good first issues
-Look for `good-first-issue` — typically a new scenario, a new report slice, or a
-UI panel polish. Avoid tasks needing private data or production clusters.
+Look for the [`good-first-issue`](https://github.com/yashsharmaa/gpu-center-world-model/labels/good-first-issue)
+label — typically a new scenario, a new report slice, or a UI panel polish. Avoid
+tasks needing private data or production clusters.
+
+The starter-issue catalog is **tracked in-repo** at
+[`scripts/good_first_issues.yml`](scripts/good_first_issues.yml): 12 issues with
+at least one per major area (docs, schema, data engine, evaluation, benchmarks,
+web, serving, planner, uncertainty, reliability, CI, fairness). Maintainers
+materialise it into real GitHub issues + the launch labels (`good-first-issue`,
+`help-wanted`, `needs-design`, `blocked`, `release/v0.1.0`) with:
+
+```bash
+scripts/seed_starter_issues.sh            # dry run — prints what it would create
+scripts/seed_starter_issues.sh --apply    # create labels + issues (needs `gh auth login`)
+```
 
 ## Code of conduct
 Be kind and constructive. See `CODE_OF_CONDUCT.md`.

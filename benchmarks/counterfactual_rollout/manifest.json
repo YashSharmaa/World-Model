@@ -1,0 +1,47 @@
+{
+  "acceptance_thresholds": {
+    "coverage_band_hi": 0.95,
+    "coverage_band_lo": 0.85,
+    "max_false_safe_rate": 0.0,
+    "max_false_safe_rate_shift": 0.01,
+    "max_optimism_bias": 0.05,
+    "min_abstain_under_shift": 0.8,
+    "min_coverage": 0.6,
+    "min_regret_reduction": 0.15,
+    "min_sign_accuracy": 0.7,
+    "min_sign_accuracy_non_abstained": 0.8
+  },
+  "artifact_requirements": [
+    "seed_registry",
+    "branch_simulator_commit",
+    "provenance_manifest"
+  ],
+  "author": "Yash Sharma",
+  "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+  "branch_simulator_commit": "930d6de8fcb5dd4f1ea8663f1d83ca114092b0d8",
+  "content_hash": "sha256:c188b2385c2f47a8b27f55d9beedff95e3b5e4c73f676c775057919af3a1eaf7",
+  "credit": "Done by Yash Sharma \u2014 https://www.linkedin.com/in/yashsharmaa/",
+  "n_windows": 2,
+  "no_blended_leaderboard_score": true,
+  "pre_action_state_hashes": [
+    "31ccb69bdfb78e3df812b54a21b61c0c45c8012dc1242daed677260343636399"
+  ],
+  "project": "gpu-center-world-model",
+  "schema_version": "1.0.0",
+  "seed_registry": {
+    "trackB-window-cross-rack": 70003,
+    "trackB-window-single-rack": 70004
+  },
+  "seed_streams": [
+    "regime",
+    "arrivals",
+    "phase",
+    "health",
+    "cooling",
+    "operator",
+    "source_health",
+    "network",
+    "telemetry"
+  ],
+  "track": "counterfactual_rollout"
+}

@@ -1,0 +1,62 @@
+{
+  "red_team_cases": {
+    "infeasible_but_tempting_admit_or_place": [
+      {
+        "abstained": true,
+        "case_id": "trackA-infeasible-gang",
+        "emitted_blockers": [
+          "node_capacities",
+          "quota"
+        ],
+        "fell_back": false,
+        "kernel_blockers": [
+          "node_capacities",
+          "quota"
+        ],
+        "kernel_feasible": false,
+        "recommended_action_id": null,
+        "reference_unsafe": true,
+        "scenario": "infeasible_but_tempting_admit_or_place",
+        "triggers_present": [
+          "infeasible_admit_or_place"
+        ]
+      }
+    ]
+  },
+  "safety_judgements": [
+    {
+      "abstained": false,
+      "action_id": "hold",
+      "emitted_blockers": [],
+      "kernel_blockers": [],
+      "kernel_feasible": true,
+      "recommended": false
+    },
+    {
+      "abstained": false,
+      "action_id": "admit-feasible",
+      "emitted_blockers": [
+        "node_capacities"
+      ],
+      "kernel_blockers": [
+        "node_capacities"
+      ],
+      "kernel_feasible": false,
+      "recommended": false
+    },
+    {
+      "abstained": false,
+      "action_id": "admit-infeasible",
+      "emitted_blockers": [
+        "node_capacities",
+        "quota"
+      ],
+      "kernel_blockers": [
+        "node_capacities",
+        "quota"
+      ],
+      "kernel_feasible": false,
+      "recommended": false
+    }
+  ]
+}

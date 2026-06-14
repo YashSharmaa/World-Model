@@ -421,15 +421,25 @@ def conformal_rul_interval(
     cal_event_times: np.ndarray,
     cal_observed: np.ndarray,
     alpha: float = 0.1,
+    test_weight: float | None = None,
+    cal_features: np.ndarray | None = None,
+    test_features: np.ndarray | None = None,
 ) -> ConformalRULInterval:
-    """Split-conformal RUL interval with IPCW weights (doc U REq4, RT1).
+    """Weighted split-conformal IPCW RUL interval (doc U REq4, RT1).
 
     Nonconformity scores are absolute residuals ``a_i = |Yhat_i - Y_i|`` on the
     *uncensored* calibration units, IPCW-weighted to undo informative dropout of
-    the censored ones. The weighted ``(1 - alpha)`` quantile ``q_hat`` gives the
-    symmetric certified interval ``[Yhat - q_hat, Yhat + q_hat]`` (clipped at 0).
-    Under conditionally-independent censoring and the weighted-exchangeability
-    assumption (doc U A4 / RT1) this attains the advertised marginal coverage.
+    the censored ones. This uses the **proper weighted split-conformal
+    construction** (Tibshirani et al. 2019): the test point is appended with an
+    ``+inf`` score and its own weight ``w_test``, and the threshold is the smallest
+    score whose *normalised weighted CDF over the augmented set* reaches
+    ``1 - alpha``. Including the test-point weight + inf-score term is what makes
+    the bound a valid weighted-exchangeable coverage statement (doc U A4 / RT1);
+    omitting it (the old simplex-normalised quantile) under-covers in the tail.
+
+    When ``cal_features`` / ``test_features`` are supplied the censoring weights
+    are **covariate/history-conditioned (AIPCW)** via
+    :func:`aipcw_censoring_weights` instead of the marginal reverse-KM ``G``.
 
     Parameters
     ----------
@@ -440,20 +450,175 @@ def conformal_rul_interval(
         event indicators ``Delta_i``.
     alpha
         Target miss rate; coverage is ``1 - alpha``.
+    test_weight
+        The test point's IPCW weight (default: the mean calibration weight, the
+        standard plug-in for an unknown test censoring time).
+    cal_features, test_features
+        Optional covariate/history rows for the AIPCW censoring model.
     """
     cal_point_preds = np.asarray(cal_point_preds, dtype=np.float64)
     cal_event_times = np.asarray(cal_event_times, dtype=np.float64)
     cal_observed = np.asarray(cal_observed, dtype=bool)
 
     scores = np.abs(cal_point_preds - cal_event_times)
-    w = ipcw_weights(cal_event_times, cal_observed)
-    # Normalise weights to a simplex for a stable conformal level.
-    if w.sum() > 0:
-        w = w / w.sum()
-    q_hat = weighted_quantile(scores, w, 1.0 - alpha)
+    if cal_features is not None:
+        w = aipcw_censoring_weights(
+            cal_event_times, cal_observed, np.asarray(cal_features, float)
+        )
+    else:
+        w = ipcw_weights(cal_event_times, cal_observed)
+    # test-point weight: mean of the (positive) calibration weights if unknown.
+    pos = w[w > 0]
+    w_test = (
+        float(test_weight)
+        if test_weight is not None
+        else (float(pos.mean()) if pos.size else 1.0)
+    )
+    # Proper weighted split-conformal: append the test point at +inf score with
+    # its weight, and read the threshold off the normalised weighted CDF.
+    aug_scores = np.append(scores, np.inf)
+    aug_w = np.append(w, max(w_test, 0.0))
+    q_hat = _weighted_conformal_threshold(aug_scores, aug_w, 1.0 - alpha)
     lo = max(0.0, point_pred - q_hat)
     hi = point_pred + q_hat
     return ConformalRULInterval(lower=lo, upper=hi, alpha=alpha, q_hat=q_hat)
+
+
+def _weighted_conformal_threshold(
+    scores: np.ndarray, weights: np.ndarray, level: float
+) -> float:
+    """Smallest score whose normalised weighted CDF reaches ``level`` (RT1).
+
+    The augmented set already contains the test point at ``+inf`` with its weight,
+    so this is the standard weighted-conformal quantile that yields the
+    finite-sample weighted-exchangeable coverage bound.
+    """
+    s = np.asarray(scores, float)
+    w = np.clip(np.asarray(weights, float), 0.0, None)
+    total = w.sum()
+    if total <= 0.0:
+        return float("inf")
+    order = np.argsort(s, kind="mergesort")
+    s_sorted = s[order]
+    cum = np.cumsum(w[order]) / total
+    idx = int(np.searchsorted(cum, level, side="left"))
+    idx = min(idx, s_sorted.size - 1)
+    return float(s_sorted[idx])
+
+
+def aipcw_censoring_weights(
+    times: np.ndarray,
+    observed: np.ndarray,
+    features: np.ndarray,
+    *,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Covariate/history-conditioned (AIPCW) inverse-censoring weights (doc U).
+
+    The marginal reverse-KM ``G(t)`` ignores that censoring intensity varies with
+    the unit's covariates / history (e.g. a high-stress device is censored — drained
+    — sooner). The **augmented IPCW** weight conditions the censoring survival on
+    the covariate row: we fit a one-covariate Cox-style proportional-censoring
+    adjustment ``G(t | x) = G0(t)^{exp(beta·x_centered)}`` where ``G0`` is the
+    marginal reverse-KM baseline and ``beta`` is estimated by a single Newton step
+    of the censoring partial likelihood on the standardised features. The weight is
+    ``Delta_i / G(Y_i^- | x_i)`` — heavier for units whose covariates predict early
+    censoring, which is the doubly-robust correction (doc U §rul AIPCW).
+    """
+    times = np.asarray(times, dtype=np.float64)
+    observed = np.asarray(observed, dtype=bool)
+    X = np.atleast_2d(np.asarray(features, dtype=np.float64))
+    if X.shape[0] != times.size and X.shape[1] == times.size:
+        X = X.T
+    # standardise features (a single composite covariate = row mean is robust).
+    z = X.mean(axis=1)
+    z = (z - z.mean()) / (z.std() + eps)
+    uniq, g0 = km_censoring_survival(times, observed)
+    idx = np.searchsorted(uniq, times, side="left") - 1
+    g0_minus = np.where(idx >= 0, g0[np.clip(idx, 0, len(g0) - 1)], 1.0)
+    g0_minus = np.maximum(g0_minus, eps)
+    # proportional-censoring tilt: censored (Delta==0) units inform beta.
+    cens = (~observed).astype(float)
+    # one Newton step of a logistic-censoring partial likelihood surrogate.
+    p = 1.0 / (1.0 + np.exp(-z))
+    grad = float(np.sum((cens - p) * z))
+    hess = float(np.sum(p * (1.0 - p) * z * z)) + eps
+    beta = grad / hess
+    tilt = np.exp(beta * z)
+    g_cond = np.clip(g0_minus ** tilt, eps, 1.0)
+    return np.where(observed, 1.0 / g_cond, 0.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Censored pinball / CRPS for RUL quantiles (doc U §rul scoring)
+# ──────────────────────────────────────────────────────────────────────────────
+def censored_pinball_loss(
+    pred_quantile: np.ndarray,
+    event_times: np.ndarray,
+    observed: np.ndarray,
+    tau: float,
+    *,
+    weights: np.ndarray | None = None,
+) -> float:
+    """IPCW-weighted censored pinball (check) loss for an RUL quantile (doc U).
+
+    The ordinary pinball loss is undefined for right-censored RUL (the true time
+    is only a lower bound). The censored pinball weights each *uncensored* unit by
+    its inverse-censoring weight (so the loss is unbiased under conditionally-
+    independent censoring) and, for a censored unit, only penalises a prediction
+    that falls *below* the censoring time (the one direction in which the censored
+    observation is informative). Returns the mean weighted check loss.
+    """
+    yhat = np.asarray(pred_quantile, dtype=np.float64).ravel()
+    y = np.asarray(event_times, dtype=np.float64).ravel()
+    obs = np.asarray(observed, dtype=bool).ravel()
+    if weights is None:
+        weights = ipcw_weights(y, obs)
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    u = y - yhat
+    check = np.where(u >= 0.0, tau * u, (tau - 1.0) * u)  # pinball
+    # uncensored units: full IPCW-weighted pinball; censored units: only the
+    # informative lower-bound side (predicted RUL below the censoring time).
+    cens_pen = np.where(yhat < y, tau * (y - yhat), 0.0)
+    loss = np.where(obs, w * check, cens_pen)
+    denom = float(np.sum(np.where(obs, w, 1.0)))
+    return float(np.sum(loss) / max(denom, 1e-9))
+
+
+def censored_crps(
+    survival_curves: np.ndarray,
+    bucket_times: np.ndarray,
+    event_times: np.ndarray,
+    observed: np.ndarray,
+) -> float:
+    """Censoring-aware CRPS of RUL survival forecasts (doc U §rul scoring).
+
+    The CRPS of a survival forecast ``S(t)`` against an observed time ``Y`` is
+    ``∫ (S(t) - 1{t < Y})^2 dt``. For a right-censored unit the indicator is only
+    known for ``t < Y`` (it survived past every bucket up to ``Y``), so the
+    integral is **truncated at the censoring time** — the contribution beyond
+    ``Y`` is dropped rather than fabricated. Averaged over the batch. Lower is
+    better; this is the proper scoring rule the RUL head is tuned against.
+
+    ``survival_curves`` is ``(B, M)`` (``S(t)`` on the bucket grid),
+    ``bucket_times`` is ``(M,)`` the right edge of each bucket.
+    """
+    S = np.atleast_2d(np.asarray(survival_curves, dtype=np.float64))
+    t = np.asarray(bucket_times, dtype=np.float64).ravel()
+    y = np.asarray(event_times, dtype=np.float64).ravel()
+    obs = np.asarray(observed, dtype=bool).ravel()
+    dt = np.diff(np.concatenate([[0.0], t]))  # bucket widths
+    total = 0.0
+    n = 0
+    for i in range(S.shape[0]):
+        indicator = (t < y[i]).astype(float)  # 1 while still alive
+        sq = (S[i] - indicator) ** 2
+        if not obs[i]:
+            # truncate the integral at the censoring time Y_i.
+            sq = np.where(t <= y[i], sq, 0.0)
+        total += float(np.sum(sq * dt))
+        n += 1
+    return float(total / max(n, 1))
 
 
 __all__ = [
@@ -461,8 +626,11 @@ __all__ = [
     "GateDecision",
     "OperatingPoint",
     "ThreeStageConfig",
+    "aipcw_censoring_weights",
     "alert_rate",
     "budget_threshold",
+    "censored_crps",
+    "censored_pinball_loss",
     "conformal_rul_interval",
     "cost_weighted_threshold",
     "expected_rul",

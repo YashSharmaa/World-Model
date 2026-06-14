@@ -42,10 +42,39 @@ from ..schema.state import SourceState, WorldState
 
 __all__ = [
     "AbstainDecision",
+    "ReliabilityAbstainSignals",
     "aggregate_abstention",
     "observation_integrity_bad_prob",
     "should_abstain",
+    "should_abstain_with_reliability",
 ]
+
+
+@dataclass(slots=True)
+class ReliabilityAbstainSignals:
+    """Wired reliability + OOD signals feeding the abstention gate (doc U/L).
+
+    Built from the serving forecast-signal engine (``forecast_signals.py``) so the
+    planner gate consumes the *real* quiet-failure integrity posterior, the OOD
+    conformal p-value / BH-FDR flag, and the changepoint -> SPRT confirmation
+    chain — not a hardcoded heuristic. All fields are optional; a ``None`` value
+    means that signal is unavailable for this candidate and is skipped.
+    """
+
+    #: observation-integrity posterior u_t (doc U §QF), higher = worse.
+    integrity_u: float | None = None
+    #: hard quiet-failure trigger from the integrity posterior.
+    quiet_failure: bool = False
+    #: OOD conformal p-value (small = novel) and its BH-FDR rejection flag.
+    ood_pvalue: float | None = None
+    ood_flagged: bool = False
+    #: changepoint -> SPRT confirmation chain (a confirmed change abstains).
+    changepoint_alarm: bool = False
+    sprt_confirmed: bool = False
+    #: BOCPD recent-changepoint posterior mass (run-length-1 probability).
+    bocpd_recent_cp_prob: float | None = None
+    #: hazard channels isolated as anomalous under BH-FDR (doc U §3).
+    isolated_channels: tuple[str, ...] = ()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -168,6 +197,78 @@ def should_abstain(
         source_bad_prob=source_bad_prob,
         model_flagged=model_flagged,
     )
+
+
+def should_abstain_with_reliability(
+    bundle: KPIForecastBundle,
+    cfg: AbstentionConfig,
+    source_bad_prob: float,
+    reliability: ReliabilityAbstainSignals | None = None,
+) -> AbstainDecision:
+    """Abstention gate enriched with the wired reliability + OOD signals.
+
+    Extends :func:`should_abstain` with the doc-U/L reliability chain. Order of
+    checks (first hit wins): model-flagged -> quiet-failure integrity -> SPRT-
+    confirmed changepoint -> OOD conformal/FDR flag -> epistemic -> classical OOD
+    score -> degraded observation integrity. Every added check can only *cause*
+    abstention (it never makes an action look safer), so the kernel safe set is
+    never expanded (doc M / G1).
+
+    Falls back to the classical :func:`should_abstain` when ``reliability`` is
+    ``None``, so existing callers keep byte-stable behaviour.
+    """
+    base = should_abstain(bundle, cfg, source_bad_prob)
+    if reliability is None or base.abstain:
+        return base
+
+    epi = base.epistemic
+    ood = base.ood
+    # Quiet-failure integrity posterior (doc U §QF): a rising latent-fault belief
+    # under degraded telemetry abstains before any direct fault indicator fires.
+    kappa_obs = getattr(cfg, "max_source_health_bad_prob", 0.5)
+    if reliability.quiet_failure or (
+        reliability.integrity_u is not None and reliability.integrity_u > kappa_obs
+    ):
+        return AbstainDecision(
+            abstain=True,
+            reason=(
+                "quiet_failure_integrity "
+                f"{(reliability.integrity_u or 1.0):.3f} > {kappa_obs:.3f}"
+            ),
+            epistemic=epi,
+            ood=ood,
+            source_bad_prob=source_bad_prob,
+            model_flagged=False,
+        )
+    # Changepoint -> SPRT confirmation chain (doc U §3): a *confirmed* regime
+    # change in the residual stream abstains.
+    if reliability.sprt_confirmed:
+        return AbstainDecision(
+            abstain=True,
+            reason="changepoint_sprt_confirmed",
+            epistemic=epi,
+            ood=ood,
+            source_bad_prob=source_bad_prob,
+            model_flagged=False,
+        )
+    # OOD conformal / BH-FDR flag (doc L ood_detection): a window flagged
+    # out-of-support by the conformal novelty test abstains.
+    if reliability.ood_flagged or (
+        reliability.ood_pvalue is not None
+        and reliability.ood_pvalue <= getattr(cfg, "ood_pvalue_alpha", 0.05)
+    ):
+        return AbstainDecision(
+            abstain=True,
+            reason=(
+                "ood_conformal_flag "
+                f"p={(reliability.ood_pvalue or 0.0):.3f}"
+            ),
+            epistemic=epi,
+            ood=ood,
+            source_bad_prob=source_bad_prob,
+            model_flagged=False,
+        )
+    return base
 
 
 def aggregate_abstention(

@@ -14,7 +14,12 @@
 #
 #  We avoid `macos-latest` deliberately: GitHub is migrating that label to
 #  macos-26 starting 2026-06-15, so a pinned label keeps CI reproducible.
-#  Actions are pinned by major version.
+#
+#  Supply-chain (doc H "Pin GitHub Actions by SHA"): every `uses:` is pinned to a
+#  full 40-char commit SHA with the human-readable version in a trailing comment.
+#  Dependabot (github-actions ecosystem) bumps the SHA + comment together. Pinning
+#  the immutable commit — not a movable tag — is the mitigation for a re-tagged or
+#  compromised action.
 # ─────────────────────────────────────────────────────────────────────────────
 name: ci
 
@@ -46,10 +51,10 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -83,6 +88,18 @@ jobs:
           python scripts/validate_schemas.py
           python -m pytest -ra -q scripts/test_repro_gates.py
 
+      # Doc F benchmark_release_plan: the three released benchmark packs
+      # (semantics / counterfactual_rollout / safe_action_selection) must stay
+      # regenerable from the deterministic generator, and the official scoring
+      # entrypoints must score their packs through the authoritative runner. This
+      # catches drift in the packs OR in any scoring entrypoint.
+      - name: Validate benchmark packs + official scoring entrypoints
+        run: |
+          python scripts/build_benchmark_packs.py --check
+          python benchmarks/semantics/score.py --out "$RUNNER_TEMP/bench/semantics"
+          python benchmarks/counterfactual_rollout/score.py --out "$RUNNER_TEMP/bench/cfr"
+          python benchmarks/safe_action_selection/score.py --out "$RUNNER_TEMP/bench/sas"
+
       - name: Test (pytest core, no MLX/slow)
         run: pytest -ra -q -m "not mlx and not slow" --cov=gpu_center_world_model --cov-report=xml
 
@@ -93,7 +110,7 @@ jobs:
 
       - name: Upload distribution artifacts
         if: matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-py312
           path: dist/*
@@ -110,10 +127,10 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -129,6 +146,22 @@ jobs:
       - name: MLX smoke (one tiny train + inference step)
         run: pytest -ra -q -m "mlx"
 
+      # Doc H MLX/serving gate: "Record p50 and p95 local compare latency on the
+      # scripted three-action demo case." Run the committed performance suite on
+      # the Apple-silicon reference lane — it pins the 3-action demo p50/p95 as
+      # fast (p50 < 250 ms, p95 < 500 ms) and STABLE (p95 ≤ 20×p50) and gates
+      # this step on a pathological regression.
+      - name: Performance suite (compare latency assertions)
+        run: pytest -ra -q tests/performance
+
+      # Record the MEASURED p50/p95 to the job step summary (so the numbers are
+      # captured on every run, not merely asserted) for BOTH the scripted
+      # three-action demo AND the enumerated set (>3 actions: a placement onto
+      # every domain). The enumerated case FAILS the step if its p95 ≥ 5 s — the
+      # interactive-loop SLA from doc H.
+      - name: Record compare latency p50/p95 (three-action + enumerated <5 s)
+        run: python scripts/perf_enumerated_latency.py
+
       - name: Local-demo parity (deterministic safe-set replay)
         run: pytest -ra -q -m "not slow" tests/golden tests/integration
 
@@ -143,13 +176,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -161,3 +194,59 @@ jobs:
 
       - name: Install from the frozen lock
         run: uv sync --frozen --extra dev --extra serve --extra data --extra baselines
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Web: the three.js Decision Studio static checks + e2e (doc H ci_and_testing).
+  #   * `tsc --noEmit` — the authoritative TypeScript type gate.
+  #   * ESLint (flat config + @typescript-eslint) — the second static gate.
+  #   * Playwright — a small headless suite over the MAIN decision flow (load
+  #     scene → pick action → ranked recommendation + why-not). No backend is
+  #     needed: the typed client degrades to deterministic mock data offline, so
+  #     the compare flow is fully exercisable hermetically in CI.
+  # Authoritative — blocks the merge gate (the web app ships in v0.1).
+  # ───────────────────────────────────────────────────────────────────────────
+  web:
+    name: web (tsc + eslint + playwright)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      # Reproducible install from the committed lockfile (mirror of `uv --frozen`).
+      - name: Install web dependencies (npm ci)
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Lint (eslint)
+        run: npm run lint
+
+      # Install ONLY the Chromium browser the suite targets, plus its OS deps.
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end (Playwright, headless)
+        run: npm run test:e2e
+
+      # Surface the HTML report + traces when the e2e suite fails.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report
+          path: |
+            apps/web/playwright-report/
+            apps/web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore

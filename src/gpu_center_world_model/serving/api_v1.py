@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import numpy as np
+
 from ..schema.actions import (
     Action,
     ActionType,
@@ -58,6 +60,12 @@ from ..simulator.contracts import (
 from ..version import API_VERSION, SCHEMA_VERSION, __version__
 from . import dto
 from .cache import ScoringGraph, ServingCache, shape_bucket_key
+from .forecast_signals import (
+    ForecastSignalEngine,
+    HazardSignals,
+    SelectiveLedger,
+    build_window_signals,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -383,13 +391,23 @@ def compare_actions(
         bundle = forecasts[action_id]
         r.rank = rank_idx
         r.delta_kpis = _delta_kpis(bundle, base_bundle)
-        r.uncertainty = _uncertainty(bundle)
+        r.uncertainty = _uncertainty(bundle, engine)
         if req.include_rollouts:
             r.rollout = _build_rollout_for(
                 engine, state, action_id, action_map[action_id], bundle
             )
 
     recommended = ranking[0] if (ranking and not abstain) else None
+
+    # Attach the selective certificate ledger (doc L split-select-certify) to the
+    # recommended candidate's uncertainty payload so the finite-sample guarantee
+    # travels with the recommendation (additive; existing fields unchanged).
+    ref = getattr(engine, "reference", None)
+    ledger = getattr(ref, "last_ledger", None) if ref is not None else None
+    if recommended is not None and ledger is not None:
+        rec_result = by_id.get(recommended)
+        if rec_result is not None and isinstance(rec_result.uncertainty, dict):
+            rec_result.uncertainty["selective_ledger"] = ledger.as_dict()
 
     candidates = dto.pad_candidates(results, dto.DEFAULT_BRANCHES)
     return dto.CompareResponse(
@@ -624,8 +642,18 @@ def _medians(bundle: KPIForecastBundle) -> dict[str, float]:
     return {qf.channel.value: qf.median() for qf in bundle.quantiles}
 
 
-def _uncertainty(bundle: KPIForecastBundle) -> dict[str, Any]:
-    """Compact uncertainty payload for halo thickness + confidence bands."""
+def _uncertainty(
+    bundle: KPIForecastBundle, engine: EngineBundle | None = None
+) -> dict[str, Any]:
+    """Compact uncertainty payload for halo thickness + confidence bands.
+
+    When the reference engine has cached wired reliability signals for this
+    candidate (the production path), they are surfaced additively under
+    ``reliability`` — the quiet-failure integrity posterior, the OOD conformal
+    p-value / FDR flag, and the changepoint -> SPRT chain — so the planner ledger
+    and the UI can render the real abstention evidence. Existing field names
+    (``epistemic``, ``ood``, ``bands``, ``hazards``) are unchanged.
+    """
     bands: dict[str, dict[str, float]] = {}
     for qf in bundle.quantiles:
         q = qf.quantiles
@@ -641,12 +669,36 @@ def _uncertainty(bundle: KPIForecastBundle) -> dict[str, Any]:
         }
         for hz in bundle.hazards
     }
-    return {
+    out: dict[str, Any] = {
         "epistemic": round(bundle.epistemic_score, 4),
         "ood": round(bundle.ood_score, 4),
         "bands": bands,
         "hazards": hazards,
     }
+    if engine is not None:
+        ref = getattr(engine, "reference", None)
+        sig = (
+            ref.last_signals.get(bundle.action_id)
+            if ref is not None and hasattr(ref, "last_signals")
+            else None
+        )
+        if sig is not None:
+            out["reliability"] = {
+                "integrity_u": round(float(sig.integrity.u), 4),
+                "quiet_failure": bool(sig.integrity.is_quiet_failure),
+                "latent_fault_mass": round(
+                    float(sig.integrity.latent_fault_mass), 4
+                ),
+                "ood_pvalue": round(float(sig.ood_pvalue), 4),
+                "ood_flagged": bool(sig.ood_flagged),
+                "changepoint_alarm": bool(sig.changepoint_alarm),
+                "sprt_confirmed": bool(sig.sprt_confirmed),
+                "bocpd_recent_cp_prob": round(
+                    float(sig.bocpd_recent_cp_prob), 4
+                ),
+                "isolated_channels": [c.value for c in sig.isolated_channels],
+            }
+    return out
 
 
 def _risk_phrases(bundle: KPIForecastBundle) -> list[str]:
@@ -695,6 +747,42 @@ class ReferenceEngine:
     model, with the same :class:`KPIForecastBundle` contract, so the planner and
     serving layer behave identically whether the real model is injected or not.
     """
+
+    def __init__(self) -> None:
+        # The wired uncertainty + reliability signal engine (UNC/REL-WIRE). Built
+        # once and lazily fitted on the first decision window's ID corpus so the
+        # conformal / OOD / selective calibrators present genuine bounds. The
+        # last-built selective ledger is kept so the planner can attach the
+        # SelectiveCertificate to each recommendation's explanation entry.
+        self._signal_engine = ForecastSignalEngine()
+        self._signal_engine_fitted = False
+        self.last_ledger: SelectiveLedger | None = None
+        self.last_signals: dict[str, HazardSignals] = {}
+
+    def _ensure_signal_fit(self, state: WorldState) -> None:
+        """Lazily fit the signal calibrators on a self-generated ID corpus.
+
+        The corpus is a deterministic family of perturbed copies of the current
+        pre-action state — an in-distribution calibration set anchored by the
+        pre-action topology (doc L: calibrate only on action-conditioned decision
+        windows). With an injected calibration corpus the app may pre-fit instead.
+        """
+        if self._signal_engine_fitted:
+            return
+        import copy
+
+        corpus: list[WorldState] = []
+        rng = np.random.default_rng(0)
+        for _i in range(24):
+            w = copy.deepcopy(state)
+            x = w.symbolic
+            # deterministic ID perturbation of telemetry / occupancy.
+            for g in x.gpus.values():
+                g.util = float(np.clip(g.util + rng.normal(0, 0.05), 0.0, 1.0))
+                g.temp_c = float(max(0.0, g.temp_c + rng.normal(0, 2.0)))
+            corpus.append(w)
+        self._signal_engine.fit(corpus)
+        self._signal_engine_fitted = True
 
     # -- ExactKernel protocol ------------------------------------------------
     def feasible(self, state: WorldState, action: Action) -> FeasibilityResult:
@@ -955,92 +1043,79 @@ class ReferenceEngine:
                 },
             )
 
-        spread_w = 60.0 + 200.0 * occ
+        # Risk-band spread comes from the residual-filter posterior (doc T): the
+        # Rao-Blackwellized source-health filter (MNAR availability/censoring
+        # evidence folded into its weights) widens the bands when its mode
+        # posterior is diffuse / degraded, so the bands reflect the filtered
+        # belief rather than a fixed heuristic.
+        self._ensure_signal_fit(state)
+        _band_sig = build_window_signals(state)
+        band_scale = self._signal_engine.posterior_band_scale(_band_sig)
+        spread_w = (60.0 + 200.0 * occ) * band_scale
         quantiles = [
             qf(KPIChannel.QUEUE_WAIT_DELTA_S, qwait, spread_w),
             qf(KPIChannel.ADMITTED_GPU_HOURS_DELTA, gpu_hours, gpu_hours * 0.1),
-            qf(KPIChannel.TOPOLOGY_FRAGMENTATION_DELTA, frag, 0.05),
+            qf(KPIChannel.TOPOLOGY_FRAGMENTATION_DELTA, frag, 0.05 * band_scale),
             qf(KPIChannel.COMPLETION_TIME_DELTA_S, completion, spread_w),
             qf(KPIChannel.CROSS_RACK_RATE, cross_rack, 0.05),
-            qf(KPIChannel.SLOWDOWN, 1.0 + occ, 0.1),
+            qf(KPIChannel.SLOWDOWN, 1.0 + occ, 0.1 * band_scale),
         ]
 
-        # Hazards rise with occupancy and with admitting more load. All six
-        # modeled hazard channels (doc F predictive_accuracy: hotspot,
-        # PodsReadyTimeout, requeue, XID/GPU fault, node failure, headroom) are
-        # emitted from simple *monotone* closed forms so the planner risk gate,
-        # the why-not predicted-risk surface, and the compare uncertainty ribbon
-        # can all reason over the same hazard families the learned model targets.
-        # Each form is monotone non-decreasing in the load / occupancy / horizon
-        # quantities that physically raise that hazard, and HOLD (no new load)
-        # always carries strictly lower hazard than an admit/place, which is what
-        # makes "prefer hold when warranted" (doc F PodsReady scenario) emerge.
+        # --- WIRED hazard / epistemic / OOD / conformal signals -------------
+        # All six modeled hazard channels (doc F: hotspot, PodsReadyTimeout,
+        # requeue, XID/GPU fault, node failure, headroom) now flow from the real
+        # reliability package: the workload competing-risks (PodsReadyTimeout,
+        # requeue) and the GPU xid_fault come from the discrete-time cause-specific
+        # hazard heads -> Aalen-Johansen CIF (doc U Eq1-Eq5) driven by the residual
+        # belief (occupancy, admitted load, exposure horizon, locality, the HSMM
+        # device-health posterior, and the multi-level rack/node/switch/power/
+        # cooling ancestor fault summaries, doc U I1/I2); hotspot/headroom/
+        # node_failure are parallel-binary discrete-time survival hazards
+        # ``1-(1-rate)^buckets``. Every form is still monotone non-decreasing in
+        # the load / occupancy / horizon quantities that physically raise it, and
+        # HOLD carries strictly lower load than an admit/place. The conformal upper
+        # is a fitted Mondrian one-sided bound (doc L T3/T4), epistemic/OOD come
+        # from decompose()/OODDetector — never the old ``0.05+0.10·occ`` heuristic.
+        sig = _band_sig  # reuse the window signals built for the band scale
         load = 0.0 if action.type == ActionType.HOLD else (gpu_demand / 64.0)
-        # Horizon factor: a longer exposure window can only raise event hazards
-        # (discrete-time survival: 1 - (1-rate)^t is increasing in t). Normalised
-        # so the 30-minute reference horizon is ~1.0.
-        hz_factor = horizon_s / 1800.0
-        hotspot_p = _clip(0.04 + 0.30 * occ + 0.10 * load)
-        timeout_p = _clip(0.05 + 0.15 * (1.0 - locality) + 0.05 * load)
-        headroom_p = _clip(0.02 + 0.20 * occ * load)
-        # requeue follows the PodsReady timeout loop (a timeout drives an
-        # eviction + backoff requeue), so it is monotone in the timeout hazard
-        # and grows with the horizon (more windows = more backoff exposure).
-        requeue_p = _clip((0.40 * timeout_p + 0.05 * load) * (0.5 + 0.5 * hz_factor))
-        # XID / device-fault hazard rises with sustained device occupancy and the
-        # exposure horizon (more GPU-hours under load = more fault opportunity).
-        xid_p = _clip((0.01 + 0.06 * occ + 0.04 * load) * (0.5 + 0.5 * hz_factor))
-        # node-failure hazard is the rarest; it is monotone in the device-fault
-        # hazard (a node fails at least as rarely as any single device on it) and
-        # in occupancy, scaled below the XID rate (doc U severity ordering).
-        node_fail_p = _clip(0.25 * xid_p + 0.02 * occ * hz_factor)
+        hz = self._signal_engine.signals_for(
+            sig,
+            action_name=action.type.value,
+            load=load,
+            locality=locality,
+            horizon_s=horizon_s,
+        )
         hazards = [
             HazardForecast(
+                ch,
+                horizon_s,
+                _clip(hz.hazards[ch]),
+                conformal_upper=_clip(hz.conformal_upper[ch]),
+            )
+            for ch in (
                 HazardChannel.HOTSPOT,
-                horizon_s,
-                hotspot_p,
-                conformal_upper=_clip(hotspot_p * 1.5 + 0.03),
-            ),
-            HazardForecast(
                 HazardChannel.PODS_READY_TIMEOUT,
-                horizon_s,
-                timeout_p,
-                conformal_upper=_clip(timeout_p * 1.5 + 0.03),
-            ),
-            HazardForecast(
                 HazardChannel.HEADROOM_VIOLATION,
-                horizon_s,
-                headroom_p,
-                conformal_upper=_clip(headroom_p * 1.5 + 0.02),
-            ),
-            HazardForecast(
                 HazardChannel.REQUEUE,
-                horizon_s,
-                requeue_p,
-                conformal_upper=_clip(requeue_p * 1.5 + 0.03),
-            ),
-            HazardForecast(
                 HazardChannel.XID_FAULT,
-                horizon_s,
-                xid_p,
-                conformal_upper=_clip(xid_p * 1.6 + 0.02),
-            ),
-            HazardForecast(
                 HazardChannel.NODE_FAILURE,
-                horizon_s,
-                node_fail_p,
-                conformal_upper=_clip(node_fail_p * 1.6 + 0.01),
-            ),
+            )
         ]
-
-        epistemic = _clip(0.05 + 0.10 * occ)
-        ood = _clip(0.02 + 0.05 * load)
+        # Cache the wired per-action signals so the planner abstention gate can
+        # read the quiet-failure integrity posterior, the changepoint/SPRT chain,
+        # the OOD conformal flag, and the FDR-isolated channels (doc U/M). Keyed
+        # by the bundle action_id (for the UI uncertainty payload) AND by a
+        # composite (wl, type) so two candidates over the same workload (e.g. hold
+        # vs place) do not alias in the planner gate.
+        bundle_id = wl_uid or action.type.value
+        self.last_signals[bundle_id] = hz
+        self.last_signals[f"{bundle_id}::{action.type.value}"] = hz
         return KPIForecastBundle(
             action_id=wl_uid or action.type.value,
             quantiles=quantiles,
             hazards=hazards,
-            epistemic_score=epistemic,
-            ood_score=ood,
+            epistemic_score=_clip(hz.epistemic),
+            ood_score=_clip(hz.ood),
         )
 
     def score_actions(
@@ -1087,11 +1162,60 @@ class ReferenceEngine:
         if not ranking:
             return [], False, None
 
-        top = forecasts[ranking[0]]
-        if top.epistemic_score > max_epi:
-            return ranking, True, "epistemic_disagreement_exceeds_threshold"
-        if top.ood_score > max_ood:
-            return ranking, True, "ood_score_exceeds_threshold"
+        top_id = ranking[0]
+        top = forecasts[top_id]
+        # Build the wired reliability abstention signals for the top survivor from
+        # the cached per-action signals (quiet-failure integrity, OOD conformal
+        # p-value/FDR flag, changepoint -> SPRT chain) and route them through the
+        # enriched planner gate (doc U/L/M). This replaces the bare epistemic/OOD
+        # threshold check with the full reliability chain while keeping the same
+        # (ranking, abstain, reason) return contract.
+        from ..planner.abstain import (
+            ReliabilityAbstainSignals,
+            should_abstain_with_reliability,
+        )
+        from ..schema.policy import AbstentionConfig
+
+        cfg = AbstentionConfig(
+            max_epistemic_disagreement=max_epi,
+            max_ood_score=max_ood,
+        )
+        top_action = dict(safe_actions).get(top_id)
+        sig = None
+        if top_action is not None:
+            sig = self.last_signals.get(
+                f"{top.action_id}::{top_action.type.value}"
+            )
+        if sig is None:
+            sig = self.last_signals.get(top.action_id)
+        source_bad = sig.integrity.u if sig is not None else 0.0
+        rel = None
+        if sig is not None:
+            rel = ReliabilityAbstainSignals(
+                integrity_u=float(sig.integrity.u),
+                quiet_failure=bool(sig.integrity.is_quiet_failure),
+                ood_pvalue=float(sig.ood_pvalue),
+                ood_flagged=bool(sig.ood_flagged),
+                changepoint_alarm=bool(sig.changepoint_alarm),
+                sprt_confirmed=bool(sig.sprt_confirmed),
+                bocpd_recent_cp_prob=float(sig.bocpd_recent_cp_prob),
+                isolated_channels=tuple(c.value for c in sig.isolated_channels),
+            )
+        decision = should_abstain_with_reliability(top, cfg, source_bad, rel)
+
+        # Attach the SelectiveCertificate to the recommendation's ledger entry
+        # (doc L split-select-certify): the auditable finite-sample guarantee that
+        # travels with every recommendation.
+        worst_haz = max((h.conformal_upper for h in top.hazards), default=0.0)
+        self.last_ledger = self._signal_engine.selective_ledger(
+            epistemic=float(top.epistemic_score),
+            ood=float(top.ood_score),
+            risk_upper=float(worst_haz),
+            benefit_margin=float(1.0 - worst_haz),
+        )
+
+        if decision.abstain:
+            return ranking, True, decision.reason
         return ranking, False, None
 
     def rollout(

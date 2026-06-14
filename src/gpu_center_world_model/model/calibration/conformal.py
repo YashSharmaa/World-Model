@@ -36,6 +36,7 @@ that widens / annotates a :class:`KPIForecastBundle` in place.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -130,19 +131,35 @@ class OneSidedUpperConformal:
     The right primitive for the safety gate: ``P{R ≤ U_α} ≥ 1-α``. Fills the
     ``conformal_upper`` field on hazard forecasts so the planner can gate on the
     *calibrated* upper risk, not the nominal point estimate (doc L safety gate).
+
+    This is a thin shim around the canonical
+    :class:`uncertainty.conformal.OneSidedUpperConformal` so the project has *one*
+    conformal implementation (doc L handoff). The divergent ``1 - pred`` fabricated
+    margin / aggressive clamp that previously lived here is removed: when the
+    calibrator is unfitted the honest answer is an infinite radius (no finite
+    bound carries the guarantee), and the only post-hoc clip is to ``[0, 1]``
+    because the bounded quantity here is a probability.
     """
 
     alpha: float = 0.05
     margin_: float = float("inf")
 
     def fit(self, preds: np.ndarray, targets: np.ndarray) -> OneSidedUpperConformal:
-        scores = np.asarray(targets) - np.asarray(preds)  # one-sided (doc L D6)
-        self.margin_ = conformal_quantile(scores, self.alpha)
+        from ...uncertainty.conformal import (
+            OneSidedUpperConformal as _CanonicalOneSided,
+        )
+
+        canon = _CanonicalOneSided(alpha=self.alpha)
+        canon.fit(np.asarray(targets), np.asarray(preds))  # (r_true, r_hat)
+        self.margin_ = canon.q_plus
         return self
 
     def upper(self, pred: float) -> float:
-        m = self.margin_ if np.isfinite(self.margin_) else (1.0 - pred)
-        return float(min(1.0, max(pred, pred + m)))
+        # Unfitted -> honest infinite radius -> the bound is the pred itself
+        # clipped to the probability simplex (never *under*-states, never the old
+        # ``1 - pred`` fabrication). Fitted -> pred + the conformal quantile.
+        m = self.margin_ if np.isfinite(self.margin_) else 0.0
+        return float(min(1.0, max(0.0, pred + m)))
 
 
 # --------------------------------------------------------------------------- #
@@ -205,11 +222,36 @@ class ConformalBundleCalibrator:
 
     cqr: dict[tuple[str, int], CQRCalibrator] = field(default_factory=dict)
     upper: dict[tuple[str, int], OneSidedUpperConformal] = field(default_factory=dict)
+    # Per-(channel, horizon) group-conditional Mondrian calibrators keyed by the
+    # doc-L 5-tuple slice (action, horizon, workload, topology/flavor, source-
+    # health) with hierarchical back-off (doc L T3). Consulted at serve time via
+    # ``calibrate(bundle, slice_key=...)`` for group-conditional widening; the
+    # marginal CQR remains the always-available fallback.
+    mondrian: dict[tuple[str, int], Any] = field(default_factory=dict)
 
-    def calibrate(self, bundle: KPIForecastBundle) -> KPIForecastBundle:
+    def calibrate(
+        self, bundle: KPIForecastBundle, slice_key: object | None = None
+    ) -> KPIForecastBundle:
         new_q: list[QuantileForecast] = []
         for qf in bundle.quantiles:
-            cal = self.cqr.get((qf.channel.value, qf.horizon_s))
+            key = (qf.channel.value, qf.horizon_s)
+            mond = self.mondrian.get(key) if slice_key is not None else None
+            if mond is not None:
+                lo = qf.quantiles.get(0.05, qf.median())
+                hi = qf.quantiles.get(0.95, qf.median())
+                clo, chi = mond.interval(slice_key, lo, hi)
+                q = dict(qf.quantiles)
+                if np.isfinite(clo):
+                    q[0.05] = clo
+                if np.isfinite(chi):
+                    q[0.95] = chi
+                new_q.append(
+                    QuantileForecast(
+                        channel=qf.channel, horizon_s=qf.horizon_s, quantiles=q
+                    )
+                )
+                continue
+            cal = self.cqr.get(key)
             new_q.append(cal.calibrate_forecast(qf) if cal else qf)
         new_h = []
         for hf in bundle.hazards:

@@ -132,6 +132,22 @@ class TrackInputs:
     # Track C — safe action selection
     planning_windows: list[PlanningWindow] = field(default_factory=list)
     baseline_planning_windows: list[PlanningWindow] = field(default_factory=list)
+    #: Per-window inputs for constructing baseline planning windows by *running*
+    #: each of the six doc-F baselines' ``score_actions`` (doc F baseline_systems).
+    #: A list of :class:`model.baselines.BaselineDecisionWindow` (or dicts the
+    #: runner coerces). When present the runner scores every baseline, picks the
+    #: *strongest* comparator (lowest mean safe regret), and feeds its regret into
+    #: ``evaluate_planning`` so the >=15% threshold is measured against the best
+    #: skeptical baseline (doc F ``acceptance_thresholds.planning_utility``).
+    baseline_decision_windows: list[object] = field(default_factory=list)
+    #: When the strongest-comparator search should include the hindsight oracle
+    #: (off by default — the oracle is an upper bound, not a deployable foil).
+    baseline_include_oracle: bool = False
+    #: Optional pre-computed doc-F ablation report (``model.baselines.ablations``
+    #: ``AblationReport.as_dict()``) surfaced in the report under
+    #: ``slices["_ablations"]`` so the five per-ablation ``main_readouts`` ship in
+    #: the :class:`EvaluationReport` (doc F ``ablations``).
+    ablation_report: dict[str, object] | None = None
     # Fairness (v2 hooks; doc V H9) — reported slice-wise alongside safety-first
     # metrics, never release-blocking in v1 (fairness_mode is off by default).
     fairness_windows: list[FairnessEvalWindow] = field(default_factory=list)
@@ -192,15 +208,67 @@ def run_track_counterfactual(
     )
 
 
+def compute_strongest_baseline(
+    inputs: TrackInputs,
+) -> object | None:
+    """Run all six doc-F baselines and return the strongest comparator's windows.
+
+    When ``baseline_decision_windows`` are supplied, this builds every registered
+    doc-F baseline (``model.baselines.build_default_baselines``), runs each one's
+    ``score_actions`` over each decision window's candidate set to construct
+    baseline :class:`PlanningWindow`s, scores all of them, and returns the
+    comparator with the **lowest mean safe regret** — the strongest foil — as a
+    :class:`model.baselines.StrongestBaselineResult`. Returns ``None`` when no
+    baseline decision windows were collected (the runner then falls back to any
+    pre-built ``baseline_planning_windows``).
+
+    The import is local so the harness stays import-clean on a build that excludes
+    the model package (doc F: the runner is backend-neutral, pure aggregation).
+    """
+    if not inputs.baseline_decision_windows:
+        return None
+    from ..model.baselines import (
+        BaselineDecisionWindow,
+        build_default_baselines,
+        strongest_baseline_windows,
+    )
+
+    bwins = [
+        w
+        for w in inputs.baseline_decision_windows
+        if isinstance(w, BaselineDecisionWindow)
+    ]
+    if not bwins:
+        return None
+    baselines = build_default_baselines()
+    return strongest_baseline_windows(
+        baselines, bwins, include_oracle=inputs.baseline_include_oracle
+    )
+
+
 def run_track_planning(
     inputs: TrackInputs,
+    strongest_baseline: object | None = None,
 ) -> PlanningReport | None:
-    """Track C: lexicographic safe-regret vs oracle, paired against baseline."""
+    """Track C: lexicographic safe-regret vs oracle, paired against baseline.
+
+    When ``strongest_baseline`` is supplied (from
+    :func:`compute_strongest_baseline`), its chosen windows are used as the paired
+    comparator so the doc-F ">=15% lower mean safe regret than the best skeptical
+    baseline" threshold is measured against the **strongest** of the six baselines
+    (doc F ``acceptance_thresholds.planning_utility``). Otherwise the runner falls
+    back to any pre-built ``baseline_planning_windows`` (the Wave-1/2 behaviour).
+    """
     if not inputs.planning_windows:
         return None
+    baseline_windows = inputs.baseline_planning_windows or None
+    if strongest_baseline is not None:
+        sb_windows = getattr(strongest_baseline, "windows", None)
+        if sb_windows:
+            baseline_windows = sb_windows
     return evaluate_planning(
         inputs.planning_windows,
-        baseline_windows=inputs.baseline_planning_windows or None,
+        baseline_windows=baseline_windows,
     )
 
 
@@ -645,7 +713,11 @@ class BenchmarkRunner:
         t0 = time.time()
         safety_gate, red_team = run_track_semantics(inputs)
         counterfactual = run_track_counterfactual(inputs)
-        planning = run_track_planning(inputs)
+        # Build the strongest of the six doc-F baselines (when per-window baseline
+        # decision inputs are supplied) so the planning-utility threshold is
+        # measured against the best skeptical comparator (doc F planning_utility).
+        strongest_baseline = compute_strongest_baseline(inputs)
+        planning = run_track_planning(inputs, strongest_baseline)
         predictive = run_track_predictive(inputs)
         calibration = run_track_calibration(inputs)
         coverage_slice = run_coverage_by_slice(inputs)
@@ -660,6 +732,19 @@ class BenchmarkRunner:
         fairness_slices = compute_fairness_slices(inputs)
         if fairness_slices:
             slices["_fairness"] = fairness_slices
+
+        # Baseline comparator profile (doc F baseline_systems): publish each
+        # baseline's mean safe regret and which one is the strongest comparator
+        # the planning-utility threshold was computed against. Surfaced in the
+        # report's free-form `slices` map under a dedicated key (no new top-level
+        # field, so the EvaluationReport surface stays byte-stable).
+        if strongest_baseline is not None:
+            slices["_baselines"] = strongest_baseline.as_dict()
+
+        # Ablation profile (doc F ablations): surface the five per-ablation
+        # main_readouts in the report so the ablation evidence ships with it.
+        if inputs.ablation_report:
+            slices["_ablations"] = dict(inputs.ablation_report)
 
         cf_coverage = (
             counterfactual_coverage(inputs.branch_windows)
@@ -735,6 +820,17 @@ class BenchmarkRunner:
                 "counterfactual_coverage": cf_coverage,
                 "is_shift_pack": inputs.is_shift_pack,
                 "fairness": fairness.as_dict() if fairness else None,
+                "strongest_baseline": (
+                    getattr(strongest_baseline, "name", None)
+                    if strongest_baseline is not None
+                    else None
+                ),
+                "n_baseline_decision_windows": len(inputs.baseline_decision_windows),
+                "n_ablations": (
+                    len(inputs.ablation_report.get("ablations", []))
+                    if inputs.ablation_report
+                    else 0
+                ),
                 "thresholds": dict(THRESHOLDS),
             },
         )
@@ -1111,6 +1207,12 @@ def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
             payload.get("n_severe_shift_zero_events", 0)  # type: ignore[arg-type]
         ),
         is_shift_pack=bool(payload.get("is_shift_pack", False)),
+        baseline_include_oracle=bool(payload.get("baseline_include_oracle", False)),
+        ablation_report=(
+            dict(payload["ablation_report"])  # type: ignore[arg-type]
+            if isinstance(payload.get("ablation_report"), Mapping)
+            else None
+        ),
     )
 
 
@@ -1122,6 +1224,7 @@ __all__ = [
     "apply_acceptance",
     "compute_fairness_slices",
     "compute_slices",
+    "compute_strongest_baseline",
     "counterfactual_coverage",
     "run_abstention",
     "run_benchmark",

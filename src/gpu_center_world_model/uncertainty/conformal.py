@@ -473,23 +473,43 @@ class BCACICalibrator:
     bias: float = 0.0
     alpha_min: float = 1e-3
     alpha_max: float = 0.5
+    #: one-sided floored bias: a conformal *upper* bound should only be pushed
+    #: outward (b_t >= 0) so de-biasing never tightens below the safe radius.
+    one_sided: bool = True
+    bias_floor: float = 0.0
     _err_hist: deque = field(default_factory=lambda: deque(maxlen=2000))
 
     def __post_init__(self) -> None:
         self.alpha_t = self.alpha_target
 
     def radius(self, scores: np.ndarray) -> float:
-        """Radius on *de-biased* scores at the adapted level."""
-        s = np.asarray(scores, float) - self.bias
+        """Radius on *de-biased* scores at the adapted level (one-sided floored).
+
+        With ``one_sided`` the de-bias only *adds* a non-negative bias to the
+        scores (the radius is never pulled below the un-biased conformal radius),
+        which is the correct behaviour for a one-sided safety upper bound: drift
+        may only widen it, never silently tighten it (doc L BC-ACI safety form).
+        """
+        b = self.bias
+        if self.one_sided:
+            b = max(self.bias_floor, b)
+            s = np.asarray(scores, float) + b  # widen by the (floored) bias
+        else:
+            s = np.asarray(scores, float) - self.bias
         return split_conformal_quantile(
             s, float(np.clip(self.alpha_t, self.alpha_min, self.alpha_max))
         )
 
     def update(self, covered: bool, residual: float | None = None) -> float:
-        """Update the level (ACI) and the EW bias estimate (BC).
+        """Update the level (ACI) and the EW bias estimate (BC), coverage-coupled.
 
-        ``residual`` is the latest signed nonconformity residual driving the
-        bias estimate; if omitted only the level is updated.
+        ``residual`` is the latest signed nonconformity residual driving the bias
+        estimate; if omitted only the level is updated. The bias EW step is
+        **coupled to the coverage-error signal**: when the interval *misses*
+        (``covered == False``) the bias adapts faster (a miss is direct evidence
+        the bound drifted low), so the de-bias chases drift more aggressively
+        exactly when it is failing — and with ``one_sided`` the bias is floored at
+        ``bias_floor`` so de-biasing can only widen the safe upper bound.
         """
         err = 0.0 if covered else 1.0
         self._err_hist.append(err)
@@ -501,15 +521,132 @@ class BCACICalibrator:
             )
         )
         if residual is not None:
-            self.bias = (1.0 - self.bias_decay) * self.bias + (
-                self.bias_decay * float(residual)
-            )
+            # coverage-coupled EW step: misses accelerate the bias update.
+            step = self.bias_decay * (1.0 + err)
+            step = min(step, 1.0)
+            self.bias = (1.0 - step) * self.bias + step * float(residual)
+            if self.one_sided:
+                self.bias = max(self.bias_floor, self.bias)
         return self.alpha_t
 
     def empirical_coverage(self) -> float:
         if not self._err_hist:
             return float("nan")
         return 1.0 - float(np.mean(self._err_hist))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conformal risk control (CVaR / OCE) for bounded / monotone losses (doc L E18)
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class ConformalRiskController:
+    """Conformal risk control for a bounded, monotone loss (doc L E18, CRC).
+
+    Generalises split conformal from the 0/1 miscoverage loss to an arbitrary
+    **bounded, monotone non-increasing-in-threshold** loss ``L_lambda`` (e.g. a
+    CVaR / OCE tail loss). Chooses the smallest threshold ``lambda_hat`` whose
+    *finite-sample-corrected* empirical risk over the calibration set stays at or
+    below the target ``alpha``:
+
+        lambda_hat = inf{ lambda : (n/(n+1)) Rhat_n(lambda) + B/(n+1) <= alpha }
+
+    where ``B`` is the loss upper bound. By the conformal-risk-control theorem
+    (Angelopoulos et al. 2024, doc L E18) the deployed risk then satisfies
+    ``E[L_{lambda_hat}(X_test)] <= alpha``. The loss matrix ``losses[i, j]`` is the
+    loss of calibration point ``i`` at candidate threshold ``lambdas[j]`` and must
+    be non-increasing along ``j`` (larger threshold = more conservative = lower
+    loss).
+    """
+
+    alpha: float = 0.10
+    loss_bound: float = 1.0
+    lambda_hat: float = math.inf
+
+    def fit(self, lambdas: np.ndarray, losses: np.ndarray) -> ConformalRiskController:
+        lam = np.asarray(lambdas, float).ravel()
+        loss = np.asarray(losses, float)
+        n = loss.shape[0]
+        if n == 0 or lam.size == 0:
+            self.lambda_hat = math.inf
+            return self
+        order = np.argsort(lam)
+        lam = lam[order]
+        loss = loss[:, order]
+        rhat = loss.mean(axis=0)  # empirical risk per candidate threshold
+        corrected = (n / (n + 1.0)) * rhat + self.loss_bound / (n + 1.0)
+        ok = np.nonzero(corrected <= self.alpha)[0]
+        # losses are non-increasing in lambda, so the *smallest* admissible lambda
+        # is the first index meeting the budget.
+        self.lambda_hat = float(lam[ok[0]]) if ok.size else float(lam[-1])
+        return self
+
+    def threshold(self) -> float:
+        return self.lambda_hat
+
+
+def cvar_from_losses(losses: np.ndarray, beta: float) -> float:
+    """Empirical CVaR (expected loss in the worst ``1-beta`` tail), doc L E18.
+
+    ``CVaR_beta(L) = E[L | L >= VaR_beta(L)]`` — the average of the upper
+    ``(1 - beta)`` fraction of losses. Used as the bounded/monotone loss the
+    :class:`ConformalRiskController` calibrates a threshold against, and as the
+    risk objective the safety-margin planner consumes (doc M risk_objective).
+    """
+    s = np.sort(np.asarray(losses, float).ravel())
+    if s.size == 0:
+        return 0.0
+    var = float(np.quantile(s, beta, method="higher"))
+    tail = s[s >= var]
+    return float(tail.mean()) if tail.size else var
+
+
+def oce_from_losses(losses: np.ndarray, beta: float, *, mu: float = 1.0) -> float:
+    """Optimized Certainty Equivalent (OCE) risk for the entropic disutility.
+
+    ``OCE = inf_t { t + (1/mu) E[ phi(L - t) ] }`` with ``phi(z) = exp(mu z) - 1``
+    (the entropic / exponential disutility, a smooth coherent risk measure that
+    upper-bounds CVaR, doc L E18). Minimised over a grid of ``t`` candidates; the
+    coherent-risk value fed into the conformal risk controller for a smooth tail
+    objective. ``beta`` re-scales ``mu`` so larger ``beta`` weights the tail more.
+    """
+    x = np.asarray(losses, float).ravel()
+    if x.size == 0:
+        return 0.0
+    mu_eff = mu * (1.0 + beta)
+    grid = np.linspace(float(x.min()), float(x.max()), 64)
+    best = math.inf
+    for t in grid:
+        val = t + (1.0 / mu_eff) * float(np.mean(np.exp(mu_eff * (x - t)) - 1.0))
+        best = min(best, val)
+    return float(best)
+
+
+@dataclass(slots=True)
+class BundleResidualRiskHead:
+    """One-sided bundle-average residual-risk head (doc L E18 / safety margin).
+
+    Calibrates a single one-sided upper bound on the *bundle-average* residual
+    safety risk — the mean over a forecast bundle's hazard channels of the excess
+    interventional risk vs the conservative fallback. This is the scalar the
+    planner's chance-constrained margin reads (doc M abstention / conformal risk
+    margin): ``U = mean_residual_hat + q^+`` with ``P{mean_residual <= U} >= 1-α``.
+    """
+
+    alpha: float = 0.05
+    q_plus: float = math.inf
+
+    def fit(
+        self, bundle_residual_means: np.ndarray, bundle_residual_hat: np.ndarray
+    ) -> BundleResidualRiskHead:
+        scores = np.asarray(bundle_residual_means, float) - np.asarray(
+            bundle_residual_hat, float
+        )
+        self.q_plus = split_conformal_quantile(scores, self.alpha)
+        return self
+
+    def upper(self, bundle_residual_hat: float) -> float:
+        m = self.q_plus if math.isfinite(self.q_plus) else 0.0
+        return float(bundle_residual_hat + m)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,6 +674,8 @@ def one_sided_coverage(y: np.ndarray, upper: np.ndarray) -> float:
 __all__ = [
     "ACICalibrator",
     "BCACICalibrator",
+    "BundleResidualRiskHead",
+    "ConformalRiskController",
     "ConformalizedQuantileRegressor",
     "MondrianConformal",
     "OneSidedUpperConformal",
@@ -544,7 +683,9 @@ __all__ = [
     "WeightedConformal",
     "beta_corrected_level",
     "conformal_rank",
+    "cvar_from_losses",
     "empirical_coverage",
+    "oce_from_losses",
     "one_sided_coverage",
     "reg_incomplete_beta",
     "split_conformal_quantile",

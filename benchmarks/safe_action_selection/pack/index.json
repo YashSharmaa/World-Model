@@ -1,0 +1,19 @@
+{
+  "author": "Yash Sharma",
+  "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+  "credit": "Done by Yash Sharma \u2014 https://www.linkedin.com/in/yashsharmaa/",
+  "generator_commit": "930d6de8fcb5dd4f1ea8663f1d83ca114092b0d8",
+  "project": "gpu-center-world-model",
+  "schema_version": "1.0.0",
+  "windows": [
+    {
+      "family": "safe_action_selection",
+      "label_uri": "pack/eval_inputs.json#trackC-window-locality",
+      "n_branches": 3,
+      "scenario_id": "trackC-window-locality",
+      "scenario_state_hash": "31ccb69bdfb78e3df812b54a21b61c0c45c8012dc1242daed677260343636399",
+      "split": "test_intervention",
+      "window_uri": "pack/eval_inputs.json#trackC-window-locality"
+    }
+  ]
+}

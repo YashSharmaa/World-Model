@@ -27,10 +27,15 @@ from gpu_center_world_model.reliability import (
     GPU_CAUSES,
     WORKLOAD_CAUSES,
     CauseSpecificHazardModel,
+    aipcw_censoring_weights,
     all_cause_risk,
+    censored_crps,
     censored_log_likelihood,
+    censored_pinball_loss,
+    conformal_rul_interval,
     cumulative_incidence,
     hazards_from_logits,
+    interval_censored_log_likelihood,
     logits_from_hazards,
     survival_from_q,
 )
@@ -179,3 +184,100 @@ def test_unknown_entity_kind_raises():
 
     with pytest.raises(ValueError):
         CauseSpecificHazardModel.for_entity("switch", n_features=2)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REL-SURVIVAL-CENSORING: left-truncation, interval-censoring, IPCW/AIPCW, scoring
+# ──────────────────────────────────────────────────────────────────────────────
+def test_left_truncation_excludes_pre_entry_buckets():
+    """The survival product must start at the unit's entry bucket (delayed entry)."""
+    logits = _rng().normal(size=(6, 5, 2))
+    h, q = hazards_from_logits(logits)
+    kw = dict(
+        event_bucket=np.full(6, 5),
+        cause_index=np.zeros(6, int),
+        observed=np.zeros(6, bool),
+    )
+    ll_full = censored_log_likelihood(h, q, **kw)
+    ll_trunc = censored_log_likelihood(h, q, entry_bucket=np.full(6, 3), **kw)
+    # truncated LL drops the (negative) pre-entry log-survival terms, so it is
+    # never smaller than the from-bucket-1 LL.
+    assert np.all(ll_trunc >= ll_full - 1e-9)
+    # and entry == 1 reproduces the untruncated likelihood exactly.
+    ll_e1 = censored_log_likelihood(h, q, entry_bucket=np.ones(6, int), **kw)
+    assert np.allclose(ll_e1, ll_full, atol=ATOL)
+
+
+def test_interval_censored_likelihood_integrates_onset_uncertainty():
+    """Interval-censoring sums the CIF increment over the censoring interval."""
+    logits = _rng().normal(size=(4, 6, 2))
+    h, q = hazards_from_logits(logits)
+    # an all-cause event known to lie in (1, 4].
+    ll = interval_censored_log_likelihood(
+        h, q, left_bucket=np.full(4, 1), right_bucket=np.full(4, 4)
+    )
+    assert ll.shape == (4,)
+    assert np.all(np.isfinite(ll)) and np.all(ll <= 0.0)
+    # a wider interval admits more mass -> a higher (less negative) likelihood.
+    ll_wide = interval_censored_log_likelihood(
+        h, q, left_bucket=np.full(4, 1), right_bucket=np.full(4, 6)
+    )
+    assert np.all(ll_wide >= ll - 1e-9)
+
+
+def test_aipcw_weights_condition_on_covariates():
+    rng = _rng()
+    t = rng.uniform(1.0, 5.0, size=80)
+    obs = rng.random(80) > 0.3
+    feats = rng.normal(size=(80, 3))
+    w = aipcw_censoring_weights(t, obs, feats)
+    # only uncensored units carry weight (Delta_i term).
+    assert np.all(w[~obs] == 0.0)
+    assert np.all(w[obs] > 0.0)
+    # AIPCW differs from the marginal reverse-KM IPCW (covariate conditioning).
+    from gpu_center_world_model.reliability import ipcw_weights
+
+    w_marginal = ipcw_weights(t, obs)
+    assert not np.allclose(w[obs], w_marginal[obs])
+
+
+def test_conformal_rul_interval_includes_test_point_weight():
+    """The proper weighted construction appends the test point at +inf score."""
+    rng = _rng()
+    cal_pred = rng.uniform(1.0, 5.0, size=60)
+    cal_t = rng.uniform(1.0, 5.0, size=60)
+    cal_o = rng.random(60) > 0.3
+    iv = conformal_rul_interval(
+        3.0,
+        cal_point_preds=cal_pred,
+        cal_event_times=cal_t,
+        cal_observed=cal_o,
+        alpha=0.1,
+        test_weight=1.0,
+    )
+    assert iv.lower >= 0.0 and iv.upper >= iv.lower
+    assert np.isfinite(iv.q_hat)
+    # a larger test-point weight can only widen (never tighten) the interval.
+    iv_big = conformal_rul_interval(
+        3.0,
+        cal_point_preds=cal_pred,
+        cal_event_times=cal_t,
+        cal_observed=cal_o,
+        alpha=0.1,
+        test_weight=100.0,
+    )
+    assert iv_big.q_hat >= iv.q_hat - 1e-9
+
+
+def test_censored_pinball_and_crps_are_finite():
+    rng = _rng()
+    yhat = rng.uniform(1.0, 5.0, size=40)
+    y = rng.uniform(1.0, 5.0, size=40)
+    obs = rng.random(40) > 0.3
+    pl = censored_pinball_loss(yhat, y, obs, tau=0.5)
+    assert np.isfinite(pl) and pl >= 0.0
+    logits = rng.normal(size=(40, 5, 2))
+    _h, q = hazards_from_logits(logits)
+    S = survival_from_q(q)
+    crps = censored_crps(S, np.array([1.0, 2, 3, 4, 5]), y, obs)
+    assert np.isfinite(crps) and crps >= 0.0

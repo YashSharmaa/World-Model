@@ -53,6 +53,10 @@ dev = [
   "ruff>=0.5",
   "pyright>=1.1.370",
   "mkdocs-material>=9.5",
+  # Source-of-truth API/schema reference: render the DTO + schema dataclasses
+  # straight from their docstrings/signatures so the docs can never drift from
+  # the code (doc H docs_and_cards "generate from source").
+  "mkdocstrings[python]>=0.26",
   # JSON-schema validation of released contracts (doc H static checks).
   "jsonschema>=4.21",
 ]

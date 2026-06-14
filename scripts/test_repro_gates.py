@@ -3,7 +3,9 @@
 #  for GPU datacenter operations.
 #
 #  Author:  Yash Sharma  ·  https://www.linkedin.com/in/yashsharmaa/
-#  License: Apache-2.0
+#
+#  SPDX-FileCopyrightText: 2026 Yash Sharma <https://www.linkedin.com/in/yashsharmaa/>
+#  SPDX-License-Identifier: Apache-2.0
 # ─────────────────────────────────────────────────────────────────────────────
 """Scoped reproducibility-gate tests for the repo-infra lane (items REPRO-*).
 

@@ -525,6 +525,151 @@ class HierarchicalScan:
         return [self.step(row) for row in residual_stream]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Orchestrated detection chain: primary -> SPRT -> BOCPD -> hierarchical -> FDR
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class ChangepointVerdict:
+    """Auditable outcome of the full changepoint -> abstention chain (doc U §3)."""
+
+    primary_alarm: bool  # a broad detector raised suspicion
+    sprt_confirmed: bool  # SPRT confirmed the change (escalate / abstain)
+    bocpd_recent_cp_prob: float  # posterior mass on a recent changepoint
+    hierarchical_alarm: bool  # a node/rack/switch-level common-mode alarm
+    fired_levels: tuple[str, ...]  # which topology levels fired
+    isolated_streams: tuple[int, ...]  # BH-FDR isolated anomalous stream indices
+
+    @property
+    def abstain(self) -> bool:
+        """The chain abstains on a *confirmed* change or a hierarchical alarm."""
+        return self.sprt_confirmed or self.hierarchical_alarm
+
+
+def detect_confirm_isolate(
+    stream: np.ndarray,
+    *,
+    groups: dict[str, list[list[int]]] | None = None,
+    adjacency: np.ndarray | None = None,
+    h_device: float = 5.0,
+    h_group: float = 8.0,
+    sprt_mean1: float = 2.0,
+    sprt_sigma: float = 1.0,
+    fdr: float = 0.05,
+    confirm_window: int = 8,
+) -> ChangepointVerdict:
+    """Run the full doc-U §3 detection chain on a multistream residual matrix.
+
+    ``stream`` has shape ``(T, D)`` (``T`` timesteps over ``D`` device streams).
+    The chain is:
+
+    1. **Primary detector** — per-stream CUSUM raises a broad alarm on the
+       suspect stream (Lorden-minimax quickest-change).
+    2. **SPRT confirmation** — Wald's SPRT confirms (or clears) the change on the
+       suspect stream's post-alarm window before any escalation (doc U §3 SPRT).
+    3. **BOCPD run-length** — the recent-changepoint posterior mass on the pooled
+       stream feeds the abstention logic / explanation ledger.
+    4. **Hierarchical alarms** — the topology-aware multistream scan raises
+       node/rack/switch common-mode alarms (doc U §3 Eq1-Eq3).
+    5. **FDR isolation** — per-stream final CUSUM statistics are converted to
+       one-sided p-values and passed through Benjamini-Hochberg so only streams
+       whose anomaly survives FDR control are isolated as channels.
+
+    Returns a :class:`ChangepointVerdict` whose ``abstain`` flag the planner gate
+    consumes (doc U §3 changepoint -> SPRT -> abstention chain).
+    """
+    stream = np.atleast_2d(np.asarray(stream, dtype=np.float64))
+    t, d = stream.shape
+
+    # 1. primary per-stream CUSUM.
+    cusums = [CUSUM(h=h_device) for _ in range(d)]
+    primary_alarm = False
+    suspect = -1
+    fired_step = -1
+    for ti in range(t):
+        for j in range(d):
+            if cusums[j].step(float(stream[ti, j])):
+                primary_alarm = True
+                if suspect < 0:
+                    suspect, fired_step = j, ti
+        if primary_alarm and suspect >= 0:
+            break
+
+    # 2. SPRT confirmation on the suspect stream's post-alarm window.
+    sprt_confirmed = False
+    if primary_alarm and suspect >= 0:
+        sprt = SPRT(mean0=0.0, mean1=sprt_mean1, sigma=sprt_sigma)
+        start = max(fired_step, 0)
+        window = stream[start : start + confirm_window, suspect]
+        if window.size == 0:
+            window = stream[:, suspect][-confirm_window:]
+        for x in window:
+            if sprt.step(float(x)) == SPRT_ACCEPT_H1:
+                sprt_confirmed = True
+                break
+
+    # 3. BOCPD run-length on the pooled (mean) stream.
+    bocpd = BOCPD(max_run=min(300, max(8, t)))
+    pooled = stream.mean(axis=1)
+    for x in pooled:
+        bocpd.step(float(x))
+    cp_prob = float(bocpd.changepoint_prob(window=2))
+
+    # 4. hierarchical / graph-aware alarms.
+    hierarchical_alarm = False
+    fired_levels: list[str] = []
+    if groups:
+        scan = HierarchicalScan(
+            n_streams=d,
+            groups=groups,
+            adjacency=adjacency,
+            h_device=h_device,
+            h_group=h_group,
+        )
+        for ti in range(t):
+            res = scan.step(stream[ti])
+            if res["alarm"]:
+                hierarchical_alarm = True
+                for level, fired in res["group_fired"].items():  # type: ignore[union-attr]
+                    if fired and level not in fired_levels:
+                        fired_levels.append(level)
+
+    # 5. BH-FDR stream isolation from final CUSUM statistics.
+    stats = np.array([c.stat for c in cusums], dtype=np.float64)
+    # one-sided p-value under the standardised-statistic null.
+    from ..uncertainty.missingness import _normal_cdf
+
+    pvals = 1.0 - _normal_cdf(stats / max(h_device, 1e-9))
+    reject = _bh_reject(pvals, fdr)
+    isolated = tuple(int(i) for i in np.nonzero(reject)[0])
+
+    return ChangepointVerdict(
+        primary_alarm=primary_alarm,
+        sprt_confirmed=sprt_confirmed,
+        bocpd_recent_cp_prob=cp_prob,
+        hierarchical_alarm=hierarchical_alarm,
+        fired_levels=tuple(fired_levels),
+        isolated_streams=isolated,
+    )
+
+
+def _bh_reject(pvalues: np.ndarray, fdr: float) -> np.ndarray:
+    """Benjamini-Hochberg step-up rejection mask (FDR control, doc U §3)."""
+    p = np.asarray(pvalues, dtype=np.float64).ravel()
+    m = p.size
+    if m == 0:
+        return np.zeros(0, dtype=bool)
+    order = np.argsort(p)
+    ranked = p[order]
+    thresh = (np.arange(1, m + 1) / m) * fdr
+    below = ranked <= thresh
+    if not below.any():
+        return np.zeros(m, dtype=bool)
+    k = int(np.max(np.nonzero(below)[0]))
+    reject = np.zeros(m, dtype=bool)
+    reject[order[: k + 1]] = True
+    return reject
+
+
 __all__ = [
     "BOCPD",
     "CUSUM",
@@ -532,7 +677,9 @@ __all__ = [
     "SPRT_ACCEPT_H0",
     "SPRT_ACCEPT_H1",
     "SPRT_CONTINUE",
+    "ChangepointVerdict",
     "HierarchicalScan",
     "ShiryaevRoberts",
+    "detect_confirm_isolate",
     "gaussian_shift_llr",
 ]

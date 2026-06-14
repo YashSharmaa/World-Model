@@ -1,0 +1,121 @@
+{
+  "branch_windows": [
+    {
+      "abstained": {},
+      "action_ids": [
+        "hold",
+        "place-0",
+        "place-1",
+        "place-2"
+      ],
+      "baseline_action_id": "hold",
+      "pred_energy": {
+        "hold": 0.0,
+        "place-0": -0.33,
+        "place-1": -0.09,
+        "place-2": 0.03
+      },
+      "pred_risk": {},
+      "recommended": {
+        "place-0": true
+      },
+      "ref_unsafe": {},
+      "true_energy": {
+        "hold": 0.0,
+        "place-0": -0.3,
+        "place-1": -0.12,
+        "place-2": 0.06
+      },
+      "window_id": "31ccb69bdfb78e3df812b54a21b61c0c45c8012dc1242daed677260343636399"
+    },
+    {
+      "abstained": {},
+      "action_ids": [
+        "hold",
+        "place-0",
+        "place-1",
+        "place-2"
+      ],
+      "baseline_action_id": "hold",
+      "pred_energy": {
+        "hold": 0.0,
+        "place-0": -0.33,
+        "place-1": -0.09,
+        "place-2": 0.03
+      },
+      "pred_risk": {},
+      "recommended": {
+        "place-0": true
+      },
+      "ref_unsafe": {},
+      "true_energy": {
+        "hold": 0.0,
+        "place-0": -0.3,
+        "place-1": -0.12,
+        "place-2": 0.06
+      },
+      "window_id": "31ccb69bdfb78e3df812b54a21b61c0c45c8012dc1242daed677260343636399"
+    }
+  ],
+  "n_branches": 4,
+  "rho_pair": 0.4,
+  "tau_mix": 2.0,
+  "window_features": [
+    {
+      "action_family": "place",
+      "horizon_s": 300,
+      "source_health": "observed",
+      "topology_family": "cross_rack",
+      "workload_family": "allreduce_heavy"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 900,
+      "source_health": "observed",
+      "topology_family": "cross_rack",
+      "workload_family": "allreduce_heavy"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 1800,
+      "source_health": "observed",
+      "topology_family": "cross_rack",
+      "workload_family": "allreduce_heavy"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 3600,
+      "source_health": "observed",
+      "topology_family": "cross_rack",
+      "workload_family": "allreduce_heavy"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 300,
+      "source_health": "observed",
+      "topology_family": "single_rack",
+      "workload_family": "throughput"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 900,
+      "source_health": "observed",
+      "topology_family": "single_rack",
+      "workload_family": "throughput"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 1800,
+      "source_health": "observed",
+      "topology_family": "single_rack",
+      "workload_family": "throughput"
+    },
+    {
+      "action_family": "place",
+      "horizon_s": 3600,
+      "source_health": "observed",
+      "topology_family": "single_rack",
+      "workload_family": "throughput"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "author": "Yash Sharma",
+  "author_url": "https://www.linkedin.com/in/yashsharmaa/",
+  "credit": "Done by Yash Sharma \u2014 https://www.linkedin.com/in/yashsharmaa/",
+  "generator_commit": "930d6de8fcb5dd4f1ea8663f1d83ca114092b0d8",
+  "project": "gpu-center-world-model",
+  "schema_version": "1.0.0",
+  "windows": [
+    {
+      "family": "semantics",
+      "label_uri": "pack/eval_inputs.json#trackA-feasible-place",
+      "n_branches": 2,
+      "scenario_id": "trackA-feasible-place",
+      "scenario_state_hash": "fc22e3b78d5db1158e51ca212bfcde9f1542961873debd8924c3ab8add55863e",
+      "split": "test_intervention",
+      "window_uri": "pack/eval_inputs.json#trackA-feasible-place"
+    },
+    {
+      "family": "semantics",
+      "label_uri": "pack/eval_inputs.json#trackA-infeasible-gang",
+      "n_branches": 1,
+      "scenario_id": "trackA-infeasible-gang",
+      "scenario_state_hash": "44da9637476e959bf9a9eea8c3ab948e47522ef6578a62c32d431be757a6ba63",
+      "split": "test_topology",
+      "window_uri": "pack/eval_inputs.json#trackA-infeasible-gang"
+    }
+  ]
+}

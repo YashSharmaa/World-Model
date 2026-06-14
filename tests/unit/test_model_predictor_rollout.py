@@ -219,3 +219,67 @@ def test_smoke_train_runs_with_predictor():
     report = smoke_train(cfg=TrainConfig(seed=1))
     assert report.steps > 0
     assert not report.collapsed()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UNC-BATCHENSEMBLE: rank-1 fast weights + calibrated disagreement mapping
+# ──────────────────────────────────────────────────────────────────────────────
+def test_batchensemble_is_rank1_over_shared_backbone():
+    """Epistemic uses rank-1 fast weights over ONE shared backbone (doc L)."""
+    from gpu_center_world_model.model.world_model import BatchEnsembleMember
+
+    m = ResidualWorldModel.build(n_ensemble=3, n_oracle=0)
+    # rank-1 members exist; the deep ensemble (oracle) is skipped on this build.
+    assert len(m.be_members) == 2
+    assert m.ensemble == []
+    assert all(isinstance(mem, BatchEnsembleMember) for mem in m.be_members)
+    # each member is a per-type pair of rank-1 vectors (r, s), not a full backbone.
+    mem = m.be_members[0]
+    for t, r in mem.r.items():
+        assert r.ndim == 1 and mem.s[t].ndim == 1
+
+
+def test_batchensemble_member_apply_is_a_rank1_modulation():
+    """A member modulates the shared latent by ``s ∘ tanh(r ∘ z)`` per type."""
+    from gpu_center_world_model.model.world_model import BatchEnsembleMember
+
+    mem = BatchEnsembleMember.build({"workload": 4}, seed=1)
+    z = {"workload": np.ones((3, 4))}
+    out = mem.apply(z)["workload"]
+    expected = mem.s["workload"] * np.tanh(mem.r["workload"] * np.ones((3, 4)))
+    assert np.allclose(out, expected)
+
+
+def test_batchensemble_disagreement_is_nonzero_and_serving_stable():
+    """The rank-1 ensemble yields non-trivial disagreement; contract is stable."""
+    m = ResidualWorldModel.build(n_ensemble=3, n_oracle=0)
+    state, uid = _state()
+    bundles = m.score_actions(
+        state,
+        [
+            Hold(workload_uid=uid),
+            Admit(
+                workload_uid=uid, cluster_queue_id="cq-0", resource_flavor_id="flavor-0"
+            ),
+        ],
+        HORIZONS_S[2],
+    )
+    assert len(bundles) == 2
+    # rank-1 members disagree with the shared backbone -> positive epistemic.
+    assert bundles[0].epistemic_score > 0.0
+    # encode contract unchanged.
+    z = m.encode(state)
+    assert "workload" in z and "global" in z
+
+
+def test_epistemic_scale_calibration_replaces_exp_squash():
+    """calibrate_epistemic_scale fits a held-out scale; ID windows score < 1."""
+    m = ResidualWorldModel.build(n_ensemble=3, n_oracle=0)
+    states = [_state()[0] for _ in range(6)]
+    # before calibration: the ad-hoc 1 - exp(-d) bounded squash is used.
+    assert m.epistemic_scale == 0.0
+    scale = m.calibrate_epistemic_scale(states)
+    assert scale > 0.0 and m.epistemic_scale == scale
+    # an ID window now maps through d/scale (clipped), a genuine calibration.
+    b = m.score_actions(states[0], [Hold(workload_uid=_state()[1])], HORIZONS_S[2])[0]
+    assert 0.0 <= b.epistemic_score <= 1.0

@@ -441,6 +441,66 @@ class DegradationFilter:
             out.append(belief)
         return out
 
+    # -- EM parameter fit (replace hardcoded constants) ----------------------
+    def fit_em(
+        self,
+        streams: list[tuple[list[SourceHealth], list[float | None]]],
+        *,
+        neighbor_fault: float = 0.0,
+        n_iter: int = 8,
+        prior: dict[DeviceHealth, float] | None = None,
+    ) -> DegradationParams:
+        """EM-fit the HSMM emission + regime parameters on residualised streams.
+
+        Replaces the hardcoded ``regime_logits`` / ``emission_mean`` /
+        ``emission_std`` constants with maximum-likelihood estimates from data
+        (doc U §2 T1 EM). One EM iteration runs the exact forward (state, dwell)
+        filter to obtain the per-step state-marginal responsibilities
+        ``gamma_t(s)`` (E-step), then re-estimates (M-step):
+
+        * **emission Gaussian** ``(mu_s, sigma_s)`` of the residualised health
+          index from the responsibility-weighted observed values, and
+        * **regime softmax** ``P(R | Z=s)`` from the responsibility-weighted
+          observed-regime counts (Laplace-smoothed), whose logits overwrite
+          ``regime_logits``.
+
+        The semi-Markov successor matrix and dwell scale are kept structural
+        (the degradation cascade is a domain prior, doc U §2 A2); EM refines the
+        *observation* model, which is what the residualised telemetry identifies.
+        Returns (and stores) the fitted :class:`DegradationParams`.
+        """
+        params = self.params
+        for _ in range(max(1, n_iter)):
+            # accumulators
+            val_num = np.zeros(N_STATES)
+            val_w = np.zeros(N_STATES)
+            val_sq = np.zeros(N_STATES)
+            reg_counts = np.full((N_STATES, N_REGIMES), 1e-3)  # Laplace prior
+            for regimes, values in streams:
+                belief = self.init_belief(prior)
+                for r, v in zip(regimes, values, strict=False):
+                    belief = self.update(
+                        belief, regime=r, value=v, neighbor_fault=neighbor_fault
+                    )
+                    gamma = belief.state_marginal()  # (N_STATES,)
+                    reg_counts[:, REGIME_INDEX[r]] += gamma
+                    if r == SourceHealth.OBSERVED and v is not None:
+                        val_num += gamma * float(v)
+                        val_sq += gamma * float(v) ** 2
+                        val_w += gamma
+            # M-step: emission Gaussian.
+            w = np.maximum(val_w, 1e-6)
+            mu = np.where(val_w > 1e-6, val_num / w, params.emission_mean)
+            var = np.where(val_w > 1e-6, val_sq / w - mu**2, params.emission_std**2)
+            sigma = np.sqrt(np.maximum(var, 1e-2))
+            params.emission_mean = mu
+            params.emission_std = sigma
+            # M-step: regime softmax logits from smoothed counts.
+            reg_p = reg_counts / reg_counts.sum(axis=1, keepdims=True)
+            params.regime_logits = np.log(np.maximum(reg_p, 1e-6))
+        self.params = params
+        return params
+
 
 __all__ = [
     "HEALTH_STATES",
