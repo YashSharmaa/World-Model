@@ -12,7 +12,107 @@
 
 import { chip, el, fmtDelta, fmtSeconds, type PanelHandle } from "./dom";
 import type { Store, StoreState } from "../state/store";
-import type { CandidateResultDTO, WorkloadDTO } from "../api/client";
+import type {
+  CandidateResultDTO,
+  QuantileForecastDTO,
+  QueueDTO,
+  WorkloadDTO,
+} from "../api/client";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl<K extends keyof SVGElementTagNameMap>(
+  tag: K,
+  attrs: Record<string, string | number>,
+): SVGElementTagNameMap[K] {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+  return node;
+}
+
+/**
+ * Render a p05-p95 confidence ribbon around the p50 median for ONE quantile
+ * forecast (doc G animation_rules "Uncertainty display": confidence bands in
+ * charts). The fan is drawn as a filled p05-p95 band, a lighter p10-p90 inner
+ * band, and a solid p50 median line, normalised within the candidate's own
+ * channel range so the relative spread is legible at a glance. Returns null when
+ * the forecast lacks the quantile heads needed for a band.
+ */
+function bandChart(forecast: QuantileForecastDTO, label: string): HTMLElement | null {
+  const q = forecast.quantiles;
+  const p05 = q["0.05"];
+  const p50 = q["0.5"];
+  const p95 = q["0.95"];
+  if (p05 == null || p50 == null || p95 == null) return null;
+  const p10 = q["0.1"] ?? p05;
+  const p90 = q["0.9"] ?? p95;
+
+  const lo = Math.min(p05, p50, p95);
+  const hi = Math.max(p05, p50, p95);
+  const span = Math.max(1e-6, hi - lo);
+  const W = 132;
+  const H = 26;
+  const padX = 2;
+  const x = (v: number): number => padX + ((v - lo) / span) * (W - padX * 2);
+
+  const wrap = el("div", "band-chart");
+  const cap = el("div", "band-cap");
+  cap.append(
+    el("span", "", label),
+    el("span", "band-spread", `±${fmtDelta((p95 - p05) / 2, "", 0).replace("+", "")}`),
+  );
+  wrap.appendChild(cap);
+
+  const svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+  const midY = H / 2;
+  // outer p05-p95 band
+  svg.appendChild(
+    svgEl("rect", {
+      x: x(p05),
+      y: midY - 8,
+      width: Math.max(1, x(p95) - x(p05)),
+      height: 16,
+      rx: 3,
+      fill: "var(--predicted)",
+      "fill-opacity": "0.18",
+    }),
+  );
+  // inner p10-p90 band
+  svg.appendChild(
+    svgEl("rect", {
+      x: x(p10),
+      y: midY - 6,
+      width: Math.max(1, x(p90) - x(p10)),
+      height: 12,
+      rx: 2,
+      fill: "var(--predicted)",
+      "fill-opacity": "0.34",
+    }),
+  );
+  // p50 median tick
+  svg.appendChild(
+    svgEl("line", {
+      x1: x(p50),
+      y1: midY - 9,
+      x2: x(p50),
+      y2: midY + 9,
+      stroke: "var(--grounded)",
+      "stroke-width": 2,
+    }),
+  );
+  wrap.appendChild(svg);
+  return wrap;
+}
+
+/** Short human channel label for the band-chart caption. */
+const CHANNEL_LABELS: Record<string, string> = {
+  queue_wait_delta_s: "Queue wait band",
+  rack_thermal_headroom_c: "Thermal headroom band",
+  admitted_gpu_hours_delta: "Admitted GPU-h band",
+  topology_fragmentation_delta: "Fragmentation band",
+  completion_time_delta_s: "Completion band",
+  cross_rack_rate: "Cross-rack band",
+};
 
 /** Human labels for the KPI delta channels shown in the recommendation panel. */
 const KPI_LABELS: Record<string, [string, string, "lowerBetter" | "higherBetter"]> = {
@@ -39,16 +139,34 @@ export function createQueueStrip(parent: HTMLElement, store: Store): PanelHandle
   root.appendChild(list);
   parent.appendChild(root);
 
-  function card(wl: WorkloadDTO, focused: boolean): HTMLElement {
+  function card(wl: WorkloadDTO, focused: boolean, queue: QueueDTO | null): HTMLElement {
     const c = el("div", `wl-card ${focused ? "focused" : ""}`);
     const title = el("div", "wl-card-title");
     title.append(el("span", "", wl.workload_uid), el("span", "", `${wl.gpu_req} GPU`));
+    // Resource ask + queue age + PRIORITY are first-class card fields (doc G
+    // "Workload queue strip" contents: resource ask, queue age, priority).
     const meta = el(
       "div",
       "wl-meta",
       `${wl.tenant_id} · ${wl.topology_policy} · ${wl.comm_class} · age ${fmtSeconds(wl.age_s)}`,
     );
-    c.append(title, meta);
+    const prio = el("div", "wl-meta");
+    prio.append(
+      el("span", "wl-prio", `priority ${wl.priority}`),
+      // Queue context: where this job sits in its local queue and the live wait.
+      el(
+        "span",
+        "",
+        queue
+          ? ` · queue ${wl.local_queue_id}: ${queue.pending_ct} pending (${queue.pending_gpu} GPU) · wait p95 ${fmtSeconds(queue.wait_time_p95_s)}`
+          : ` · queue ${wl.local_queue_id}`,
+      ),
+    );
+    c.append(title, meta, prio);
+
+    // Per-candidate action chips (doc G queue strip "candidate action chips"):
+    // the focused workload exposes its kernel-safe alphabet (hold / admit A /
+    // admit B) right on the card so the decision target stays on the strip.
     const chips = el("div", "wl-chips");
     chips.append(
       chip("Compare actions", () => {
@@ -56,6 +174,26 @@ export function createQueueStrip(parent: HTMLElement, store: Store): PanelHandle
         void store.runCompare();
       }),
     );
+    if (focused) {
+      const cmp = store.get().compare;
+      if (cmp) {
+        for (const cand of [...cmp.candidates].sort(
+          (a, b) => (a.rank ?? 99) - (b.rank ?? 99),
+        )) {
+          const cls = !cand.safe ? "danger" : cand.action_id === cmp.recommended_action_id ? "active" : "";
+          chips.append(
+            chip(
+              `${cand.safe ? "▶" : "🔒"} ${actionLabel(cand)}`,
+              () => {
+                if (cand.safe) store.playBranch(cand.action_id);
+                else void store.showWhyNot(cand.action_id);
+              },
+              cls,
+            ),
+          );
+        }
+      }
+    }
     c.appendChild(chips);
     c.addEventListener("click", () => store.setFocusedWorkload(wl.workload_uid));
     return c;
@@ -72,7 +210,12 @@ export function createQueueStrip(parent: HTMLElement, store: Store): PanelHandle
         list.appendChild(el("div", "wl-meta", "No pending workloads."));
         return;
       }
-      for (const wl of pend) list.appendChild(card(wl, wl.workload_uid === s.focusedWorkload));
+      const queues = s.snapshot?.entities.queues ?? [];
+      for (const wl of pend) {
+        const queue =
+          queues.find((q) => q.name === wl.local_queue_id) ?? null;
+        list.appendChild(card(wl, wl.workload_uid === s.focusedWorkload, queue));
+      }
     },
   };
 }
@@ -89,6 +232,12 @@ export function createRecommendation(parent: HTMLElement, store: Store): PanelHa
   return {
     root,
     update(s: StoreState) {
+      // In replay-calibration the right rail belongs to the calibration panel;
+      // the recommendation panel always yields the slot so they never overlap.
+      if (s.mode === "replay-calibration") {
+        root.classList.add("hidden");
+        return;
+      }
       const cmp = s.compare;
       if (!cmp) {
         best.innerHTML = "";
@@ -96,7 +245,7 @@ export function createRecommendation(parent: HTMLElement, store: Store): PanelHa
         best.appendChild(
           el("div", "wl-meta", "Select a workload and compare safe actions."),
         );
-        root.classList.toggle("hidden", s.mode === "replay-calibration");
+        root.classList.remove("hidden");
         return;
       }
       root.classList.remove("hidden");
@@ -169,6 +318,13 @@ function rowFor(
     head.append(el("span", "badge safe", "SAFE"));
   }
 
+  // Epistemic / OOD confidence badges (doc G: "confidence badges"). Learned
+  // uncertainty is shown as its OWN signal, distinct from the exact-kernel gate.
+  const ep = c.uncertainty.epistemic_score;
+  const ood = c.uncertainty.ood_score;
+  head.append(confBadge("Epi", ep, 0.3, 0.45));
+  head.append(confBadge("OOD", ood, 0.2, 0.35));
+
   const actions = el("div", "rec-actions");
   if (!c.safe) {
     actions.append(chip("Why not?", () => void store.showWhyNot(c.action_id), "danger"));
@@ -209,9 +365,29 @@ function rowFor(
     );
     kpis.appendChild(cell);
   }
-  wrap.append(kpis, actions);
+  wrap.append(kpis);
+
+  // Confidence band charts (p05-p95 ribbon around p50) — one per forecast channel
+  // the model returned. These are the learned forecast spread, kept visually
+  // separate from the exact-kernel verdict above (doc G uncertainty display).
+  if (c.uncertainty.quantiles.length) {
+    const bands = el("div", "rec-bands");
+    for (const fc of c.uncertainty.quantiles) {
+      const chart = bandChart(fc, CHANNEL_LABELS[fc.channel] ?? fc.channel);
+      if (chart) bands.appendChild(chart);
+    }
+    if (bands.childElementCount) wrap.append(bands);
+  }
+
+  wrap.append(actions);
   row.append(wrap);
   return row;
+}
+
+/** A small coloured confidence badge: green (low), amber (mid), red (high). */
+function confBadge(label: string, value: number, mid: number, hi: number): HTMLElement {
+  const cls = value >= hi ? "blocked" : value >= mid ? "abstain" : "safe";
+  return el("span", `badge conf ${cls}`, `${label} ${value.toFixed(2)}`);
 }
 
 /** Self-captioning beat caption (doc G: works when the video plays muted). */

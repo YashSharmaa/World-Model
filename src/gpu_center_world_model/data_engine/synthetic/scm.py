@@ -561,6 +561,220 @@ def emit_gpu_telemetry(
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Dynamic linear coregionalization telemetry backbone (doc R Eq17-Eq20)
+# ──────────────────────────────────────────────────────────────────────────────
+#: The shared GPU telemetry channels emitted per step (DCGM canonical names).
+_DLC_CHANNELS: tuple[str, ...] = (
+    "DCGM_FI_DEV_GPU_UTIL",
+    "DCGM_FI_DEV_MEM_COPY_UTIL",
+    "DCGM_FI_DEV_POWER_USAGE",
+    "DCGM_FI_DEV_GPU_TEMP",
+)
+
+#: Per-channel factor loadings Λ (rows = channels, col = shared latent factor).
+#: A single shared factor f_t drives all four channels coherently: utilisation,
+#: power, and temperature rise and fall *together* under the common workload-phase
+#: load, never independently (doc R Eq17 / rejected "independent per-channel
+#: sampling"). Power/temp load harder on f than the bounded utilisation channels.
+#: **Uncalibrated priors** (doc D calibrated_bounds_only tier).
+_DLC_LOADING: dict[str, float] = {
+    "DCGM_FI_DEV_GPU_UTIL": 0.04,
+    "DCGM_FI_DEV_MEM_COPY_UTIL": 0.035,
+    "DCGM_FI_DEV_POWER_USAGE": 12.0,
+    "DCGM_FI_DEV_GPU_TEMP": 0.9,
+}
+
+#: Per-channel idiosyncratic noise scale ε (small relative to the shared factor).
+_DLC_EPS: dict[str, float] = {
+    "DCGM_FI_DEV_GPU_UTIL": 0.012,
+    "DCGM_FI_DEV_MEM_COPY_UTIL": 0.012,
+    "DCGM_FI_DEV_POWER_USAGE": 3.0,
+    "DCGM_FI_DEV_GPU_TEMP": 0.25,
+}
+
+#: Per-regime factor-AR persistence G_t (cross-channel lag depth, doc R Eq17).
+#: A bursty regime gives the shared factor more momentum (slower-decaying
+#: cross-channel lag), a draining regime less.
+_DLC_REGIME_G: dict[str, float] = {
+    "steady": 0.6,
+    "ramping": 0.7,
+    "burst": 0.82,
+    "drain": 0.4,
+    "normal": 0.6,
+}
+
+
+@dataclass(slots=True)
+class DLCEmitter:
+    """Dynamic-linear-coregionalization telemetry state (doc R Eq17).
+
+    Carries the shared latent factor ``f_t`` with regime/phase-conditioned AR
+    momentum ``G_t`` and the per-channel loadings ``Λ_t`` and idiosyncratic noise.
+    One emitter per GPU keeps each device's factor independent while the *channels*
+    of a device move coherently (cross-channel correlation + lag) — exactly the
+    DynLMC backbone doc R selects over independent per-channel Gaussian noise.
+    """
+
+    f: float = 0.0  # shared latent factor f_t
+
+    def step(
+        self,
+        phase: str,
+        regime: str,
+        health: str,
+        rng: np.random.Generator,
+    ) -> dict[str, float]:
+        """Advance the factor one step and return per-channel DLC offsets.
+
+        ``f_t = G_t f_{t-Δ} + η_t`` with ``G_t`` from the regime and an innovation
+        ``η_t`` whose magnitude is the workload-phase comm activity (a collective
+        phase drives bigger correlated swings). The returned offsets ``Λ f_t + ε``
+        are *added* to the channel means by :func:`telemetry_emission`, so a power
+        excursion co-occurs with a temperature rise and a utilisation dip — the
+        coherent cross-channel structure (doc R Eq17/Eq18 lagged transfer).
+        """
+        g_t = _DLC_REGIME_G.get(regime, 0.6)
+        _sm, _mem, comm = _PHASE_UTIL.get(phase, _PHASE_UTIL["staging"])
+        eta = float(rng.normal(0.0, 0.3 + 0.7 * comm))
+        self.f = g_t * self.f + eta
+        # A degraded/faulting device emits *noisier* telemetry (the idiosyncratic
+        # ε channel variance widens) — failures often surface first as erratic
+        # readings, so device health modulates the emission noise (doc R Eq20).
+        noise_scale = {
+            "healthy": 1.0,
+            "degraded": 1.6,
+            "intermittently_faulty": 2.5,
+            "reset_recovery": 2.0,
+            "masked": 1.0,
+        }.get(health, 1.0)
+        offsets: dict[str, float] = {}
+        for ch in _DLC_CHANNELS:
+            eps = float(rng.normal(0.0, _DLC_EPS[ch] * noise_scale))
+            offsets[ch] = _DLC_LOADING[ch] * self.f + eps
+        return offsets
+
+
+def telemetry_emission(
+    gpu_id: str,
+    phase: str,
+    health: str,
+    temp_c: float,
+    power_w: float,
+    regime: str,
+    emitter: DLCEmitter,
+    rng: np.random.Generator,
+    *,
+    ts_ns: int,
+    source_health: SourceHealth = SourceHealth.OBSERVED,
+) -> Observation:
+    """Emit a GPU telemetry :class:`Observation` through the DLC backbone (Eq17).
+
+    Like :func:`emit_gpu_telemetry` the channel *means* are children of (phase,
+    health) — never independent — but the per-step noise is replaced by the
+    coregionalized offsets ``Λ_t f_t + ε_t`` from a shared latent factor, so the
+    util/mem/power/temp channels of a device move together with regime-conditioned
+    cross-channel lag (doc R Eq17). The physical ``temp_c`` / ``power_w`` passed in
+    are the RC-thermal/power-surrogate values; the DLC offsets ride on top as the
+    correlated observation residual. Missingness travels as source-health state.
+    """
+    sm, mem, _comm = _PHASE_UTIL.get(phase, _PHASE_UTIL["staging"])
+    deg = {
+        "healthy": 1.0,
+        "degraded": 0.85,
+        "intermittently_faulty": 0.5,
+        "reset_recovery": 0.0,
+        "masked": 0.0,
+    }[health]
+    available = source_health in (SourceHealth.OBSERVED, SourceHealth.DELAYED)
+    age = 0.0 if source_health == SourceHealth.OBSERVED else 30.0
+    off = emitter.step(phase, regime, health, rng)
+    util = float(np.clip(sm * deg + off["DCGM_FI_DEV_GPU_UTIL"], 0.0, 1.0))
+    memutil = float(np.clip(mem * deg + off["DCGM_FI_DEV_MEM_COPY_UTIL"], 0.0, 1.0))
+    power = float(max(0.0, power_w * deg + off["DCGM_FI_DEV_POWER_USAGE"]))
+    temp = float(temp_c + off["DCGM_FI_DEV_GPU_TEMP"])
+    xid = 0
+    if health == "intermittently_faulty" and rng.random() < 0.2:
+        xid = int(rng.choice([48, 63, 79, 94]))
+
+    def ch(name: str, value: float) -> Channel:
+        return Channel(
+            name=name,
+            value=value,
+            available=available,
+            age_s=age,
+            source_health=source_health,
+        )
+
+    channels = {
+        "DCGM_FI_DEV_GPU_UTIL": ch("DCGM_FI_DEV_GPU_UTIL", util * 100.0),
+        "DCGM_FI_DEV_MEM_COPY_UTIL": ch("DCGM_FI_DEV_MEM_COPY_UTIL", memutil * 100.0),
+        "DCGM_FI_DEV_POWER_USAGE": ch("DCGM_FI_DEV_POWER_USAGE", power),
+        "DCGM_FI_DEV_GPU_TEMP": ch("DCGM_FI_DEV_GPU_TEMP", temp),
+        "DCGM_FI_DEV_XID_ERRORS": ch("DCGM_FI_DEV_XID_ERRORS", float(xid)),
+    }
+    return Observation(
+        entity_kind="gpu",
+        entity_id=gpu_id,
+        family=ObservationFamily.GPU_TELEMETRY,
+        ts_event_ns=ts_ns,
+        channels=channels,
+    )
+
+
+def sample_operator_mode(
+    state: str,
+    visible_stress: float,
+    rng: np.random.Generator,
+    *,
+    manual_override: str | None = None,
+) -> str:
+    """One step of the confounded operator-policy mode O (doc R Eq6).
+
+    ``Oτ+1 = fO(Oτ, visible_stateτ, policy_thresholdsτ, manual_override, U^O)``: the
+    operator mode is a *confounder* of the observational action propensity — under
+    high visible stress (headroom pressure, fault precursors) the operator tilts
+    toward ``conservative``/``incident`` modes, which in turn make the observational
+    action law ``πobs`` more cautious (doc R Eq16). A manual override clamps the
+    mode deterministically (the guardrail path). ``visible_stress`` ∈ [0, 1].
+    """
+    if manual_override is not None and manual_override in OPERATOR_MODES:
+        return manual_override
+    s = float(min(max(visible_stress, 0.0), 1.0))
+    # base self-persistence; stress shifts mass toward conservative/incident.
+    table: dict[str, dict[str, float]] = {
+        "normal": {"normal": 0.95 - 0.5 * s, "conservative": 0.05 + 0.4 * s,
+                   "incident": 0.1 * s},
+        "conservative": {"conservative": 0.85 - 0.3 * s, "normal": 0.15 - 0.1 * s,
+                         "incident": 0.05 + 0.4 * s},
+        "incident": {"incident": 0.7 + 0.2 * s, "conservative": 0.3 - 0.2 * s},
+        "maintenance": {"maintenance": 0.9, "normal": 0.1},
+    }[state]
+    keys = list(table)
+    probs = np.array([max(table[k], 0.0) for k in keys], dtype=float)
+    probs = np.clip(probs, 0.0, None)
+    if probs.sum() <= 0:
+        return state
+    probs = probs / probs.sum()
+    return str(rng.choice(keys, p=probs))
+
+
+def pi_obs_caution(operator_mode: str) -> float:
+    """Observational action caution πobs ∈ [0, 1] under the operator mode (Eq16).
+
+    The confounded observational action model: a conservative/incident operator is
+    *more* likely to hold and *less* likely to admit aggressively (doc R Eq16
+    confounded action law). Returns the caution weight the branch uses to attribute
+    an observational-action propensity to each candidate (higher ⇒ holds favoured).
+    """
+    return {
+        "normal": 0.1,
+        "conservative": 0.5,
+        "maintenance": 0.8,
+        "incident": 0.9,
+    }.get(operator_mode, 0.1)
+
+
 def context_from_latents(
     regime: str, operator_mode: str, cooling_state: str, ambient_c: float
 ) -> ExogenousContext:
@@ -641,6 +855,7 @@ __all__ = [
     "HEALTH_STATES",
     "OPERATOR_MODES",
     "WORKLOAD_PHASES",
+    "DLCEmitter",
     "PhaseProgram",
     "PodSpec",
     "PodTopology",
@@ -648,8 +863,11 @@ __all__ = [
     "calibrated_posterior",
     "context_from_latents",
     "emit_gpu_telemetry",
+    "pi_obs_caution",
+    "sample_operator_mode",
     "sample_phase_program",
     "source_state_from_health",
     "step_cooling",
     "step_health",
+    "telemetry_emission",
 ]

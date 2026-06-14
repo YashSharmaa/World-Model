@@ -265,6 +265,19 @@ export function buildMockSnapshot(tick = 0): StateSnapshotDTO {
         dst_kind: "switch",
         pairs: nodes.map((n) => [n.node_uid, n.switch_id]),
       },
+      // ToR-to-ToR spine fabric: every rack's switch links to the next, plus a
+      // cross-block link, so the renderer can build inter-rack link geometry from
+      // the relation array (the topology QUALITY the demo cares about) rather
+      // than an index heuristic. switch_id mirrors `tor-${rack_id}`.
+      {
+        type: "LINKED_TO",
+        src_kind: "switch",
+        dst_kind: "switch",
+        pairs: RACK_IDS.flatMap((rid, i): Array<[string, string]> => {
+          const next = RACK_IDS[(i + 1) % RACK_IDS.length];
+          return next !== rid ? [[`tor-${rid}`, `tor-${next}`]] : [];
+        }),
+      },
     ],
     current_kpis: {
       queue_wait_p95_s: 1260,
@@ -281,6 +294,80 @@ export function buildMockSnapshot(tick = 0): StateSnapshotDTO {
       worst_source_health: "observed",
     },
     credit: CREDIT,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// SSE state_delta (partial merge-by-id payload)
+// ──────────────────────────────────────────────────────────────────────────
+/**
+ * Build a PARTIAL `state_delta` for the offline SSE loop: only the entities and
+ * KPIs that actually move tick-to-tick are included, so the frontend store can
+ * exercise a real merge-by-id (doc G transport: "return only changed entities").
+ *
+ * What changes each tick:
+ *   - the two head GPUs of rack-a1 breathe util / temp / power (live telemetry)
+ *   - the research queue's live p50/p95 wait times drift
+ *   - the pod-level free-GPU KPI + freshness age tick
+ * Everything else (the other ~126 GPUs, every rack/node/domain) is OMITTED and
+ * must be preserved by the store's by-id merge.
+ */
+export function buildMockStateDelta(tick: number): {
+  state_hash: string;
+  patch: Partial<StateSnapshotDTO>;
+} {
+  const rnd = prng(7919 + tick);
+  const phase = Math.sin(tick / 2);
+
+  // A couple of live GPU telemetry updates on rack-a1's first node.
+  const changedGpus: GPUDTO[] = [0, 1].map((g) => ({
+    gpu_uuid: `rack-a1-n0-g${g}`,
+    node_uid: "rack-a1-n0",
+    allocated_to: "wl-bg-rack-a1",
+    util: 0.55 + 0.4 * rnd(),
+    temp_c: 46 + 6 * phase + 4 * rnd(),
+    power_w: 470 + 160 * rnd(),
+    xid_code: 0,
+    health_state: "healthy",
+  }));
+
+  // The research queue's live wait times drift around the snapshot values.
+  const changedQueue: QueueDTO = {
+    name: "lq-research",
+    tenant_id: "tenant-research",
+    cluster_queue_ref: "cq-shared",
+    pending_ct: 1,
+    pending_gpu: 16,
+    wait_time_p50_s: Math.max(60, Math.round(420 + 90 * phase)),
+    wait_time_p95_s: Math.max(180, Math.round(1260 + 180 * phase)),
+  };
+
+  const base = buildMockSnapshot(0);
+  const usedGpu = base.entities.gpus.filter((g) => g.allocated_to).length;
+
+  return {
+    state_hash: `0x${(0xabc123 + tick * 0x1111).toString(16)}`,
+    patch: {
+      state_hash: `0x${(0xabc123 + tick * 0x1111).toString(16)}`,
+      generated_at: new Date(Date.UTC(2026, 5, 14, 9, 0, tick % 60)).toISOString(),
+      entities: {
+        // Only the changed families are present; the store merges them BY ID and
+        // leaves every other rack / node / GPU / domain untouched.
+        gpus: changedGpus,
+        queues: [changedQueue],
+      } as StateSnapshotDTO["entities"],
+      current_kpis: {
+        ...base.current_kpis,
+        queue_wait_p95_s: changedQueue.wait_time_p95_s,
+        free_gpu: base.entities.racks.length * NODES_PER_RACK * GPUS_PER_NODE - usedGpu,
+      },
+      freshness: {
+        scheduler_state_age_s: 8 + (tick % 5),
+        placement_state_age_s: 3 + (tick % 3),
+        gpu_telemetry_age_s: 4 + (tick % 4),
+        worst_source_health: "observed",
+      },
+    },
   };
 }
 
@@ -395,6 +482,27 @@ function buildRollout(
 const EPISTEMIC_ABSTAIN = 0.45;
 const OOD_ABSTAIN = 0.35;
 
+/**
+ * Build a five-point quantile fan { p05, p10, p50, p90, p95 } around a median.
+ * `spread` is the half-width of the p05-p95 ribbon; the p10/p90 heads sit at
+ * ~0.55 of that half-width so the ribbon reads as a calibrated fan, not a box.
+ * The fan is the data the recommendation band chart draws (doc G uncertainty
+ * display: "confidence bands in charts").
+ */
+function spreadQuantiles(
+  median: number,
+  spread: number,
+): Record<string, number> {
+  const half = Math.abs(spread);
+  return {
+    "0.05": median - half,
+    "0.1": median - half * 0.55,
+    "0.5": median,
+    "0.9": median + half * 0.55,
+    "0.95": median + half,
+  };
+}
+
 export function buildMockCompare(req: CompareRequest): CompareResultDTO {
   const horizon = req.horizon_s || 1800;
 
@@ -449,10 +557,17 @@ export function buildMockCompare(req: CompareRequest): CompareResultDTO {
           abstain: false,
           abstain_reason: null,
           quantiles: [
+            // Five-point quantile fan (p05/p10/p50/p90/p95) so the recommendation
+            // band chart can draw a real p05-p95 ribbon around the p50 median.
             {
               channel: "queue_wait_delta_s",
               horizon_s: horizon,
-              quantiles: { "0.05": -540, "0.5": -420, "0.95": -180 },
+              quantiles: spreadQuantiles(-420, 160),
+            },
+            {
+              channel: "rack_thermal_headroom_c",
+              horizon_s: horizon,
+              quantiles: spreadQuantiles(-5.5, 2.2),
             },
           ],
           hazards: [
@@ -544,14 +659,23 @@ export function buildMockCompare(req: CompareRequest): CompareResultDTO {
         abstain,
         abstain_reason: abstainReason,
         quantiles: [
+          // Quantile spread widens with epistemic uncertainty so the band chart
+          // visibly fans out for the tighter / worse-locality candidates.
           {
             channel: "queue_wait_delta_s",
             horizon_s: horizon,
-            quantiles: {
-              "0.05": (deltaKpis.queue_wait_delta_s ?? 0) - 120,
-              "0.5": deltaKpis.queue_wait_delta_s ?? 0,
-              "0.95": (deltaKpis.queue_wait_delta_s ?? 0) + 180,
-            },
+            quantiles: spreadQuantiles(
+              deltaKpis.queue_wait_delta_s ?? 0,
+              150 + 600 * epistemic,
+            ),
+          },
+          {
+            channel: "rack_thermal_headroom_c",
+            horizon_s: horizon,
+            quantiles: spreadQuantiles(
+              deltaKpis.rack_thermal_headroom_c ?? 0,
+              1.5 + 5 * epistemic,
+            ),
           },
         ],
         hazards: [
@@ -726,12 +850,30 @@ export function buildMockReplay(scenarioId: string): ReplayDTO {
       ? { targetRack: null, holdFreesRack: "rack-a1" }
       : { targetRack },
   );
+  // Realized diverges from prediction at t=720 across THREE channels so the
+  // replay error badges (queue wait, hotspot, headroom) each carry real signal:
+  //   - hotspot the predictor UNDER-called (realized curve sits above predicted)
+  //   - occupancy realized slightly higher (extra spillover pods landed)
+  //   - queue_depth stays one deeper than predicted (a job requeued, didn't drain)
+  const divergeRack = targetRack ?? "rack-a1";
   for (const p of realized.points) {
-    if (p.t_s >= 720 && targetRack) {
-      p.rack_hotspot[targetRack] = Math.min(
+    if (p.t_s >= 720) {
+      p.rack_hotspot[divergeRack] = Math.min(
         1,
-        (p.rack_hotspot[targetRack] ?? 0) + 0.22,
+        (p.rack_hotspot[divergeRack] ?? 0) + 0.22,
       );
+      p.rack_occupancy[divergeRack] = Math.min(
+        0.99,
+        (p.rack_occupancy[divergeRack] ?? 0) + 0.06,
+      );
+      p.queue_depth = p.queue_depth + 1;
+      if (p.t_s === 720)
+        p.events.push({
+          t_s: p.t_s,
+          kind: "hotspot",
+          entity_id: divergeRack,
+          detail: "realized hotspot exceeded prediction (under-called)",
+        });
     }
   }
 

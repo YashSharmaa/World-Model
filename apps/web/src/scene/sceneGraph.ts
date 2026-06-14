@@ -107,7 +107,7 @@ export function buildSceneGraph(snapshot: StateSnapshotDTO): SceneGraph {
   function attach(snap: StateSnapshotDTO): void {
     const { racks, nodes, gpus, workloads } = snap.entities;
     sg.racks = buildRacks(racks, nodes, gpus, materials);
-    sg.network = buildNetwork(sg.racks.racks, materials);
+    sg.network = buildNetwork(sg.racks.racks, materials, snap.relations);
     sg.domains = buildDomains(racks, sg.racks.racks, materials);
     sg.workloads = buildWorkloads(workloads, materials);
     sg.branches = createBranchesRoot();
@@ -141,6 +141,11 @@ export function buildSceneGraph(snapshot: StateSnapshotDTO): SceneGraph {
       if (hit.object === sg.racks.slotMesh && hit.instanceId != null) {
         const slot = sg.racks.slotIndex[hit.instanceId];
         if (slot) return { kind: "gpu", id: slot.gpuUuid };
+      }
+      // node_instanced_mesh shelves: map the instanceId back to a node identity.
+      if (hit.object === sg.racks.shelfMesh && hit.instanceId != null) {
+        const shelf = sg.racks.shelfIndex[hit.instanceId];
+        if (shelf) return { kind: "node", id: shelf.nodeUid };
       }
       const ud = hit.object.userData as { kind?: Selection["kind"]; id?: string };
       if (ud?.kind && ud.id) return { kind: ud.kind, id: ud.id };

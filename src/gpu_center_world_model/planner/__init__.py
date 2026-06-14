@@ -35,18 +35,38 @@ from .abstain import (
 # Frozen contracts (re-exported so the package presents one surface).
 from .contracts import LedgerEntry, PlannerResult, ScoredAction
 
-# Safe-candidate enumeration.
+# Safe-candidate enumeration + amortization heads + bounded search.
 from .enumerate import (
+    AmortizationDataset,
+    AmortizationExample,
+    CEMSearch,
+    GuardedProposal,
+    LinearAmortizationHeads,
+    MCTSSearch,
+    MPPISearch,
+    SearchBackend,
+    SearchResult,
     action_id_for,
+    aggregate_sequence_lex_key,
     enumerate_safe_candidates,
     filter_by_policy_whitelist,
+    guarded_proposal,
+    train_amortization_heads,
 )
 
 # Explanation ledger.
 from .ledger import LEDGER_KINDS, ExplanationLedger
 
-# The planner itself + safe-regret evaluation.
-from .planner import SafeRegret, ShieldedPlanner, safe_regret
+# The planner itself + safe-regret evaluation + OPE / oracle utilities.
+from .planner import (
+    DROPEResult,
+    SafeRegret,
+    SafeRegretOracle,
+    ShieldedPlanner,
+    build_safe_regret_oracle,
+    doubly_robust_ope,
+    safe_regret,
+)
 
 # Statistical-safety risk gate.
 from .risk_gate import (
@@ -82,34 +102,50 @@ __all__ = [
     "LEDGER_KINDS",
     "LEX_FIELDS",
     "AbstainDecision",
+    # amortization + bounded search (doc M D1/D3)
+    "AmortizationDataset",
+    "AmortizationExample",
+    "CEMSearch",
+    "DROPEResult",
     # ledger
     "ExplanationLedger",
+    "GuardedProposal",
     "LedgerEntry",
     "LexWeights",
+    "LinearAmortizationHeads",
+    "MCTSSearch",
+    "MPPISearch",
     "PlannerResult",
     "RankNote",
     "RiskAssessment",
     "RiskNote",
     "SafeRegret",
+    "SafeRegretOracle",
     # contracts
     "ScoredAction",
+    "SearchBackend",
+    "SearchResult",
     # planner + evaluation
     "ShieldedPlanner",
     "WhyNotCard",
     "action_id_for",
     "aggregate_abstention",
+    "aggregate_sequence_lex_key",
     # risk gate
     "assess_risk",
     "blockers_card",
     # scoring
     "build_lex_key",
+    "build_safe_regret_oracle",
     # why-not
     "compose_why_not",
     "conformal_upper_for",
     "cvar_from_margin",
+    "doubly_robust_ope",
     # enumeration
     "enumerate_safe_candidates",
     "filter_by_policy_whitelist",
+    "guarded_proposal",
     "hazard_budget_map",
     "lex_key_components",
     "observation_integrity_bad_prob",
@@ -120,4 +156,5 @@ __all__ = [
     "scalar_embedding",
     # abstain
     "should_abstain",
+    "train_amortization_heads",
 ]

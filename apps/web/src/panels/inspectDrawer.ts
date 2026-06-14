@@ -10,8 +10,15 @@
 //  the scene context is never lost (doc G "Inspect Drawer").
 
 import { el, fmtSeconds, type PanelHandle } from "./dom";
-import type { Store, StoreState } from "../state/store";
-import type { GPUDTO, NodeDTO, RackDTO, WorkloadDTO } from "../api/client";
+import type { Store, StoreState, Selection } from "../state/store";
+import type {
+  GPUDTO,
+  NodeDTO,
+  RackDTO,
+  RolloutEvent,
+  StateSnapshotDTO,
+  WorkloadDTO,
+} from "../api/client";
 
 export function createInspectDrawer(parent: HTMLElement, store: Store): PanelHandle {
   const root = el("div", "panel inspect-drawer");
@@ -21,6 +28,10 @@ export function createInspectDrawer(parent: HTMLElement, store: Store): PanelHan
     const row = el("div", "kv");
     row.append(el("b", "", label), el("span", "", value));
     return row;
+  }
+
+  function sectionTitle(text: string): HTMLElement {
+    return el("div", "drawer-section", text);
   }
 
   function render(s: StoreState): void {
@@ -41,6 +52,133 @@ export function createInspectDrawer(parent: HTMLElement, store: Store): PanelHan
       renderWorkload(snap.entities.workloads.find((w) => w.workload_uid === sel.id));
     else if (sel.kind === "domain")
       renderDomain(sel.id, snap.entities.racks.find((r) => `dom-${r.rack_id}` === sel.id));
+
+    // Doc G inspect-drawer contents: relation list, recent events, assigned
+    // workloads, short-horizon forecast — for racks/nodes/GPUs/workloads/domains.
+    renderRelations(snap, sel);
+    renderAssignedWorkloads(snap, sel);
+    renderRecentEvents(s, sel);
+    renderForecast(s, sel);
+  }
+
+  // ── shared sections (doc G inspect-drawer "contents") ─────────────────────
+
+  /** Resolve the rack a selection lives in, used to scope relations/workloads. */
+  function rackOf(snap: StateSnapshotDTO, sel: Selection): string | null {
+    if (sel.kind === "rack") return sel.id;
+    if (sel.kind === "domain") return sel.id.replace(/^dom-/, "");
+    if (sel.kind === "node")
+      return snap.entities.nodes.find((n) => n.node_uid === sel.id)?.rack_id ?? null;
+    if (sel.kind === "gpu") {
+      const g = snap.entities.gpus.find((x) => x.gpu_uuid === sel.id);
+      return g
+        ? (snap.entities.nodes.find((n) => n.node_uid === g.node_uid)?.rack_id ?? null)
+        : null;
+    }
+    return null;
+  }
+
+  /** Relation list: every snapshot relation whose src/dst id touches the entity. */
+  function renderRelations(snap: StateSnapshotDTO, sel: Selection): void {
+    const id = sel.id;
+    const rows: HTMLElement[] = [];
+    for (const rel of snap.relations) {
+      for (const [src, dst] of rel.pairs) {
+        if (src === id) rows.push(kv(`${rel.type} →`, dst));
+        else if (dst === id) rows.push(kv(`← ${rel.type}`, src));
+      }
+    }
+    if (!rows.length) return;
+    root.appendChild(sectionTitle("Relations"));
+    // cap the list so a node's many CONNECTED_TO rows do not flood the drawer.
+    for (const r of rows.slice(0, 8)) root.appendChild(r);
+  }
+
+  /** Assigned workloads: jobs admitted to / running on the selected rack/domain. */
+  function renderAssignedWorkloads(snap: StateSnapshotDTO, sel: Selection): void {
+    const rackId = rackOf(snap, sel);
+    if (!rackId) return;
+    const domainId = `dom-${rackId}`;
+    const assigned = snap.entities.workloads.filter(
+      (w) => w.admitted_domain_id === domainId,
+    );
+    if (!assigned.length) return;
+    root.appendChild(sectionTitle("Assigned workloads"));
+    for (const w of assigned)
+      root.appendChild(
+        kv(w.workload_uid, `${w.gpu_req} GPU · ${w.status} · ${fmtSeconds(w.est_remaining_s)} left`),
+      );
+  }
+
+  /** Recent events: rollout/replay events at or before the cursor for this entity. */
+  function renderRecentEvents(s: StoreState, sel: Selection): void {
+    const snap = s.snapshot;
+    if (!snap) return;
+    const rackId = rackOf(snap, sel);
+    const matches = (ev: RolloutEvent): boolean =>
+      ev.entity_id === sel.id ||
+      ev.entity_id === rackId ||
+      (sel.kind === "workload" && ev.entity_id === sel.id);
+
+    // Pull events from whichever rollout currently drives the scene.
+    let events: RolloutEvent[] = [];
+    if (s.mode === "replay-calibration" && s.replay) {
+      events = [...s.replay.realized.points, ...s.replay.predicted.points]
+        .flatMap((p) => p.events);
+    } else if (s.compare) {
+      const recId = s.pinnedActions[0] ?? s.compare.recommended_action_id;
+      const rec = s.compare.candidates.find((c) => c.action_id === recId);
+      events = (rec?.rollout?.points ?? []).flatMap((p) => p.events);
+    }
+    const recent = events
+      .filter(matches)
+      .filter((ev) => ev.t_s <= s.cursorS + 1)
+      .sort((a, b) => b.t_s - a.t_s)
+      .slice(0, 5);
+    if (!recent.length) return;
+    root.appendChild(sectionTitle("Recent events"));
+    for (const ev of recent)
+      root.appendChild(kv(`t+${Math.round(ev.t_s)}s · ${ev.kind}`, ev.detail));
+  }
+
+  /** Short-horizon forecast preview: the sampled rollout point for this entity. */
+  function renderForecast(s: StoreState, sel: Selection): void {
+    const snap = s.snapshot;
+    if (!snap) return;
+    const rackId = rackOf(snap, sel);
+    if (!rackId) return;
+
+    // Prefer the live driving rollout; sample a short-horizon point ahead.
+    let rollout = null as ReturnType<typeof pickRollout> | null;
+    rollout = pickRollout(s);
+    if (!rollout) return;
+    const previewT = Math.min(
+      rollout.points.at(-1)?.t_s ?? 0,
+      s.cursorS + Math.min(300, s.horizonS), // ~5 min lookahead
+    );
+    let point = rollout.points[0];
+    for (const p of rollout.points) {
+      if (p.t_s <= previewT) point = p;
+      else break;
+    }
+    if (!point) return;
+    root.appendChild(sectionTitle(`Forecast (+${Math.round(previewT - s.cursorS)}s)`));
+    root.append(
+      kv("Predicted occupancy", `${Math.round((point.rack_occupancy[rackId] ?? 0) * 100)}%`),
+      kv("Predicted hotspot", (point.rack_hotspot[rackId] ?? 0).toFixed(2)),
+      kv("Queue depth", String(point.queue_depth)),
+      kv("Epistemic / OOD", `${point.uncertainty.epistemic.toFixed(2)} / ${point.uncertainty.ood.toFixed(2)}`),
+    );
+  }
+
+  /** The rollout currently driving the scene (replay realized, or fronted branch). */
+  function pickRollout(s: StoreState) {
+    if (s.mode === "replay-calibration" && s.replay) return s.replay.realized;
+    if (s.compare) {
+      const recId = s.pinnedActions[0] ?? s.compare.recommended_action_id;
+      return s.compare.candidates.find((c) => c.action_id === recId)?.rollout ?? null;
+    }
+    return null;
   }
 
   function renderRack(r?: RackDTO): void {

@@ -405,6 +405,208 @@ def kernel_state_summary(
 
 
 # --------------------------------------------------------------------------- #
+# Exact-state field decoders D_f for the mandatory consistency loss (doc J D11).
+# --------------------------------------------------------------------------- #
+# The set F_exact of kernel-determined fields (doc J A6): each is named, carries
+# the entity-type latent block it decodes from, and a loss flavor that selects
+# the elementwise loss ℓ_f in Eq. 18 ("bce" for binary masks / blocker bits,
+# "huber" for exact arithmetic counters). Categorical ids (admitted flavor /
+# domain) are realized here as per-row *presence* binary masks decoded from the
+# workload latent (the exact id itself is recovered from the kernel ledger; the
+# residual model is only constrained to stay consistent with whether the kernel
+# bound an id), keeping the decoder lightweight while still pinning the learned
+# residual into the kernel-null directions (doc J T3).
+#
+# Each entry is (field_name, latent_type, out_dim, flavor):
+FIELD_SPEC: tuple[tuple[str, str, int, str], ...] = (
+    # admitted flavor / domain presence (categorical-id consistency, doc J A6)
+    ("admitted_flavor", "workload", 1, "bce"),
+    ("admitted_domain", "workload", 1, "bce"),
+    # kernel blocker bit: the workload is admission-blocked (pending/reserving)
+    ("blocker_bit", "workload", 1, "bce"),
+    # feasible-domain mask: the domain has free GPU capacity (placement feasible)
+    ("feasible_domain", "topology_domain", 1, "bce"),
+    # protected-domain mask: the domain is operator-protected (doc J A6)
+    ("protected_domain", "topology_domain", 1, "bce"),
+    # unhealthy-device exclusion: the GPU is excluded (degraded/faulty/masked)
+    ("unhealthy_gpu", "gpu", 1, "bce"),
+    # unhealthy-node exclusion: the node is unschedulable / not ready
+    ("unhealthy_node", "node", 1, "bce"),
+    # exact quota / arithmetic counters (normalized, Huber regression, doc J A6)
+    ("quota_counters", "global", 4, "huber"),
+)
+
+
+@dataclass(slots=True)
+class FieldDecoders:
+    """Lightweight per-field decoders ``D_f`` over exact-bound latent coords.
+
+    Realizes doc J D11: for each kernel-determined field ``f`` in ``F_exact`` a
+    small Dense maps the per-type rolled latent ``ẑ_h`` to that field's type
+    (logit for binary masks / blocker bits, real value for exact counters). The
+    decoders are read by :func:`jepa.consistency_loss` against the stop-gradient
+    exact field values ``f(s^K)`` (doc J Eq. 18). Constraining the residual to
+    reproduce these exact fields forces it into the kernel-null directions
+    (doc J T3): it cannot lower training loss by violating exact symbolic
+    semantics. Keyed by ``field_name`` so the consistency loss can pair each
+    decoder output with its kernel target by name.
+    """
+
+    be: Backend
+    decoders: dict[str, Dense]
+    spec: tuple[tuple[str, str, int, str], ...]
+
+    @classmethod
+    def build(
+        cls,
+        lat: dict[str, int],
+        rng: np.random.Generator,
+        be: Backend,
+        spec: tuple[tuple[str, str, int, str], ...] = FIELD_SPEC,
+    ) -> FieldDecoders:
+        decoders: dict[str, Dense] = {}
+        for name, ltype, out_dim, _flavor in spec:
+            W, b = _init_dense(rng, out_dim, lat[ltype])
+            decoders[name] = Dense(be.from_numpy(W), be.from_numpy(b))
+        return cls(be=be, decoders=decoders, spec=spec)
+
+    def decode(
+        self, z: dict[str, ArrayLike], be: Backend
+    ) -> dict[str, ArrayLike]:
+        """Decode the rolled latent ``ẑ_h`` into per-field outputs (doc J D11).
+
+        Returns ``{field_name: D_f(ẑ_{h, latent_type})}``; a binary-mask field is
+        a per-row logit ``(n, 1)`` over the entity rows, a counter field is a
+        single ``(out_dim,)`` vector read from the (single-row) global latent.
+        """
+        out: dict[str, ArrayLike] = {}
+        for name, ltype, _out_dim, _flavor in self.spec:
+            h = z.get(ltype)
+            if h is None:
+                continue
+            out[name] = self.decoders[name](h, be)
+        return out
+
+    def to_backend(self, be: Backend) -> FieldDecoders:
+        if be.name == self.be.name:
+            return self
+        conv = self.be.to_numpy
+        out: dict[str, Dense] = {
+            name: Dense(be.from_numpy(conv(d.W)), be.from_numpy(conv(d.b)))
+            for name, d in self.decoders.items()
+        }
+        return FieldDecoders(be=be, decoders=out, spec=self.spec)
+
+
+def exact_field_targets(
+    state: WorldState,
+    order: dict[str, list[str]],
+    masks: dict[str, ArrayLike],
+    be: Backend,
+    spec: tuple[tuple[str, str, int, str], ...] = FIELD_SPEC,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Read the exact kernel-determined fields ``f(s^K)`` (doc J A6/Eq. 18).
+
+    Returns ``{field_name: (target, valid_mask)}`` where ``target`` matches the
+    *padded* ``(cap, out_dim)`` shape of the corresponding decoder output (the
+    full latent block, so the consistency loss compares per-row) and
+    ``valid_mask`` is the ``(cap,)`` row-validity mask (padding rows excluded).
+    The first ``len(order[ltype])`` rows carry the valid-entity targets in the
+    same sorted-uid order the :class:`FeatureBuilder` packs, so the targets align
+    with the latent rows exactly. Targets are read directly off the
+    (counterfactual future) symbolic state ``s^K`` so they are exact and the
+    learned residual is pinned into the kernel-null directions (doc J T3). For
+    the single-row counter field the target lives on the global row.
+    """
+    X = state.symbolic
+    protected = set(X.operator_policy.protected_domains)
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _mask_np(ltype: str) -> np.ndarray:
+        m = masks.get(ltype)
+        if m is None:
+            return np.zeros((0,), dtype=np.float32)
+        return np.asarray(be.to_numpy(m)).astype(np.float32).reshape(-1)
+
+    for name, ltype, out_dim, _flavor in spec:
+        uids = order.get(ltype, [])
+        valid = _mask_np(ltype)
+        cap = valid.shape[0]
+        tgt = np.zeros((cap, out_dim), dtype=np.float32)
+
+        if name == "admitted_flavor":
+            for i, u in enumerate(uids):
+                w = X.workloads.get(u)
+                tgt[i, 0] = 1.0 if (w and w.admitted_flavor_id) else 0.0
+        elif name == "admitted_domain":
+            for i, u in enumerate(uids):
+                w = X.workloads.get(u)
+                tgt[i, 0] = 1.0 if (w and w.admitted_domain_id) else 0.0
+        elif name == "blocker_bit":
+            for i, u in enumerate(uids):
+                w = X.workloads.get(u)
+                blocked = bool(
+                    w
+                    and w.status in (WorkloadStatus.PENDING, WorkloadStatus.RESERVING)
+                )
+                tgt[i, 0] = 1.0 if blocked else 0.0
+        elif name == "feasible_domain":
+            for i, u in enumerate(uids):
+                d = X.domains.get(u)
+                tgt[i, 0] = 1.0 if (d and d.free_gpu > 0) else 0.0
+        elif name == "protected_domain":
+            for i, u in enumerate(uids):
+                tgt[i, 0] = 1.0 if u in protected else 0.0
+        elif name == "unhealthy_gpu":
+            excluded = {
+                DeviceHealth.DEGRADED,
+                DeviceHealth.INTERMITTENTLY_FAULTY,
+                DeviceHealth.RESET_RECOVERY,
+                DeviceHealth.MASKED,
+            }
+            for i, u in enumerate(uids):
+                g = X.gpus.get(u)
+                bad = bool(g and (g.health_state in excluded or g.xid_code > 0))
+                tgt[i, 0] = 1.0 if bad else 0.0
+        elif name == "unhealthy_node":
+            for i, u in enumerate(uids):
+                ndd = X.nodes.get(u)
+                bad = bool(
+                    ndd
+                    and (
+                        not ndd.schedulable
+                        or ndd.node_health != NodeHealth.READY
+                    )
+                )
+                tgt[i, 0] = 1.0 if bad else 0.0
+        elif name == "quota_counters":
+            # exact arithmetic counters (normalized like kernel_state_summary):
+            # free-GPU pressure, pending demand, protected count, #domains.
+            doms = list(X.domains.values())
+            free_gpu = sum(dm.free_gpu for dm in doms)
+            pending = sum(
+                sum(ps.count * ps.gpu_req for ps in w.podsets)
+                for w in X.workloads.values()
+                if w.status in (WorkloadStatus.PENDING, WorkloadStatus.RESERVING)
+            )
+            counters = np.array(
+                [
+                    float(free_gpu) / 64.0,
+                    float(pending) / 64.0,
+                    float(len(protected)),
+                    float(len(doms)) / 16.0,
+                ],
+                dtype=np.float32,
+            )[:out_dim]
+            if cap > 0:
+                tgt[0, : counters.shape[0]] = counters
+                valid = valid.copy()
+                valid[0] = 1.0  # the single global row is always valid
+        out[name] = (tgt, valid)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # The model parameter bundle.
 # --------------------------------------------------------------------------- #
 @dataclass(slots=True)
@@ -423,11 +625,6 @@ class RelationalWorldModel:
     encoders: dict[str, Dense]
     fast_core: GRUCell
     slow_core: GRUCell
-    # ``relation_msg`` is retained as a per-destination-type message Dense for
-    # checkpoint compatibility (serialization flattens it); the *active* forward
-    # path uses the typed per-relation blocks below (doc Q D2). Kept as a stable
-    # field so existing serialized checkpoints round-trip unchanged.
-    relation_msg: dict[str, Dense]
     # --- typed per-relation message blocks (doc Q D2: W_r^src/W_r^dst/φ_r/η_r) #
     rel_src: dict[str, Dense]  # relation key -> W_r^src  (gathered source U_r)
     rel_dst: dict[str, Dense]  # relation key -> W_r^dst  (gathered target V_r)
@@ -445,6 +642,8 @@ class RelationalWorldModel:
     film_gen: Dense  # global latent -> per-child (γ, β) FiLM modulation (R6/V4)
     # --- world-transition predictor P_θ (doc J D6, doc E WorldTransition) ---- #
     predictor: WorldTransition | None = None
+    # --- exact-state field decoders D_f for the consistency loss (doc J D11) - #
+    field_decoders: FieldDecoders | None = None
 
     # ---- construction ---------------------------------------------------- #
     @classmethod
@@ -498,14 +697,6 @@ class RelationalWorldModel:
             rel_phi[key] = dense(cfg.message_dim, phi_in)
             rel_gate[key] = dense(1, phi_in)  # η_r edge-gate logit
 
-        # Legacy per-destination-type message Dense, retained for checkpoint
-        # compatibility (serialization flattens ``relation_msg``). Not used by the
-        # active forward path — the typed per-relation blocks above supersede it.
-        relation_msg: dict[str, Dense] = {}
-        for t in ENTITY_TYPES_LAT:
-            d = lat[t]
-            relation_msg[t] = dense(cfg.message_dim, d + cfg.message_dim)
-
         # Per-destination-type gated node update (doc Q D4): consumes the type
         # summary C_τ = [Ψ_τ(H_τ), Σ_r, μ_r, log(1+N_r), A_τ(a), G_τ(g)] folded
         # into a fixed per-type width (mean message + count + action + global).
@@ -545,6 +736,7 @@ class RelationalWorldModel:
         film_gen = dense(2 * max_child, lat["global"])
 
         predictor = WorldTransition.build(cfg, lat, rng, be)
+        field_decoders = FieldDecoders.build(lat, rng, be)
 
         return cls(
             cfg=cfg,
@@ -552,7 +744,6 @@ class RelationalWorldModel:
             encoders=encoders,
             fast_core=fast_core,
             slow_core=slow_core,
-            relation_msg=relation_msg,
             rel_src=rel_src,
             rel_dst=rel_dst,
             rel_phi=rel_phi,
@@ -567,6 +758,7 @@ class RelationalWorldModel:
             global_readout=global_readout,
             film_gen=film_gen,
             predictor=predictor,
+            field_decoders=field_decoders,
         )
 
     # ---- helpers --------------------------------------------------------- #
@@ -1061,7 +1253,6 @@ class RelationalWorldModel:
             encoders={k: cd(v) for k, v in self.encoders.items()},
             fast_core=cg(self.fast_core),
             slow_core=cg(self.slow_core),
-            relation_msg={k: cd(v) for k, v in self.relation_msg.items()},
             rel_src={k: cd(v) for k, v in self.rel_src.items()},
             rel_dst={k: cd(v) for k, v in self.rel_dst.items()},
             rel_phi={k: cd(v) for k, v in self.rel_phi.items()},
@@ -1076,6 +1267,9 @@ class RelationalWorldModel:
             global_readout=cd(self.global_readout),
             film_gen=cd(self.film_gen),
             predictor=(self.predictor.to_backend(be) if self.predictor else None),
+            field_decoders=(
+                self.field_decoders.to_backend(be) if self.field_decoders else None
+            ),
         )
 
 
@@ -1519,6 +1713,7 @@ __all__ = [
     "ACTION_INDEX",
     "ENTITY_TYPES_LAT",
     "FAST_TYPES",
+    "FIELD_SPEC",
     "N_ACTIONS",
     "RAW_FEATURE_DIMS",
     "RELATIONS",
@@ -1526,9 +1721,11 @@ __all__ = [
     "ArchConfig",
     "Dense",
     "FeatureBuilder",
+    "FieldDecoders",
     "GRUCell",
     "RelationalWorldModel",
     "TensorState",
     "WorldTransition",
+    "exact_field_targets",
     "kernel_state_summary",
 ]

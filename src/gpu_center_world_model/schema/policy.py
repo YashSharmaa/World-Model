@@ -62,9 +62,29 @@ class PolicyConfig:
     max_additional_wait_s: float = float("inf")
     risk: RiskThresholds = field(default_factory=RiskThresholds)
     abstention: AbstentionConfig = field(default_factory=AbstentionConfig)
-    # v2 fairness hooks (disabled by default in v1) — doc V
+    # v2 fairness hooks (disabled by default in v1) — doc V H7.
+    #
+    # The defaults keep v1 a strict no-op: ``fairness_mode == "off"`` means
+    # :func:`fairness_rank` is never engaged and the planner's lexicographic
+    # ordering is unchanged, so the committed golden stays byte-stable. The two
+    # budgets default to ``+inf`` so that even if an operator switches a mode on
+    # without sizing a budget, the Eq11 fairness gate degrades to "always
+    # satisfiable" (a ranker, never a new gate that could starve the safe set).
     fairness_mode: str = "off"  # off | drf | maxmin | pf | nbs
+    #: δ_F — the action-conditioned fairness-drift budget (doc V Eq11/D23).
     fairness_drift_budget: float = float("inf")
+    #: δ_D — the worst-served-tenant positive-debt budget ``max_t Debt_t^+``
+    #: (doc V Eq11/D27/D31). +inf ⇒ debt never blocks a candidate.
+    debt_budget: float = float("inf")
+    #: T_half — fairness-debt exponential decay half-life in seconds (doc V
+    #: Eq17/H4). ``None`` ⇒ align with Kueue's ``usageHalfLifeTime`` / the debt
+    #: tracker's :data:`DEFAULT_HALF_LIFE_S` fallback.
+    debt_half_life_s: float | None = None
+    #: Where the NBS disagreement floor d_t comes from (doc V D11/D30/H7):
+    #: ``nominal_quota`` (operator quota service), ``zero`` (pure PF), or
+    #: ``tracker`` (carry the slow-state baseline). Operator-defined, never
+    #: tenant self-reported (C4).
+    disagreement_point_source: str = "nominal_quota"  # nominal_quota | zero | tracker
     tenant_scope: str = "tenant_id"  # local_queue | tenant_id | cluster_queue
     priority_trust_mode: str = "operator_only"  # operator_only | tenant_claim
 

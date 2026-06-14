@@ -24,6 +24,7 @@ import {
   Group,
   Mesh,
   MeshBasicMaterial,
+  RingGeometry,
   TorusGeometry,
   Vector3,
 } from "three";
@@ -36,10 +37,35 @@ export interface BranchGhost {
   group: Group;
   ghostCapsule: Mesh;
   lockBadge: Mesh;
+  /** ground-plane ring whose thickness/opacity scales with learned uncertainty. */
+  uncertaintyRing: Mesh;
+  /** 0..1 combined epistemic+ood used to drive the ring (cached for animation). */
+  uncertainty: number;
   labelAnchor: Vector3;
   blocked: boolean;
   /** rack the ghost lands in (null for hold / blocked). */
   targetRack: RackView | null;
+}
+
+/**
+ * Combine a candidate's learned uncertainty into one 0..1 score for the ring.
+ * Uses epistemic + ood (the calibrated confidence signals), and ALSO folds in
+ * the relative p05-p95 quantile spread of the headline forecast so a wide band
+ * thickens the ring even when the point scores are modest (doc G uncertainty
+ * display: "encode uncertainty as halo thickness").
+ */
+export function branchUncertainty(c: CandidateResultDTO): number {
+  const u = c.uncertainty;
+  const base = Math.min(1, u.epistemic_score + u.ood_score);
+  const q = u.quantiles[0]?.quantiles;
+  let spreadTerm = 0;
+  if (q && q["0.05"] != null && q["0.5"] != null && q["0.95"] != null) {
+    const median = Math.abs(q["0.5"]);
+    const halfSpread = Math.abs(q["0.95"] - q["0.05"]) / 2;
+    // relative spread, saturating at 1 when the band is as wide as the median.
+    spreadTerm = Math.min(1, halfSpread / Math.max(1, median + halfSpread));
+  }
+  return Math.min(1, base * 0.7 + spreadTerm * 0.3);
 }
 
 export interface BranchesResult {
@@ -103,12 +129,35 @@ export function rebuildBranches(
     lock.position.copy(labelAnchor);
     group.add(lock);
 
+    // uncertainty_ring — a flat ground-plane RING (distinct geometry from the
+    // box-shaped hotspot rack_halo) whose inner/outer radius spread and opacity
+    // grow with the branch's combined epistemic+ood+spread uncertainty. Learned
+    // confidence and thermal hotspot are different signals, so they get visually
+    // distinct primitives (doc G: uncertainty halo ≠ risk-emergence halo).
+    const unc = branchUncertainty(cand);
+    const ringMat = new MeshBasicMaterial({
+      color: PALETTE.lowConf,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    });
+    // RingGeometry inner/outer thickness encodes the uncertainty magnitude.
+    const ring = new Mesh(new RingGeometry(0.9, 0.9 + 0.2 + unc * 0.9, 32), ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    const ringCenter = targetRack
+      ? targetRack.center.clone()
+      : new Vector3(-7.5, 0, branchIndex * 1.1 - 1.1);
+    ring.position.set(ringCenter.x, 0.06, ringCenter.z);
+    group.add(ring);
+
     result.root.add(group);
     result.ghosts.set(actionId, {
       actionId,
       group,
       ghostCapsule: ghost,
       lockBadge: lock,
+      uncertaintyRing: ring,
+      uncertainty: unc,
       labelAnchor,
       blocked: !cand.safe,
       targetRack,
@@ -132,6 +181,13 @@ export function updateBranches(
   for (const ghost of result.ghosts.values()) {
     const isFocus = focusedActionId == null || focusedActionId === ghost.actionId;
     const baseOpacity = isFocus ? 0.5 : 0.14; // cross-fade dim for non-focused
+
+    // Uncertainty ring breathes proportionally to the branch's learned
+    // uncertainty (thicker + brighter = less confident), dimmed when off-focus.
+    const ringMat = ghost.uncertaintyRing.material as MeshBasicMaterial;
+    const ringPulse = 0.55 + 0.45 * Math.abs(Math.sin(cursorS / 90));
+    ringMat.opacity = ghost.uncertainty * 0.5 * ringPulse * (isFocus ? 1 : 0.4);
+    ghost.uncertaintyRing.visible = ghost.uncertainty > 0.05;
 
     if (ghost.blocked) {
       // motion stops immediately; only the lock badge animates (gentle pulse).

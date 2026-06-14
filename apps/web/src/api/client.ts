@@ -27,7 +27,14 @@
 //  When the backend is offline, every call degrades to deterministic mock data
 //  so the recorded demo is reproducible on any machine.
 
-import { buildMockSnapshot, buildMockCompare, buildMockWhyNot, buildMockReplay, buildMockReplayIndex } from "./mock";
+import {
+  buildMockSnapshot,
+  buildMockCompare,
+  buildMockWhyNot,
+  buildMockReplay,
+  buildMockReplayIndex,
+  buildMockStateDelta,
+} from "./mock";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Action alphabet (mirrors schema/actions.py ActionType)
@@ -520,15 +527,21 @@ export class WorldModelClient {
     );
   }
 
-  /** Synthetic SSE loop used when the backend is offline. */
+  /**
+   * Synthetic SSE loop used when the backend is offline. Emits a PARTIAL
+   * `state_delta` each tick — only the handful of entities/KPIs that actually
+   * change (telemetry on a couple of GPUs, the research queue's live wait, and
+   * the pod free-GPU count) — exactly the semantic-diff shape the doc-G transport
+   * promises, so the store's merge-by-id path is exercised on real partial data.
+   */
   private openMockStream(onEvent: (ev: StreamEvent) => void): () => void {
     this.backendOnline = false;
     let tick = 0;
     onEvent({ type: "backend_health", healthy: false, detail: "mock data" });
     const handle = setInterval(() => {
       tick += 1;
-      const snap = buildMockSnapshot(tick);
-      onEvent({ type: "state_delta", state_hash: snap.state_hash, patch: snap });
+      const delta = buildMockStateDelta(tick);
+      onEvent({ type: "state_delta", state_hash: delta.state_hash, patch: delta.patch });
     }, 4000);
     return () => clearInterval(handle);
   }

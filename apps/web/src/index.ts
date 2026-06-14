@@ -21,6 +21,7 @@ export {
   buildMockWhyNot,
   buildMockReplay,
   buildMockReplayIndex,
+  buildMockStateDelta,
 } from "./api/mock";
 
 // Client state.

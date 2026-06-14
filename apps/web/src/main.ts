@@ -32,13 +32,20 @@ import {
 import { apiClient } from "./api/client";
 import { Store, type StoreState } from "./state/store";
 import { buildSceneGraph, type SceneGraph } from "./scene/sceneGraph";
-import { applyOccupancy } from "./scene/racks";
-import { commitToken, setAllocationPath } from "./scene/workloads";
+import { applyOccupancy, baselineOccupancyByRack } from "./scene/racks";
+import {
+  applyWorkloadHighlight,
+  commitToken,
+  setAllocationPath,
+  updateCommitTweens,
+} from "./scene/workloads";
+import { applyDomainAnnotations, setDomainLayerVisibility } from "./scene/overlays";
 import { rebuildBranches, updateBranches } from "./scene/branches";
 import { CameraDirector, createModeTabs } from "./routes/modes";
 import { installEnvironment, type EnvironmentHandle } from "./scene/environment";
 import { buildProAssets, type ProAssetsResult } from "./scene/proAssets";
 import { createLoaderArm } from "./scene/loaderArm";
+import { createCreditPlate } from "./scene/labels";
 import { createPostFX } from "./render/postfx";
 import { CinematicDirector, defaultGoldenPath } from "./anim/director";
 import { getSceneTheme, onTheme, type SceneTheme } from "./theme";
@@ -57,6 +64,8 @@ import { createWhyNotCard } from "./panels/whyNot";
 import { createTimeline, type TimelineHandle } from "./panels/timeline";
 import { createDeltaRibbon } from "./panels/deltaRibbon";
 import { createInspectDrawer } from "./panels/inspectDrawer";
+import { createReplayCalibration } from "./panels/replayCalibration";
+import { createControls, type DomainLayer } from "./panels/controls";
 
 /** Playback speed: scene-seconds advanced per real second when playing. */
 const PLAYBACK_RATE = 120; // 2 min of horizon per real second (recordable pace)
@@ -154,6 +163,13 @@ async function main(): Promise<void> {
   /** action_id we last dramatised, so we trigger a place exactly once per commit. */
   let lastPlacedActionId: string | null = null;
 
+  // In-scene author credit plate (doc G attribution): a billboarded 3D plate
+  // floating above the pod so the recording carries the credit even on a frame
+  // grab, in addition to the persistent HTML footer. Non-interactive.
+  const creditPlate = createCreditPlate();
+  creditPlate.position.set(0, 7.2, -6.5);
+  scene.add(creditPlate);
+
   // ── panels (HTML overlay layer) ─────────────────────────────────────────
   const provenance = createProvenanceHeader(overlay);
   const modeTabs = createModeTabs(overlay, store);
@@ -164,6 +180,13 @@ async function main(): Promise<void> {
   const timeline: TimelineHandle = createTimeline(overlay, store);
   const deltaRibbon = createDeltaRibbon(overlay, store);
   const inspectDrawer = createInspectDrawer(overlay, store);
+  const replayCalibration = createReplayCalibration(overlay, store);
+  // Scene controls: horizon selector, replay picker, context-layer toggles. The
+  // layer toggle drives setDomainLayerVisibility on the LIVE scene graph; the
+  // chosen visibility is re-applied after every geometry rebuild below.
+  const controls = createControls(overlay, store, apiClient, (layer, visible) => {
+    setDomainLayerVisibility(sceneGraph.domains, layer, visible);
+  });
   const beat = createBeatCaption(overlay);
   const footer = createFooterCredit(overlay);
 
@@ -175,10 +198,20 @@ async function main(): Promise<void> {
     timeline,
     deltaRibbon,
     inspectDrawer,
+    replayCalibration,
+    controls,
     provenance,
     footer,
     beat,
   ];
+
+  /** Re-apply the user's context-layer visibility after a geometry rebuild. */
+  function reapplyLayerVisibility(): void {
+    const vis = controls.getLayerVisibility();
+    (Object.keys(vis) as DomainLayer[]).forEach((layer) =>
+      setDomainLayerVisibility(sceneGraph.domains, layer, vis[layer]),
+    );
+  }
 
   // ── golden-path "Play demo" control + auto-start ──────────────────────────
   // The cinematic director runs the eight doc-G beats; each beat's onBegin
@@ -259,6 +292,7 @@ async function main(): Promise<void> {
       sceneGraph.worldRoot.add(proAssets.root);
       scene.add(sceneGraph.worldRoot);
       applyWorldTheme(getSceneTheme()); // keep the fresh floor/grid on-theme
+      reapplyLayerVisibility(); // preserve the operator's context-layer toggles
       lastStateHash = s.snapshot.state_hash;
     }
     // Rebuild branch ghosts when the compare result or pinned set changes.
@@ -322,6 +356,9 @@ async function main(): Promise<void> {
 
     applyRolloutToScene(currentState);
 
+    // Advance the fixed-duration workload commit tweens off wall-clock dt.
+    updateCommitTweens(sceneGraph.workloads, dt);
+
     // Drive the rigged loader arm + the professional set dressing.
     arm.update(dt);
     proAssets.update(clock.elapsedTime, heatByRack, utilByRack);
@@ -340,14 +377,40 @@ async function main(): Promise<void> {
     const cursor = s.cursorS;
     const horizon = Math.max(1, s.horizonS);
 
-    // 1) Branch ghosts (compare / decision modes).
-    if (s.compare && s.pinnedActions.length) {
+    // Grounded baseline: the snapshot's current occupancy. The grounded pod is
+    // ALWAYS held at this in decision-studio and compare modes — the predicted
+    // future is layered as a translucent ghost ON TOP, never promoted to the
+    // solid grounded fill (doc G core_views: grounded now vs ghost future).
+    const baseline = s.snapshot
+      ? baselineOccupancyByRack(sceneGraph.racks, s.snapshot.entities.gpus)
+      : {};
+
+    // In replay-calibration the scene is driven by the replay traces, not the
+    // live snapshot baseline, so skip the grounded reset there.
+    const replayMode = s.mode === "replay-calibration" && s.replay;
+
+    if (!replayMode) {
+      // 0) Ground EVERY rack at the snapshot baseline (solid fill).
+      for (const view of sceneGraph.racks.racks) {
+        const rackId = view.rackId;
+        const occ = baseline[rackId] ?? 0;
+        const hot = s.snapshot?.entities.racks.find((r) => r.rack_id === rackId)?.hotspot_score ?? 0;
+        applyOccupancy(sceneGraph.racks, rackId, occ, hot, false, occ);
+        heatByRack[rackId] = hot;
+        utilByRack[rackId] = occ;
+      }
+    }
+
+    // 1) Branch ghosts (compare / decision modes). The predicted occupancy is an
+    // overlay drawn in the ghost colour ABOVE the grounded baseline.
+    if (s.compare && s.pinnedActions.length && !replayMode) {
       const focus =
         s.mode === "decision-studio" ? s.compare.recommended_action_id : null;
       updateBranches(sceneGraph.branches, cursor, horizon, focus);
 
-      // The recommended branch also drives grounded occupancy + path + commit so
-      // the pod visibly fills as the cursor advances.
+      // The fronted branch (recommended in studio, pinnedActions[0] in compare)
+      // drives the GHOST overlay occupancy + path + commit so the pod visibly
+      // *previews* filling as the cursor advances — without ever becoming solid.
       const recId =
         s.mode === "counterfactual-compare"
           ? s.pinnedActions[0]
@@ -357,12 +420,13 @@ async function main(): Promise<void> {
       if (point) {
         for (const [rackId, occ] of Object.entries(point.rack_occupancy)) {
           const hot = point.rack_hotspot[rackId] ?? 0;
-          applyOccupancy(sceneGraph.racks, rackId, occ, hot, false);
-          // feed the professional thermal/activity dressing.
+          const base = baseline[rackId] ?? 0;
+          // ghost=true: slots beyond the grounded baseline read predicted/translucent.
+          applyOccupancy(sceneGraph.racks, rackId, occ, hot, true, base);
           heatByRack[rackId] = hot;
           utilByRack[rackId] = occ;
         }
-        // commit the focused workload token over the first 180 s.
+        // commit the focused workload token over the fixed commit window.
         const targetDomain = rec?.rollout?.scene_annotations.recommended_domain_ids[0];
         const rackId = targetDomain?.replace("dom-", "") ?? null;
         const rackView = rackId
@@ -370,7 +434,13 @@ async function main(): Promise<void> {
           : null;
         if (s.focusedWorkload) {
           setAllocationPath(sceneGraph.workloads, s.focusedWorkload, rackView, sceneGraph.materials);
-          commitToken(sceneGraph.workloads, s.focusedWorkload, rackView, cursor / 180);
+          // Trigger a fixed-duration wall-clock commit tween once the branch
+          // begins committing (cursor past 0); the easing runs off frame dt.
+          commitToken(
+            sceneGraph.workloads,
+            s.focusedWorkload,
+            cursor > 0 ? rackView : null,
+          );
         }
 
         // Dramatise the world-model "place" intervention: when the planner's
@@ -383,7 +453,49 @@ async function main(): Promise<void> {
           arm.playPlace(target);
         }
       }
-    } else {
+
+      // Apply scene_annotations to the domain + workload layers: blocked domains
+      // (from blocked branches' rollouts), the recommended/candidate domain, the
+      // why-not rejected domains, and the highlighted workloads (doc G).
+      const blockedDomainIds: string[] = [];
+      const highlightWorkloadIds: string[] = [];
+      for (const cand of s.compare.candidates) {
+        const ann = cand.rollout?.scene_annotations;
+        if (!ann) continue;
+        if (!cand.safe) blockedDomainIds.push(...ann.blocked_domain_ids);
+        highlightWorkloadIds.push(...ann.highlight_workload_ids);
+      }
+      const recommendedDomainIds =
+        rec?.rollout?.scene_annotations.recommended_domain_ids ?? [];
+      // why-not rejected domains light amber when the why-not card is open.
+      const rejectedDomainIds: string[] = [];
+      if (s.whyNotActionId) {
+        const wc = s.compareCandidates[s.whyNotActionId];
+        const dom = (wc?.params.domain_id_or_set as string[] | undefined)?.[0];
+        if (dom) rejectedDomainIds.push(dom);
+      }
+      const phase = (cursor / horizon) % 1;
+      applyDomainAnnotations(sceneGraph.domains, {
+        blockedDomainIds,
+        rejectedDomainIds,
+        recommendedDomainIds,
+        pulse: phase,
+      });
+      applyWorkloadHighlight(
+        sceneGraph.workloads,
+        s.focusedWorkload
+          ? [s.focusedWorkload, ...highlightWorkloadIds]
+          : highlightWorkloadIds,
+        phase,
+      );
+    } else if (!s.compare) {
+      // Clear stale annotations when no comparison is active.
+      applyDomainAnnotations(sceneGraph.domains, {});
+      applyWorkloadHighlight(
+        sceneGraph.workloads,
+        s.focusedWorkload ? [s.focusedWorkload] : [],
+        (cursor / horizon) % 1,
+      );
       // No active comparison: let the arm settle back to its idle pose and clear
       // the last-placed guard so the next commit re-triggers the place motion.
       if (lastPlacedActionId !== null) {
@@ -393,18 +505,40 @@ async function main(): Promise<void> {
     }
 
     // 2) Replay overlay (predicted vs realized).
-    if (s.mode === "replay-calibration" && s.replay) {
+    if (replayMode && s.replay) {
       const trace = timeline.getTrace();
-      const usePred = trace !== "realized";
-      const rollout = usePred ? s.replay.predicted : s.replay.realized;
-      const point = sampleRollout(rollout.points, cursor);
-      if (point) {
-        for (const [rackId, occ] of Object.entries(point.rack_occupancy)) {
-          // realized hotspot is shown in hot colour; predicted reads as ghost.
-          const hot = point.rack_hotspot[rackId] ?? 0;
-          applyOccupancy(sceneGraph.racks, rackId, occ, hot, usePred);
-          heatByRack[rackId] = hot;
-          utilByRack[rackId] = occ;
+      const predPoint = sampleRollout(s.replay.predicted.points, cursor);
+      const realPoint = sampleRollout(s.replay.realized.points, cursor);
+
+      if (trace === "both" && predPoint && realPoint) {
+        // Render predicted (ghost) and realized (solid) SIMULTANEOUSLY: the
+        // grounded base is the realized history, with the predicted EXTRA fill
+        // layered translucent on top per rack (doc G replay divergence).
+        for (const view of sceneGraph.racks.racks) {
+          const rackId = view.rackId;
+          const realOcc = realPoint.rack_occupancy[rackId] ?? 0;
+          const predOcc = predPoint.rack_occupancy[rackId] ?? 0;
+          const realHot = realPoint.rack_hotspot[rackId] ?? 0;
+          // solid realized base:
+          applyOccupancy(sceneGraph.racks, rackId, realOcc, realHot, false, realOcc);
+          // predicted ghost overlay where prediction exceeds realized:
+          if (predOcc > realOcc) {
+            applyOccupancy(sceneGraph.racks, rackId, predOcc, realHot, true, realOcc);
+          }
+          heatByRack[rackId] = realHot;
+          utilByRack[rackId] = realOcc;
+        }
+      } else {
+        const usePred = trace === "predicted";
+        const rollout = usePred ? s.replay.predicted : s.replay.realized;
+        const point = sampleRollout(rollout.points, cursor);
+        if (point) {
+          for (const [rackId, occ] of Object.entries(point.rack_occupancy)) {
+            const hot = point.rack_hotspot[rackId] ?? 0;
+            applyOccupancy(sceneGraph.racks, rackId, occ, hot, usePred, usePred ? 0 : occ);
+            heatByRack[rackId] = hot;
+            utilByRack[rackId] = occ;
+          }
         }
       }
     }

@@ -31,6 +31,7 @@ sample-complexity calculator (doc O planning-utility row).
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -228,13 +229,240 @@ def evaluate_planning(
     return report
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Fairness evaluation hooks (doc V H9 — reported slice-wise alongside safety)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class FairnessEvalWindow:
+    """One decision window's fairness telemetry for offline replay (doc V H9).
+
+    All fields are observables the v2 fairness layer already produces (drift KPI,
+    fair benchmark + realised welfare, per-tenant decayed debt, per-tenant gaming
+    scores). They are aggregated into a :class:`FairnessReport` and grouped
+    slice-wise by the runner.
+
+    Attributes
+    ----------
+    window_id:
+        Window identifier (state hash in practice), for slice alignment.
+    fd_h:
+        The horizon-integrated fairness-drift KPI ``FD_H`` for this window's
+        recommended trajectory (doc V Eq14). Lower is fairer.
+    benchmark_welfare / realized_welfare:
+        ``M(B(H))`` and ``M(U(H))`` under the chosen SWF, for the fair-regret
+        ``Reg_fair = M(B) - M(U)`` (doc V D32).
+    per_tenant_debt:
+        ``tenant_id -> Debt_t`` decayed fairness debt after this window (doc V
+        D31). The worst-served positive debt feeds the Eq11 debt budget.
+    per_tenant_gaming:
+        ``tenant_id -> {surface: score}`` bounded gaming scores (doc V D24).
+    """
+
+    window_id: str
+    fd_h: float = float("nan")
+    benchmark_welfare: float = float("nan")
+    realized_welfare: float = float("nan")
+    per_tenant_debt: dict[str, float] = field(default_factory=dict)
+    per_tenant_gaming: dict[str, dict[str, float]] = field(default_factory=dict)
+    #: Fairness-axiom verdicts on this window's benchmark allocation (doc V
+    #: D12-D17): ``{"pareto_efficient": bool, "weighted_envy_free": bool,
+    #: "sharing_incentive": bool, "max_weighted_envy": float, ...}``. Empty when
+    #: not probed. Produced by :func:`fairness.benchmarks.verify_axioms`.
+    axioms: dict[str, object] = field(default_factory=dict)
+    #: KKT / duality-residual optimality certificate for the PF/NBS benchmark
+    #: (doc V Th4/Th5): ``{"certified": bool, "stationarity_residual": float,
+    #: ...}``. Empty when not probed. From ``optimality_certificate``.
+    optimality: dict[str, object] = field(default_factory=dict)
+    #: ε-share-stability verdict for this window (doc V D28):
+    #: ``{"is_stable": bool, "max_gain": float, ...}``. Empty when not probed.
+    share_stability: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FairnessReport:
+    """Aggregate fairness readout for one slice / system (doc V H9)."""
+
+    n_windows: int
+    fd_h_mean: float
+    fd_h_p95: float
+    fd_h_max: float
+    fair_regret_mean: float
+    max_positive_debt: float
+    mean_positive_debt: float
+    per_tenant_max_debt: dict[str, float] = field(default_factory=dict)
+    gaming: dict[str, float] = field(default_factory=dict)
+    n_flagged_gaming: int = 0
+    poa: float = float("nan")
+    # Axiom / optimality / stability roll-ups (doc V D12-D17 / Th4-Th5 / D28).
+    axiom_pass_rates: dict[str, float] = field(default_factory=dict)
+    optimality_certified_rate: float = float("nan")
+    max_stationarity_residual: float = float("nan")
+    share_stable_rate: float = float("nan")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "n_windows": self.n_windows,
+            "fd_h_mean": self.fd_h_mean,
+            "fd_h_p95": self.fd_h_p95,
+            "fd_h_max": self.fd_h_max,
+            "fair_regret_mean": self.fair_regret_mean,
+            "max_positive_debt": self.max_positive_debt,
+            "mean_positive_debt": self.mean_positive_debt,
+            "per_tenant_max_debt": dict(self.per_tenant_max_debt),
+            "gaming": dict(self.gaming),
+            "n_flagged_gaming": self.n_flagged_gaming,
+            "poa": self.poa,
+            "axiom_pass_rates": dict(self.axiom_pass_rates),
+            "optimality_certified_rate": self.optimality_certified_rate,
+            "max_stationarity_residual": self.max_stationarity_residual,
+            "share_stable_rate": self.share_stable_rate,
+        }
+
+
+def _percentile(vals: Sequence[float], q: float) -> float:
+    arr = np.array([v for v in vals if v == v], dtype=np.float64)  # drop NaN
+    return float(np.percentile(arr, q)) if arr.size else float("nan")
+
+
+def evaluate_fairness(
+    windows: Sequence[FairnessEvalWindow],
+    *,
+    gaming_flag_threshold: float = 0.5,
+    poa: float | None = None,
+) -> FairnessReport:
+    """Aggregate fairness windows into a :class:`FairnessReport` (doc V H9).
+
+    Reports FD_H as mean / p95 / max (the project's KPI-distribution convention,
+    never a bare point estimate), the mean fair regret ``M(B) - M(U)`` across
+    windows, the worst-served and mean *positive* per-tenant debt, the per-tenant
+    worst standing debt, and the mean gaming pressure per surface with a flagged
+    count. An optional replay price-of-anarchy ``poa`` is passed through.
+    """
+    n = len(windows)
+    fd = [w.fd_h for w in windows]
+    fd_clean = [v for v in fd if v == v]
+    fair_regrets = [
+        w.benchmark_welfare - w.realized_welfare
+        for w in windows
+        if w.benchmark_welfare == w.benchmark_welfare
+        and w.realized_welfare == w.realized_welfare
+    ]
+
+    # Per-tenant worst standing debt across the replay + the worst-served debt.
+    per_tenant_max_debt: dict[str, float] = {}
+    for w in windows:
+        for tid, d in w.per_tenant_debt.items():
+            per_tenant_max_debt[tid] = max(per_tenant_max_debt.get(tid, 0.0), float(d))
+    positive = [max(d, 0.0) for d in per_tenant_max_debt.values()]
+    max_pos_debt = max(positive, default=0.0)
+    mean_pos_debt = float(np.mean(positive)) if positive else 0.0
+
+    # Gaming: mean per-surface score across (window, tenant) observations, and a
+    # count of (window, tenant) pairs flagged on any surface above threshold.
+    surface_vals: dict[str, list[float]] = {}
+    n_flagged = 0
+    for w in windows:
+        for _tid, scores in w.per_tenant_gaming.items():
+            flagged = False
+            for surface, val in scores.items():
+                surface_vals.setdefault(surface, []).append(float(val))
+                if float(val) > gaming_flag_threshold:
+                    flagged = True
+            if flagged:
+                n_flagged += 1
+    gaming = {
+        f"mean_{surface}": float(np.mean(vals))
+        for surface, vals in surface_vals.items()
+    }
+
+    # Axiom pass rates (doc V D12-D17): fraction of probed windows where each
+    # axiom held on the benchmark allocation.
+    axiom_keys = ("pareto_efficient", "weighted_envy_free", "sharing_incentive")
+    axiom_counts: dict[str, list[bool]] = {k: [] for k in axiom_keys}
+    for w in windows:
+        for k in axiom_keys:
+            if k in w.axioms:
+                axiom_counts[k].append(bool(w.axioms[k]))
+    axiom_pass_rates = {
+        k: float(np.mean(v)) for k, v in axiom_counts.items() if v
+    }
+
+    # Optimality certificate roll-up (doc V Th4/Th5).
+    certified = [
+        bool(w.optimality["certified"])
+        for w in windows
+        if "certified" in w.optimality
+    ]
+    stat_residuals = [
+        float(w.optimality["stationarity_residual"])
+        for w in windows
+        if "stationarity_residual" in w.optimality
+    ]
+    # ε-share-stability roll-up (doc V D28).
+    stable = [
+        bool(w.share_stability["is_stable"])
+        for w in windows
+        if "is_stable" in w.share_stability
+    ]
+
+    return FairnessReport(
+        n_windows=n,
+        fd_h_mean=float(np.mean(fd_clean)) if fd_clean else float("nan"),
+        fd_h_p95=_percentile(fd, 95),
+        fd_h_max=float(np.max(fd_clean)) if fd_clean else float("nan"),
+        fair_regret_mean=(
+            float(np.mean(fair_regrets)) if fair_regrets else float("nan")
+        ),
+        max_positive_debt=max_pos_debt,
+        mean_positive_debt=mean_pos_debt,
+        per_tenant_max_debt=per_tenant_max_debt,
+        gaming=gaming,
+        n_flagged_gaming=n_flagged,
+        poa=float(poa) if poa is not None else float("nan"),
+        axiom_pass_rates=axiom_pass_rates,
+        optimality_certified_rate=(
+            float(np.mean(certified)) if certified else float("nan")
+        ),
+        max_stationarity_residual=(
+            float(np.max(stat_residuals)) if stat_residuals else float("nan")
+        ),
+        share_stable_rate=float(np.mean(stable)) if stable else float("nan"),
+    )
+
+
+def fairness_windows_by_slice(
+    windows: Sequence[FairnessEvalWindow],
+    slice_labels: Mapping[str, str] | Sequence[str],
+) -> dict[str, list[FairnessEvalWindow]]:
+    """Bucket fairness windows by a slice label per window (doc V H9 slice-wise).
+
+    ``slice_labels`` is either ``window_id -> label`` or a positional sequence
+    aligned with ``windows``. Windows with no resolvable label fall in ``"all"``.
+    """
+    buckets: dict[str, list[FairnessEvalWindow]] = {}
+    if isinstance(slice_labels, Mapping):
+        for w in windows:
+            label = str(slice_labels.get(w.window_id, "all"))
+            buckets.setdefault(label, []).append(w)
+    else:
+        labels = list(slice_labels)
+        for i, w in enumerate(windows):
+            label = str(labels[i]) if i < len(labels) else "all"
+            buckets.setdefault(label, []).append(w)
+    return buckets
+
+
 __all__ = [
+    "FairnessEvalWindow",
+    "FairnessReport",
     "LexKey",
     "PlanningReport",
     "PlanningWindow",
     "chose_oracle",
     "chose_unsafe",
+    "evaluate_fairness",
     "evaluate_planning",
+    "fairness_windows_by_slice",
     "lex_argmin",
     "lex_less",
     "safe_regret",

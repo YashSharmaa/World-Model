@@ -55,4 +55,48 @@ class Calibrator(Protocol):
     def calibrate(self, bundle: KPIForecastBundle) -> KPIForecastBundle: ...
 
 
-__all__ = ["Calibrator", "WorldModel"]
+@runtime_checkable
+class AmortizationHeads(Protocol):
+    """The amortized planner-to-policy heads on top of the world model (doc M D1).
+
+    Three heads distilled from offline full-enumeration replay (doc M
+    ``amortization_plan`` D1-D3). They *accelerate* the planner — propose / warm-
+    start / decide-to-trust — but never override the exact kernel: the emitted
+    action is always selected from the shielded safe set, so amortization cannot
+    break the hard-safety certificate (doc M G1). This Protocol is additive; a
+    backend that does not implement it simply leaves the planner in exact mode.
+
+    * ``proposal_scores`` — the proposal head ``π_φ(a|b)``: a recall score per
+      safe candidate so the planner can keep only the top-k for scoring (D1).
+    * ``value`` — the terminal value head ``V_ψ(b)`` / ``Q_ψ(b,a)`` aligned to the
+      planner's scalarized lex score ``S_t``: warm-starts and early-terminates
+      bounded search (D1/D3).
+    * ``abstain_score`` — the abstention / OOD head ``u_ω(b,a)``: the disagreement
+      / OOD signal the guarded inference path consults to decide whether to trust
+      the amortized proposal or fall back to exhaustive scoring (D1/D3/G2).
+    """
+
+    def proposal_scores(
+        self, state: WorldState, actions: list[Action], horizon_s: int
+    ) -> list[float]:
+        """Per-candidate recall score ``π_φ(a|b)`` (higher ⇒ more likely oracle)."""
+        ...
+
+    def value(
+        self, state: WorldState, action: Action | None, horizon_s: int
+    ) -> float:
+        """Terminal value ``V_ψ(b)`` (``action is None``) or ``Q_ψ(b,a)``.
+
+        Returned in the planner's scalarized lex-score units (lower is better),
+        so it can warm-start / terminate bounded search directly.
+        """
+        ...
+
+    def abstain_score(
+        self, state: WorldState, action: Action, horizon_s: int
+    ) -> float:
+        """Disagreement / OOD score ``u_ω(b,a)`` in ``[0, 1]`` (higher ⇒ distrust)."""
+        ...
+
+
+__all__ = ["AmortizationHeads", "Calibrator", "WorldModel"]

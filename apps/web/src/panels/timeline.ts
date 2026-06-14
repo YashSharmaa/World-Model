@@ -14,6 +14,40 @@
 
 import { el, type PanelHandle } from "./dom";
 import type { Store, StoreState } from "../state/store";
+import type { ReplayDTO, RolloutPoint } from "../api/client";
+
+/**
+ * Earliest timestamp where the realized hotspot/occupancy/queue diverges from
+ * the predicted branch beyond a small tolerance (doc G replay divergence). The
+ * timeline marks this with a fork glyph. Returns null when traces never split.
+ */
+function divergenceTimestamp(replay: ReplayDTO): number | null {
+  const predAt = (t: number): RolloutPoint | null => {
+    let chosen: RolloutPoint | null = null;
+    for (const p of replay.predicted.points) {
+      if (p.t_s <= t) chosen = p;
+      else break;
+    }
+    return chosen;
+  };
+  // Per-rack gap so a fixed busy rack elsewhere never masks the admit's divergence.
+  const maxGap = (a: Record<string, number>, b: Record<string, number>): number => {
+    let g = 0;
+    for (const k of Object.keys(b)) g = Math.max(g, Math.abs((b[k] ?? 0) - (a[k] ?? 0)));
+    return g;
+  };
+  for (const rp of replay.realized.points) {
+    const pp = predAt(rp.t_s);
+    if (!pp) continue;
+    const dHot = maxGap(pp.rack_hotspot, rp.rack_hotspot);
+    const dOcc = maxGap(pp.rack_occupancy, rp.rack_occupancy);
+    const dQ = Math.abs(rp.queue_depth - pp.queue_depth);
+    if (dHot > 0.08 || dOcc > 0.05 || dQ >= 1) {
+      return rp.t_s;
+    }
+  }
+  return null;
+}
 
 export interface TimelineHandle extends PanelHandle {
   /** which trace the replay overlay shows. */
@@ -102,6 +136,26 @@ export function createTimeline(parent: HTMLElement, store: Store): TimelineHandl
           for (const ev of p.events) addPin(ev.t_s, `realized: ${ev.detail}`, true);
         for (const p of s.replay.predicted.points)
           for (const ev of p.events) addPin(ev.t_s, `predicted: ${ev.detail}`, false);
+
+        // Divergence split (doc G replay divergence): a forked marker where the
+        // predicted path splits from the realized path, only meaningful when both
+        // traces are shown. The marker grows once the cursor passes it.
+        if (trace === "both") {
+          const dt = divergenceTimestamp(s.replay);
+          if (dt != null) {
+            const passed = s.cursorS >= dt;
+            const fork = el("div", `tl-split ${passed ? "active" : ""}`);
+            fork.style.left = `${(dt / horizon) * 100}%`;
+            fork.title = `Predicted vs realized split @ t+${Math.round(dt)}s`;
+            fork.textContent = "⋔";
+            fork.addEventListener("click", (e) => {
+              e.stopPropagation();
+              store.setCursor(dt);
+              store.setPlaying(false);
+            });
+            pinsLayer.appendChild(fork);
+          }
+        }
       } else if (s.compare) {
         const rec = s.compare.candidates.find(
           (c) => c.action_id === s.compare?.recommended_action_id,

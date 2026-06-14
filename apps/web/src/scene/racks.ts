@@ -50,13 +50,23 @@ export interface SlotIndex {
   rackId: string;
 }
 
+/** Mapping from a flat node-shelf instanceId back to its semantic identity. */
+export interface ShelfIndex {
+  nodeUid: string;
+  rackId: string;
+}
+
 export interface RacksResult {
   root: Group;
   racks: RackView[];
   /** the single InstancedMesh of all GPU slots across the pod. */
   slotMesh: InstancedMesh;
+  /** the single InstancedMesh of all node shelves across the pod. */
+  shelfMesh: InstancedMesh;
   /** instanceId -> identity, for Raycaster picking. */
   slotIndex: SlotIndex[];
+  /** shelf instanceId -> node identity, for Raycaster picking. */
+  shelfIndex: ShelfIndex[];
   /** gpu_uuid -> instanceId, for occupancy recolouring from rollouts. */
   slotByUuid: Map<string, number>;
 }
@@ -76,6 +86,7 @@ export function buildRacks(
 
   const rackViews: RackView[] = [];
   const slotIndex: SlotIndex[] = [];
+  const shelfIndex: ShelfIndex[] = [];
   const slotByUuid = new Map<string, number>();
 
   // Group nodes & gpus by rack for stable per-rack layout.
@@ -97,9 +108,19 @@ export function buildRacks(
   slotMesh.instanceColor = new InstancedBufferAttribute(slotColors, 3);
   slotMesh.instanceColor.setUsage(DynamicDrawUsage);
 
+  // node_instanced_mesh (doc G scene_graph): ONE InstancedMesh for ALL node
+  // shelves across the pod, collapsing them into a single draw call and exposing
+  // an instanceId the Raycaster maps back to a node identity (like the GPU slots).
+  const totalNodes = nodes.length;
+  const shelfGeo = new BoxGeometry(RACK_W * 0.88, 0.12, RACK_D * 0.78);
+  const shelfMesh = new InstancedMesh(shelfGeo, mats.nodeShelf, Math.max(1, totalNodes));
+  shelfMesh.name = "node_instanced_mesh";
+  shelfMesh.instanceMatrix.setUsage(DynamicDrawUsage);
+
   const m = new Matrix4();
   const tmpColor = new Color();
   let slotCursor = 0;
+  let shelfCursor = 0;
 
   const cols = 2;
   racks.forEach((rack, idx) => {
@@ -126,13 +147,12 @@ export function buildRacks(
     const nodeCount = Math.max(1, rackNodes.length);
     rackNodes.forEach((node, nIdx) => {
       const shelfY = 0.4 + (nIdx / nodeCount) * (RACK_H - 0.8);
-      const shelf = new Mesh(
-        new BoxGeometry(RACK_W * 0.88, 0.12, RACK_D * 0.78),
-        mats.nodeShelf,
-      );
-      shelf.position.set(0, shelfY, 0);
-      shelf.userData = { kind: "node", id: node.node_uid };
-      rg.add(shelf);
+      // node shelf -> one instance in the shared node_instanced_mesh (world-space
+      // matrix, since the InstancedMesh lives at rack_root, not the rack group).
+      m.makeTranslation(x, shelfY, z);
+      shelfMesh.setMatrixAt(shelfCursor, m);
+      shelfIndex.push({ nodeUid: node.node_uid, rackId: rack.rack_id });
+      shelfCursor += 1;
 
       const slots = (gpusByNode.get(node.node_uid) ?? []).sort((a, b) =>
         a.gpu_uuid.localeCompare(b.gpu_uuid),
@@ -182,13 +202,50 @@ export function buildRacks(
   if (slotMesh.instanceColor) slotMesh.instanceColor.needsUpdate = true;
   root.add(slotMesh);
 
-  return { root, racks: rackViews, slotMesh, slotIndex, slotByUuid };
+  shelfMesh.count = shelfCursor;
+  shelfMesh.instanceMatrix.needsUpdate = true;
+  root.add(shelfMesh);
+
+  return { root, racks: rackViews, slotMesh, shelfMesh, slotIndex, shelfIndex, slotByUuid };
+}
+
+/**
+ * Per-rack GROUNDED occupancy fraction computed straight from the snapshot's
+ * allocated GPU slots. This is the "now" the renderer must hold the grounded
+ * pod at in BOTH decision-studio and compare modes — predicted occupancy is
+ * layered on top as a translucent ghost, never promoted to the solid base
+ * (doc G core_views: grounded now vs ghost future).
+ */
+export function baselineOccupancyByRack(
+  result: RacksResult,
+  gpus: GPUDTO[],
+): Record<string, number> {
+  const allocByRack: Record<string, number> = {};
+  const totalByRack: Record<string, number> = {};
+  const rackByUuid = new Map(result.slotIndex.map((s) => [s.gpuUuid, s.rackId]));
+  for (const g of gpus) {
+    const rackId = rackByUuid.get(g.gpu_uuid);
+    if (!rackId) continue;
+    totalByRack[rackId] = (totalByRack[rackId] ?? 0) + 1;
+    if (g.allocated_to != null) allocByRack[rackId] = (allocByRack[rackId] ?? 0) + 1;
+  }
+  const occ: Record<string, number> = {};
+  for (const rackId of Object.keys(totalByRack)) {
+    occ[rackId] = (allocByRack[rackId] ?? 0) / Math.max(1, totalByRack[rackId]);
+  }
+  return occ;
 }
 
 /**
  * Recolour a fraction of a rack's slots to "filled" to reflect rollout
  * occupancy (occupancy update = recolour, never spawn). `ghost` desaturates the
  * fill so predicted occupancy reads as translucent against the grounded base.
+ *
+ * When `ghost` is true the slots BEYOND the grounded baseline (the predicted
+ * EXTRA fill the branch would add) read in the translucent predicted colour,
+ * while the grounded baseline slots stay solid — so a ghost overlay never
+ * promotes the predicted future to a solid grounded fill (doc G grounded-now vs
+ * ghost-future). `baseline` is the grounded fraction to hold solid underneath.
  */
 export function applyOccupancy(
   result: RacksResult,
@@ -196,20 +253,23 @@ export function applyOccupancy(
   occupancy: number,
   hotspot: number,
   ghost: boolean,
+  baseline = occupancy,
 ): void {
   const indices: number[] = [];
   result.slotIndex.forEach((s, i) => {
     if (s.rackId === rackId) indices.push(i);
   });
   const fillCount = Math.round(occupancy * indices.length);
+  const baseCount = Math.round(Math.min(occupancy, baseline) * indices.length);
   const tmp = new Color();
   indices.forEach((instanceId, k) => {
     const filled = k < fillCount;
+    const isPredictedExtra = ghost && k >= baseCount; // beyond grounded baseline
     if (!filled) {
       tmp.copy(PALETTE.slotEmpty);
     } else if (hotspot > 0.6) {
       tmp.copy(PALETTE.hot);
-    } else if (ghost) {
+    } else if (isPredictedExtra) {
       tmp.copy(PALETTE.predicted);
     } else {
       tmp.copy(PALETTE.slotFilled);

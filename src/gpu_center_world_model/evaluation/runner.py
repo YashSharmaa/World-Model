@@ -60,9 +60,13 @@ from .metrics.operator_usefulness import (
     evaluate_operator_usefulness,
 )
 from .metrics.planning import (
+    FairnessEvalWindow,
+    FairnessReport,
     PlanningReport,
     PlanningWindow,
+    evaluate_fairness,
     evaluate_planning,
+    fairness_windows_by_slice,
 )
 from .metrics.predictive import (
     PredictiveReport,
@@ -128,6 +132,14 @@ class TrackInputs:
     # Track C — safe action selection
     planning_windows: list[PlanningWindow] = field(default_factory=list)
     baseline_planning_windows: list[PlanningWindow] = field(default_factory=list)
+    # Fairness (v2 hooks; doc V H9) — reported slice-wise alongside safety-first
+    # metrics, never release-blocking in v1 (fairness_mode is off by default).
+    fairness_windows: list[FairnessEvalWindow] = field(default_factory=list)
+    #: window_id -> slice label (or positional, aligned to fairness_windows) so
+    #: FD_H / debt / gaming are grouped slice-wise (doc V H9).
+    fairness_slice_labels: dict[str, str] = field(default_factory=dict)
+    #: optional replay price-of-anarchy passed through into the fairness report.
+    fairness_poa: float | None = None
     # operator-usefulness study (provisional; doc O L10)
     operator_cases: list[OperatorCase] = field(default_factory=list)
     # abstention / shift
@@ -190,6 +202,45 @@ def run_track_planning(
         inputs.planning_windows,
         baseline_windows=inputs.baseline_planning_windows or None,
     )
+
+
+def run_track_fairness(inputs: TrackInputs) -> FairnessReport | None:
+    """Fairness hooks: aggregate FD_H / fair regret / debt / gaming / PoA.
+
+    Doc V H9: the v2 fairness metrics (fairness drift ``FD_H``, fair regret,
+    per-tenant debt, queue-hopping / priority-inflation / under-requesting gaming
+    aggregates) are reported in offline replay *alongside* the safety-first
+    metrics. They are never release-blocking in v1 (``fairness_mode`` is off by
+    default), so this returns ``None`` when no fairness windows were collected.
+    """
+    if not inputs.fairness_windows:
+        return None
+    return evaluate_fairness(inputs.fairness_windows, poa=inputs.fairness_poa)
+
+
+def compute_fairness_slices(inputs: TrackInputs) -> dict[str, object]:
+    """Group the fairness readout slice-wise (doc V H9 "reported slice-wise").
+
+    Buckets the collected :class:`FairnessEvalWindow` records by their slice
+    label (``fairness_slice_labels``; ``window_id -> label`` or positional) and
+    produces a :class:`FairnessReport` per cell plus an overall ``_overall``
+    cell. Returns an empty dict when no fairness windows were collected, so the
+    fairness slices simply do not appear for a v1 run.
+    """
+    fw = inputs.fairness_windows
+    if not fw:
+        return {}
+    out: dict[str, object] = {
+        "_overall": evaluate_fairness(fw, poa=inputs.fairness_poa).as_dict()
+    }
+    labels = inputs.fairness_slice_labels
+    if labels:
+        buckets = fairness_windows_by_slice(fw, labels)
+        cells: dict[str, object] = {}
+        for label, cell_windows in buckets.items():
+            cells[label] = evaluate_fairness(cell_windows).as_dict()
+        out["by_slice"] = cells
+    return out
 
 
 def run_track_predictive(inputs: TrackInputs) -> list[PredictiveReport]:
@@ -601,6 +652,14 @@ class BenchmarkRunner:
         operator = run_operator_usefulness(inputs)
         risk_cov, shift_ab = run_abstention(inputs)
         slices = compute_slices(inputs)
+        # Fairness hooks (doc V H9): the v2 fairness report is carried inside the
+        # report's `slices` surface under a dedicated `_fairness` key so it is
+        # published slice-wise alongside the safety-first slices without needing
+        # a new top-level report field. Absent for a v1 run (no fairness windows).
+        fairness = run_track_fairness(inputs)
+        fairness_slices = compute_fairness_slices(inputs)
+        if fairness_slices:
+            slices["_fairness"] = fairness_slices
 
         cf_coverage = (
             counterfactual_coverage(inputs.branch_windows)
@@ -672,8 +731,10 @@ class BenchmarkRunner:
                 "n_predictive_reports": len(predictive),
                 "n_calibration_reports": len(calibration),
                 "n_operator_cases": len(inputs.operator_cases),
+                "n_fairness_windows": len(inputs.fairness_windows),
                 "counterfactual_coverage": cf_coverage,
                 "is_shift_pack": inputs.is_shift_pack,
+                "fairness": fairness.as_dict() if fairness else None,
                 "thresholds": dict(THRESHOLDS),
             },
         )
@@ -781,6 +842,27 @@ def _planning_window_from(rec: Mapping[str, object]) -> PlanningWindow:
             if rec.get("baseline_chosen_id") is not None
             else None
         ),
+    )
+
+
+def _fairness_window_from(rec: Mapping[str, object]) -> FairnessEvalWindow:
+    per_debt = {
+        str(k): float(v) for k, v in dict(rec.get("per_tenant_debt", {})).items()  # type: ignore[arg-type]
+    }
+    per_gaming = {
+        str(t): {str(s): float(x) for s, x in dict(d).items()}
+        for t, d in dict(rec.get("per_tenant_gaming", {})).items()  # type: ignore[arg-type]
+    }
+    return FairnessEvalWindow(
+        window_id=str(rec.get("window_id", "")),
+        fd_h=_f(rec, "fd_h", float("nan")),
+        benchmark_welfare=_f(rec, "benchmark_welfare", float("nan")),
+        realized_welfare=_f(rec, "realized_welfare", float("nan")),
+        per_tenant_debt=per_debt,
+        per_tenant_gaming=per_gaming,
+        axioms=dict(rec.get("axioms", {})),  # type: ignore[arg-type]
+        optimality=dict(rec.get("optimality", {})),  # type: ignore[arg-type]
+        share_stability=dict(rec.get("share_stability", {})),  # type: ignore[arg-type]
     )
 
 
@@ -936,6 +1018,8 @@ def track_inputs_from_records(
         "operator_cases": "operator_cases",
         "window_feature": "window_features",
         "window_features": "window_features",
+        "fairness_window": "fairness_windows",
+        "fairness_windows": "fairness_windows",
     }
     for rec in records:
         kind = str(rec.get("kind", "")).strip()
@@ -1001,6 +1085,18 @@ def _track_inputs_from_payload(payload: Mapping[str, object]) -> TrackInputs:
             _planning_window_from(r) for r in _seq("baseline_planning_windows")
         ],
         operator_cases=[_operator_case_from(r) for r in _seq("operator_cases")],
+        fairness_windows=[
+            _fairness_window_from(r) for r in _seq("fairness_windows")
+        ],
+        fairness_slice_labels={
+            str(k): str(v)
+            for k, v in dict(payload.get("fairness_slice_labels", {})).items()  # type: ignore[arg-type]
+        },
+        fairness_poa=(
+            float(payload["fairness_poa"])  # type: ignore[arg-type]
+            if payload.get("fairness_poa") is not None
+            else None
+        ),
         risk_score=[float(x) for x in payload.get("risk_score", [])],  # type: ignore[union-attr]
         selective_error=[float(x) for x in payload.get("selective_error", [])],  # type: ignore[union-attr]
         shift_abstained_or_fellback=[
@@ -1024,6 +1120,7 @@ __all__ = [
     "BenchmarkRunner",
     "TrackInputs",
     "apply_acceptance",
+    "compute_fairness_slices",
     "compute_slices",
     "counterfactual_coverage",
     "run_abstention",
@@ -1032,6 +1129,7 @@ __all__ = [
     "run_operator_usefulness",
     "run_track_calibration",
     "run_track_counterfactual",
+    "run_track_fairness",
     "run_track_planning",
     "run_track_predictive",
     "run_track_semantics",

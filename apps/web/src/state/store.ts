@@ -65,6 +65,23 @@ type Listener = (s: StoreState) => void;
 
 const MAX_PINNED = 3; // doc G: keep candidate count shape-stable for MLX compile.
 
+/**
+ * Merge a partial array of changed entities into a base array BY ID: entries in
+ * `patch` replace the base entry with the same id (key field), and unseen ids
+ * are appended. `undefined` patch leaves the base untouched. This is the real
+ * semantic-diff merge a `state_delta` carries, not a whole-array replace.
+ */
+function mergeById<T extends Record<K, string>, K extends keyof T>(
+  base: T[],
+  patch: T[] | undefined,
+  key: K,
+): T[] {
+  if (!patch || !patch.length) return base;
+  const byId = new Map<string, T>(base.map((e) => [e[key], e]));
+  for (const e of patch) byId.set(e[key], e);
+  return [...byId.values()];
+}
+
 export class Store {
   private state: StoreState;
   private listeners = new Set<Listener>();
@@ -129,9 +146,7 @@ export class Store {
           this.set({ snapshot: ev.snapshot });
           break;
         case "state_delta":
-          if (this.state.snapshot && ev.patch.entities) {
-            this.set({ snapshot: { ...this.state.snapshot, ...ev.patch } });
-          }
+          this.applyStateDelta(ev.patch);
           break;
         case "policy_changed":
           if (this.state.snapshot)
@@ -149,11 +164,68 @@ export class Store {
           });
           break;
         case "branch_ready":
+          // A deferred branch rollout finished computing on the backend: attach
+          // it by re-running the comparison so the ready branch's rollout (and
+          // its updated rank/uncertainty) are pulled into the pinned set.
+          void this.onBranchReady(ev.action_id);
+          break;
         case "replay_loaded":
+          // The backend signalled a recorded scenario is ready to stream: load
+          // it through the normal replay path (doc G SSE `replay_loaded`).
+          void this.loadReplay(ev.scenario_id);
+          break;
         default:
           break;
       }
     });
+  }
+
+  /**
+   * Merge a `state_delta` patch into the live snapshot by ENTITY ID rather than
+   * replacing whole arrays (doc G transport: "return only changed entities; the
+   * frontend interpolates"). Each entity family in the patch is keyed by its
+   * stable id; matching entities are replaced in place and new ones appended, so
+   * a one-entity delta never clobbers the rest of the pod. Scalar / non-entity
+   * fields (state_hash, kpis, freshness, …) shallow-merge as before.
+   */
+  private applyStateDelta(patch: Partial<StateSnapshotDTO>): void {
+    const snap = this.state.snapshot;
+    if (!snap) return;
+    const next: StateSnapshotDTO = { ...snap, ...patch };
+    if (patch.entities) {
+      next.entities = {
+        racks: mergeById(snap.entities.racks, patch.entities.racks, "rack_id"),
+        nodes: mergeById(snap.entities.nodes, patch.entities.nodes, "node_uid"),
+        gpus: mergeById(snap.entities.gpus, patch.entities.gpus, "gpu_uuid"),
+        workloads: mergeById(
+          snap.entities.workloads,
+          patch.entities.workloads,
+          "workload_uid",
+        ),
+        queues: mergeById(snap.entities.queues, patch.entities.queues, "name"),
+        topology_domains: mergeById(
+          snap.entities.topology_domains,
+          patch.entities.topology_domains,
+          "domain_id",
+        ),
+      };
+    }
+    this.set({ snapshot: next });
+  }
+
+  /**
+   * Attach a newly-ready branch rollout. Re-runs the comparison (which now
+   * returns the ready branch's rollout) when the named action is part of the
+   * active compare but still missing its rollout points.
+   */
+  private async onBranchReady(actionId: string): Promise<void> {
+    const cmp = this.state.compare;
+    if (!cmp || !this.state.focusedWorkload) return;
+    const cand = cmp.candidates.find((c) => c.action_id === actionId);
+    // Only refetch when this branch is known and its rollout is not yet attached.
+    if (!cand) return;
+    const needsRollout = cand.safe && (cand.rollout == null || cand.rollout.points.length === 0);
+    if (needsRollout) await this.runCompare();
   }
 
   dispose(): void {
@@ -185,6 +257,23 @@ export class Store {
 
   setHorizon(horizonS: number): void {
     this.set({ horizonS });
+  }
+
+  /**
+   * Set the forecast horizon AND re-run the comparison at the new horizon so the
+   * rollouts, deltas, and uncertainty are recomputed for the selected window
+   * (doc G state contract: `horizon_options_s` drives the horizon selector). When
+   * no comparison is active this is just `setHorizon`. The shared cursor is
+   * clamped into the new horizon so the timeline stays valid.
+   */
+  async setHorizonAndCompare(horizonS: number): Promise<void> {
+    this.set({
+      horizonS,
+      cursorS: Math.min(this.state.cursorS, horizonS),
+    });
+    if (this.state.compare && this.state.focusedWorkload) {
+      await this.runCompare();
+    }
   }
 
   // ── compare / branches ────────────────────────────────────────────────

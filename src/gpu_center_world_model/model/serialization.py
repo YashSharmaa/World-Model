@@ -66,18 +66,37 @@ def _flatten_backbone(m: RelationalWorldModel, prefix: str) -> dict[str, np.ndar
         dense(f"{prefix}.enc.{k}", v)
     gru(f"{prefix}.fast_core", m.fast_core)
     gru(f"{prefix}.slow_core", m.slow_core)
-    for k, v in m.relation_msg.items():
-        dense(f"{prefix}.relmsg.{k}", v)
     for k, v in m.relation_update.items():
         gru(f"{prefix}.relupd.{k}", v)
     for k, v in m.pool_proj.items():
         dense(f"{prefix}.pool.{k}", v)
     for k, v in m.broadcast_update.items():
         gru(f"{prefix}.bcast.{k}", v)
+    # Wave-1 typed per-relation message blocks (doc Q D2-D4).
+    for k, v in m.rel_src.items():
+        dense(f"{prefix}.relsrc.{k}", v)
+    for k, v in m.rel_dst.items():
+        dense(f"{prefix}.reldst.{k}", v)
+    for k, v in m.rel_phi.items():
+        dense(f"{prefix}.relphi.{k}", v)
+    for k, v in m.rel_gate.items():
+        dense(f"{prefix}.relgate.{k}", v)
     out[f"{prefix}.action_embed"] = np.asarray(be.to_numpy(m.action_embed))
     dense(f"{prefix}.attn_q", m.attn_q)
     dense(f"{prefix}.attn_k", m.attn_k)
     dense(f"{prefix}.attn_v", m.attn_v)
+    dense(f"{prefix}.global_readout", m.global_readout)
+    dense(f"{prefix}.film_gen", m.film_gen)
+    # World-transition predictor P_θ (doc J D6).
+    if m.predictor is not None:
+        for k, v in m.predictor.cells.items():
+            gru(f"{prefix}.pred.cells.{k}", v)
+        for k, v in m.predictor.psi_proj.items():
+            dense(f"{prefix}.pred.psi.{k}", v)
+    # Exact-field decoders D_f for the consistency loss (doc J D11).
+    if m.field_decoders is not None:
+        for k, v in m.field_decoders.decoders.items():
+            dense(f"{prefix}.fdec.{k}", v)
     return out
 
 
@@ -103,18 +122,34 @@ def _unflatten_backbone(
         m.encoders[k] = dense(f"{prefix}.enc.{k}")
     m.fast_core = gru(f"{prefix}.fast_core")
     m.slow_core = gru(f"{prefix}.slow_core")
-    for k in m.relation_msg:
-        m.relation_msg[k] = dense(f"{prefix}.relmsg.{k}")
     for k in m.relation_update:
         m.relation_update[k] = gru(f"{prefix}.relupd.{k}")
     for k in m.pool_proj:
         m.pool_proj[k] = dense(f"{prefix}.pool.{k}")
     for k in m.broadcast_update:
         m.broadcast_update[k] = gru(f"{prefix}.bcast.{k}")
+    for k in m.rel_src:
+        m.rel_src[k] = dense(f"{prefix}.relsrc.{k}")
+    for k in m.rel_dst:
+        m.rel_dst[k] = dense(f"{prefix}.reldst.{k}")
+    for k in m.rel_phi:
+        m.rel_phi[k] = dense(f"{prefix}.relphi.{k}")
+    for k in m.rel_gate:
+        m.rel_gate[k] = dense(f"{prefix}.relgate.{k}")
     m.action_embed = be.from_numpy(params[f"{prefix}.action_embed"])
     m.attn_q = dense(f"{prefix}.attn_q")
     m.attn_k = dense(f"{prefix}.attn_k")
     m.attn_v = dense(f"{prefix}.attn_v")
+    m.global_readout = dense(f"{prefix}.global_readout")
+    m.film_gen = dense(f"{prefix}.film_gen")
+    if m.predictor is not None:
+        for k in m.predictor.cells:
+            m.predictor.cells[k] = gru(f"{prefix}.pred.cells.{k}")
+        for k in m.predictor.psi_proj:
+            m.predictor.psi_proj[k] = dense(f"{prefix}.pred.psi.{k}")
+    if m.field_decoders is not None:
+        for k in m.field_decoders.decoders:
+            m.field_decoders.decoders[k] = dense(f"{prefix}.fdec.{k}")
 
 
 def _flatten_heads(h: ForecastHeads) -> dict[str, np.ndarray]:

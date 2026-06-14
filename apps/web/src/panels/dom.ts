@@ -79,6 +79,13 @@ const CSS = `
 }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 
+/* scene controls strip (left, below the queue strip): horizon / replay / layers */
+.controls { left: 18px; bottom: 232px; width: 248px; display:grid; gap:10px; }
+.control-group { display:grid; gap:5px; }
+.control-label { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.control-chips { display:flex; gap:5px; flex-wrap:wrap; }
+.control-chips .chip { padding: 3px 9px; }
+
 /* legend (bottom-left) */
 .legend { left: 18px; bottom: 92px; width: 196px; }
 .legend-list { display: grid; gap: 6px; }
@@ -163,6 +170,17 @@ const CSS = `
 .badge.safe { background: var(--safe-bg); color: var(--safe); }
 .badge.blocked { background: var(--blocked-bg); color: var(--blocked); }
 .badge.abstain { background: var(--chip-bg); color: var(--lowconf); }
+.badge.conf { font-variant-numeric: tabular-nums; letter-spacing: .01em; }
+
+/* confidence band charts (p05-p95 ribbon around p50) */
+.rec-bands { display:grid; gap:6px; margin-top:8px; }
+.band-chart { display:flex; flex-direction:column; gap:2px; }
+.band-cap { display:flex; justify-content:space-between; font-size:10px; color:var(--muted); }
+.band-spread { font-variant-numeric: tabular-nums; color: var(--predicted); }
+.band-chart svg { display:block; }
+
+/* queue-strip priority + queue-context line */
+.wl-prio { font-weight:600; color: var(--text); }
 
 /* why-not card (centered modal-ish) */
 .why-not {
@@ -201,6 +219,19 @@ const CSS = `
 .tl-pin.realized { background: var(--blocked); }
 .tl-time { color: var(--muted); font-size: 11px; min-width: 86px; text-align:right; }
 .tl-toggle { display:flex; gap:6px; }
+/* predicted-vs-realized divergence fork marker on the timeline */
+.tl-split { position:absolute; top:-3px; transform: translateX(-7px); font-size:15px; line-height:1;
+  color: var(--lowconf); cursor:pointer; text-shadow: 0 0 4px var(--panel-solid); }
+.tl-split.active { color: var(--blocked); font-weight:700; }
+
+/* replay calibration panel (right, below recommendation) */
+.replay-calibration { right: 18px; top: 116px; width: 320px; max-height: 60vh; overflow:auto; }
+.calib-badges { display:grid; gap:7px; }
+.calib-badge { border:1px solid var(--stroke); border-radius:8px; padding:7px 9px; }
+.calib-badge-top { display:flex; align-items:center; justify-content:space-between; font-weight:600; }
+.calib-badge-detail { font-size:11px; color:var(--muted); margin-top:3px; font-variant-numeric: tabular-nums; }
+.calib-split { margin-top:10px; font-size:11.5px; color:var(--text); display:flex; gap:7px; align-items:flex-start; }
+.calib-split-dot { color: var(--blocked); }
 
 /* inspect drawer (right slide-over) */
 .inspect-drawer {
@@ -209,8 +240,10 @@ const CSS = `
   transition: right 220ms ease; padding-top: 70px; overflow:auto;
 }
 .inspect-drawer.open { right: 0; }
-.kv { display:flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--stroke); font-size: 12px; }
+.kv { display:flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px dashed var(--stroke); font-size: 12px; }
 .kv b { color: var(--muted); font-weight: 500; }
+.kv span { text-align: right; }
+.drawer-section { margin-top: 12px; margin-bottom: 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--accent); }
 
 /* footer credit (bottom-right) */
 .footer-credit { position:absolute; right: 18px; bottom: 10px; font-size: 11px; }

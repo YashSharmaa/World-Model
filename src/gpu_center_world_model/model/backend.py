@@ -21,10 +21,14 @@ architecture, heads and JEPA losses can be written *once* against the shim.
 The shim is intentionally minimal: a :class:`Backend` dataclass carrying the
 array module ``xp`` plus a small set of normalized helpers whose signatures
 differ between the two libraries (``softmax``, ``sigmoid``, ``layer_norm``,
-``rng``, ``to_numpy``, ``stop_gradient``). Heavy autodiff/compile (``mx.compile``,
-``nn.value_and_grad``) lives in :mod:`gpu_center_world_model.model.mlx_backend`
-and is only touched when MLX is genuinely available; the NumPy path is a pure
-*reference forward* implementation used by the tests and the Linux demo.
+``rng``, ``to_numpy``, ``stop_gradient``). Heavy autodiff/compile (the
+``mlx.nn`` parameter tree, ``nn.value_and_grad`` + ``AdamW`` and the
+``mx.compile``'d outer training step) lives in
+:mod:`gpu_center_world_model.model.mlx_backend` (entry point
+``mlx_train_step``) and is only touched when MLX is genuinely available; the
+NumPy path is a pure *reference forward* implementation, optimized by the SPSA
+estimator in :mod:`gpu_center_world_model.model.train`, used by the tests and
+the Linux demo.
 
 Rationale: doc E names the MLX-first stack with a NumPy/Arrow fallback for ETL
 and CI; doc Q wants fixed-incidence batched matmuls (a backend-neutral op); and

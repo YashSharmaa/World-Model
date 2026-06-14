@@ -218,13 +218,45 @@ def fairness_observables(
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass(slots=True)
 class FairnessRankResult:
-    """Output of :func:`fairness_rank`: re-ordered safe actions + a ledger (H8)."""
+    """Output of :func:`fairness_rank`: re-ordered safe actions + a ledger (H8).
+
+    Attributes
+    ----------
+    ranked:
+        The fairness-re-ordered safe ``ScoredAction`` list (winner first).
+    ledger:
+        One ``ranked`` :class:`LedgerEntry` per candidate with the Eq11 fairness
+        evidence (serving tenant, benchmark service, under-served gap ``B - U``,
+        positive debt, the action-conditioned drift delta, and the two budget
+        verdicts) — the H8 explanation surface.
+    applied:
+        ``True`` only when ``fairness_mode`` is an active mode; ``False`` (no-op)
+        when fairness is off.
+    fairness_mode:
+        The mode that produced the ranking (echo of ``policy.fairness_mode``).
+    benchmark_service:
+        ``tenant_id -> B_t`` benchmark Leontief service from :func:`fair_division`.
+    under_served_gap:
+        ``tenant_id -> (B_t - U_t)_+`` true under-served gap given the supplied
+        realized-service history (doc V D31). Empty when no history was passed.
+    drift_delta:
+        ``action_id -> δ_FD(a|s)`` the action-conditioned drift delta vs hold
+        (doc V D23). Populated only when per-action drift was supplied.
+    within_budget:
+        ``action_id -> bool`` — whether the candidate satisfies *both* Eq11
+        budgets (drift ≤ δ_F and ``max_t Debt_t^+`` ≤ δ_D). Candidates that
+        violate a budget are sorted *after* all in-budget candidates (a soft
+        lexicographic demotion; fairness is a ranker, never a gate — doc V H10).
+    """
 
     ranked: list[ScoredAction]
     ledger: list[LedgerEntry] = field(default_factory=list)
     applied: bool = False  # False when fairness_mode == off (no-op)
     fairness_mode: str = "off"
     benchmark_service: dict[str, float] = field(default_factory=dict)
+    under_served_gap: dict[str, float] = field(default_factory=dict)
+    drift_delta: dict[str, float] = field(default_factory=dict)
+    within_budget: dict[str, bool] = field(default_factory=dict)
 
 
 def _action_tenant(
@@ -248,8 +280,10 @@ def fairness_rank(
     debt_tracker: FairnessDebtTracker | None = None,
     weights: Mapping[str, float] | None = None,
     nominal_service: Mapping[str, float] | None = None,
+    realized_service: Mapping[str, float] | None = None,
+    action_drift_delta: Mapping[str, float] | None = None,
 ) -> FairnessRankResult:
-    """Re-rank a planner safe set by fairness when ``fairness_mode != off`` (H10).
+    """Re-rank a planner safe set by the Eq11 budgeted-lexicographic rule (H10).
 
     This is the single public entry point the planner calls. Contract:
 
@@ -258,22 +292,42 @@ def fairness_rank(
     * **Safe-set only.** Operates strictly on the already-kernel-safe, already-
       risk-gated ``ScoredAction`` list. It never adds, drops, or un-gates an
       action — fairness is a ranker, not a gate (doc V, H10 / A1).
-    * **Budgeted lexicographic re-rank** (doc V, Eq11). For each candidate it
-      derives a fairness sort key:
+    * **Budgeted lexicographic re-rank** (doc V, Eq11). The rule is
 
-        1. whether the action helps the *worst-served* tenant (largest positive
-           debt) — actions serving more-indebted tenants sort earlier;
-        2. the tenant's gap below its fair-benchmark service (under-served first);
+        ``a* ∈ argmax_{a ∈ A_safe : FD_H(a) ≤ δ_F and max_t Debt_t^+(a) ≤ δ_D}
+          T_H(a)``, then tie-break by lower p95 wait, higher locality, lower
+        fragmentation.
+
+      Realised as a budgeted lexicographic sort key per candidate (lower sorts
+      earlier ⇒ better):
+
+        0. ``budget_violation`` — ``0`` if the candidate satisfies *both* Eq11
+           budgets (its action-conditioned drift ``δ_FD(a|s) ≤ δ_F`` and the
+           post-action worst-served debt ``max_t Debt_t^+ ≤ δ_D``), else ``1``.
+           Budget-respecting candidates are always preferred; this is the
+           lexicographic gate of Eq11, kept *soft* so the safe set is never
+           emptied (a ranker, not a hard gate — doc V H10);
+        1. ``-served_gap`` — actions toward the tenant with the largest true
+           under-served gap ``(B_t - U_t)_+`` sort first (worst-served-first);
+        2. ``-positive_debt`` — among equal gaps, serve the more-indebted tenant;
         3. the planner's own lexicographic key (preserves safety → statistical
-           safety → wait → GPU-hours → locality → fragmentation as the tiebreak).
+           safety → wait → GPU-hours → locality → fragmentation as the Eq11
+           throughput-first tie-break).
 
       ``hold`` actions are anchored at their planner position (they neither serve
       nor starve a tenant) so fairness never forces churn for its own sake.
 
-    The benchmark service comes from :func:`fair_division` under the active mode,
-    over tenant demands aggregated from state (H1). Every reordered action gets a
-    ledger entry recording the serving tenant, its benchmark service, and its
-    current positive debt (H8 explanation ledger).
+    Parameters new in the wiring item
+    ----------------------------------
+    realized_service:
+        ``tenant_id -> U_t`` realised cumulative Leontief service so far. When
+        supplied the under-served gap is the *true* ``(B_t - U_t)_+`` (doc V
+        D31), not the raw benchmark service; absent, it degrades to ``B_t``.
+    action_drift_delta:
+        ``action_id -> δ_FD(a|s)`` the action-conditioned fairness-drift delta
+        vs hold (doc V D23/Eq11). When supplied it gates each candidate against
+        ``policy.fairness_drift_budget``; absent, the drift budget is treated as
+        satisfied (no per-action drift evidence to gate on).
     """
     sym = state.symbolic if isinstance(state, WorldState) else state
     mode = policy.fairness_mode
@@ -304,34 +358,81 @@ def fairness_rank(
         except ValueError:
             benchmark_service = {}
 
+    # ---- true under-served gap (B - U) per tenant (doc V D31) -------------
+    # When realised-service history is supplied, the under-served gap is the
+    # positive part of (benchmark - realised). Without history we fall back to
+    # the benchmark service itself (the gap a tenant *would* face from zero), so
+    # the ranker is still worst-served-first but the ledger flags it as a proxy.
+    under_served_gap: dict[str, float] = {}
+    have_history = realized_service is not None
+    for tid, bench in benchmark_service.items():
+        realised = float(realized_service.get(tid, 0.0)) if have_history else 0.0
+        under_served_gap[tid] = max(float(bench) - realised, 0.0)
+
+    drift_budget = float(policy.fairness_drift_budget)
+    debt_budget = float(policy.debt_budget)
+
     # ---- per-tenant current positive debt (slow-core memory) --------------
     def _pos_debt(tenant_id: str | None) -> float:
         if tenant_id is None or debt_tracker is None:
             return 0.0
         return debt_tracker.positive_debt(tenant_id)
 
-    # realized-so-far service proxy is not known here; under-served gap is the
-    # benchmark service the tenant *would* get — actions toward high-benchmark,
-    # high-debt tenants are preferred (doc V Eq11 worst-served-first).
+    # Worst-served standing debt across all tracked tenants — the LHS of the
+    # Eq11/D27 debt budget ``max_t Debt_t^+ ≤ δ_D``. Serving an under-served
+    # tenant relieves debt; serving an already-satisfied tenant (or holding while
+    # someone starves) leaves it standing, so we charge each candidate the
+    # post-action worst-served debt (debt minus what *this* action repays).
+    base_max_debt = (
+        debt_tracker.max_positive_debt() if debt_tracker is not None else 0.0
+    )
+
     ledger: list[LedgerEntry] = []
+    drift_delta_out: dict[str, float] = {}
+    within_budget: dict[str, bool] = {}
     decorated: list[tuple[tuple[float, ...], int, ScoredAction]] = []
     for idx, sc in enumerate(cand_list):
         tenant = _action_tenant(sc.action, sym)
         is_hold = sc.action.type == ActionType.HOLD
         pos_debt = _pos_debt(tenant)
         bench = float(benchmark_service.get(tenant, 0.0)) if tenant else 0.0
+        gap = float(under_served_gap.get(tenant, 0.0)) if tenant else 0.0
+
+        # δ_FD(a|s): per-action drift delta vs hold (doc V D23). Hold is its own
+        # reference, so its delta is exactly 0; other actions take the supplied
+        # value (None ⇒ unknown ⇒ treated as drift-neutral for the budget).
+        if action_drift_delta is not None and sc.action_id in action_drift_delta:
+            drift = float(action_drift_delta[sc.action_id])
+        else:
+            drift = 0.0
+        drift_delta_out[sc.action_id] = drift
+
+        # Post-action worst-served debt: an action serving an under-served tenant
+        # repays up to its benchmark service this window, so the worst-served
+        # debt it leaves standing is ``max(base_max_debt - repaid, debt_of_a)``
+        # bounded below by 0. Hold repays nothing.
+        repaid = 0.0 if is_hold or tenant is None else min(pos_debt, bench)
+        post_max_debt = max(base_max_debt - repaid, 0.0)
+
+        drift_ok = drift <= drift_budget
+        debt_ok = post_max_debt <= debt_budget
+        budget_ok = drift_ok and debt_ok
+        within_budget[sc.action_id] = budget_ok
+        violation = 0 if budget_ok else 1
 
         if is_hold or tenant is None:
             # neutral: keep at planner position, do not let fairness reorder it.
+            served_gap = 0.0
             helps = 0.0
-            gap = 0.0
         else:
             # lower key sorts earlier ⇒ negate "good for fairness" signals.
-            helps = -(pos_debt)
-            gap = -(bench)
+            served_gap = -gap
+            helps = -pos_debt
 
         planner_key = sc.lex_key if sc.lex_key else (float(sc.rank or idx),)
-        fairness_key = (helps, gap, *planner_key)
+        # Eq11 budgeted-lexicographic key: budget verdict dominates, then
+        # worst-served gap, then standing debt, then the planner ordering.
+        fairness_key = (float(violation), served_gap, helps, *planner_key)
         decorated.append((fairness_key, idx, sc))
 
         ledger.append(
@@ -340,14 +441,25 @@ def fairness_rank(
                 action_id=sc.action_id,
                 detail=(
                     f"fairness_mode={mode}; tenant={tenant}; "
-                    f"benchmark_service={bench:.4g}; positive_debt={pos_debt:.4g}"
+                    f"benchmark_service={bench:.4g}; under_served_gap={gap:.4g}; "
+                    f"positive_debt={pos_debt:.4g}; drift_delta={drift:.4g}; "
+                    f"within_budget={budget_ok}"
                 ),
                 evidence={
                     "tenant_id": tenant,
                     "fairness_mode": mode,
                     "benchmark_service": bench,
+                    "under_served_gap": gap,
                     "positive_debt": pos_debt,
+                    "drift_delta": drift,
+                    "drift_budget": drift_budget,
+                    "drift_within_budget": drift_ok,
+                    "post_action_max_debt": post_max_debt,
+                    "debt_budget": debt_budget,
+                    "debt_within_budget": debt_ok,
+                    "within_budget": budget_ok,
                     "is_hold": is_hold,
+                    "has_realized_history": have_history,
                 },
             )
         )
@@ -364,6 +476,9 @@ def fairness_rank(
         applied=True,
         fairness_mode=mode,
         benchmark_service=benchmark_service,
+        under_served_gap=under_served_gap,
+        drift_delta=drift_delta_out,
+        within_budget=within_budget,
     )
 
 

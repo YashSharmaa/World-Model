@@ -36,7 +36,12 @@ from ...schema.observations import Observation
 from ...schema.state import WorldState
 from ...utils.seeding import SeedBundle
 from ..contracts import DecisionWindow, LabelPack, Origin, Split
-from ..normalize.canonical import Lane, SilverFrame
+from ..normalize.canonical import (
+    Lane,
+    SilverFrame,
+    bronze_to_silver,
+    observations_to_metric_samples,
+)
 from ..synthetic.counterfactual import CounterfactualPack
 
 
@@ -116,6 +121,14 @@ def labels_from_pack(
                 # point-mass quantiles at the realised value (single-seed pack);
                 # multi-seed packs overwrite these with empirical quantiles.
                 kpi_q[ch] = {q: val for q in QUANTILES}
+            # Collapsed slow-latent / virtual-queue targets (doc K T14 EqL1-EqL5)
+            # are emitted as additional ``vq:*`` channels — the privileged
+            # structured targets the world model's slow latent regresses on (doc K
+            # handoff: "expose bottleneck coordinates, dual shadow prices, and
+            # fragmentation summaries ... as privileged structured targets"). They
+            # ride the existing ``kpi_quantiles`` schema (additive, point-mass).
+            for name, val in branch.vq_features.items():
+                kpi_q[f"vq:{name}"] = {q: float(val) for q in QUANTILES}
             out.append(
                 LabelPack(
                     decision_id=pack.state_hash,
@@ -130,6 +143,111 @@ def labels_from_pack(
     return out
 
 
+def silver_from_pack(
+    pack: CounterfactualPack,
+    *,
+    baseline_action_id: str | None = None,
+    origin: str = "sim",
+    pre_action_state: WorldState | None = None,
+) -> dict[Lane, list[SilverFrame]]:
+    """Round-trip a branch's emitted telemetry into Silver (doc D Bronze→Silver).
+
+    The rollout emits per-step canonical :class:`Observation`s on every branch
+    (DLC backbone, doc R Eq17). We feed the *realised future* of the realised
+    (baseline) branch through the same pipeline real telemetry uses —
+    :func:`observations_to_metric_samples` (→ Bronze rows) then
+    :func:`bronze_to_silver` (→ three-lane Silver tables) — so synthetic and real
+    share one canonical schema (doc D prioritised recommendation). Returns the
+    Silver lanes; the windows builder slices them into the pre-action observational
+    context and the post-action realised horizon.
+
+    When ``pre_action_state`` is supplied, a strictly-before-``t0`` snapshot of each
+    GPU's current telemetry is prepended so the observational context is a non-empty
+    leak-free history (every snapshot timestamp is ``< t0``), and the rollout
+    emissions form the realised horizon (``≥ t0``).
+    """
+    base_id = baseline_action_id or pack.baseline_action_id
+    branch = next((b for b in pack.branches if b.action_id == base_id), None)
+    if branch is None or not branch.observations:
+        branch = next(
+            (b for b in pack.branches if b.feasible and b.observations), None
+        )
+    observations: list[Observation] = []
+    if pre_action_state is not None:
+        observations.extend(_pre_action_snapshot(pre_action_state))
+    if branch is not None:
+        observations.extend(branch.observations)
+    # ``degrade_nonobserved`` flags incident-time staleness/drops as degraded in
+    # Bronze so missingness travels as state through Silver (doc D #5; doc R Eq20).
+    rows = observations_to_metric_samples(
+        observations, origin=origin, degrade_nonobserved=True
+    )
+    return bronze_to_silver(rows)
+
+
+def _pre_action_snapshot(state: WorldState) -> list[Observation]:
+    """One strictly-before-``t0`` GPU telemetry frame from the pre-action state.
+
+    Reads each GPU's current canonical telemetry (util/mem/power/temp/xid) directly
+    off the symbolic state at ``t0⁻`` so the window has a non-empty pre-decision
+    observational context that :func:`assert_no_leakage` validates. Timestamps sit
+    one fast-cadence tick *before* ``t0`` (never at/after it).
+    """
+    from ...schema.observations import (
+        Channel,
+        ObservationFamily,
+        SourceHealth,
+    )
+
+    ts = int(state.ts_ns - 1_000_000_000)  # 1 s before t0 (a fast-lane tick)
+    out: list[Observation] = []
+    for gid, g in state.symbolic.gpus.items():
+        def ch(name: str, value: float) -> Channel:
+            return Channel(
+                name=name,
+                value=value,
+                available=True,
+                age_s=0.0,
+                source_health=SourceHealth.OBSERVED,
+            )
+
+        out.append(
+            Observation(
+                entity_kind="gpu",
+                entity_id=gid,
+                family=ObservationFamily.GPU_TELEMETRY,
+                ts_event_ns=ts,
+                channels={
+                    "DCGM_FI_DEV_GPU_UTIL": ch("DCGM_FI_DEV_GPU_UTIL", g.util * 100.0),
+                    "DCGM_FI_DEV_MEM_COPY_UTIL": ch(
+                        "DCGM_FI_DEV_MEM_COPY_UTIL", g.mem_util * 100.0
+                    ),
+                    "DCGM_FI_DEV_POWER_USAGE": ch("DCGM_FI_DEV_POWER_USAGE", g.power_w),
+                    "DCGM_FI_DEV_GPU_TEMP": ch("DCGM_FI_DEV_GPU_TEMP", g.temp_c),
+                    "DCGM_FI_DEV_XID_ERRORS": ch(
+                        "DCGM_FI_DEV_XID_ERRORS", float(g.xid_code)
+                    ),
+                },
+            )
+        )
+    return out
+
+
+def realized_horizon_frames(
+    silver: dict[Lane, list[SilverFrame]], t0_ns: int
+) -> list[SilverFrame]:
+    """Silver frames at/after ``t0`` — the realised future (doc D realized_horizon).
+
+    The complement of the pre-action feature slice: every frame whose time is at or
+    after the decision boundary, i.e. the observed outcome of the chosen action.
+    """
+    out: list[SilverFrame] = []
+    for frames in silver.values():
+        out.extend(fr for fr in frames if fr.ts_ns >= t0_ns)
+    out.sort(key=lambda f: f.ts_ns)
+    return out
+
+
 def build_window(
     pre_action_state: WorldState,
     pack: CounterfactualPack,
@@ -141,14 +259,28 @@ def build_window(
     source_mix: Origin = Origin.SIM_COUNTERFACTUAL,
     generator_commit: str = "",
     provenance_uri: str = "",
+    observational_context_uri: str = "",
+    realized_horizon_uri: str = "",
+    counterfactual_pack_uri: str = "",
+    attach_pack_telemetry: bool = False,
 ) -> tuple[DecisionWindow, list[LabelPack]]:
     """Assemble a Gold decision window + its label packs from a CF pack.
 
     The window's ``state_hash`` is the pack's pre-action hash, ``seed_bundle`` is
     the shared exogenous bundle, and ``candidate_action_ids`` are the branch ids.
     Pre-action features (if supplied) are leak-checked before emission.
+
+    When ``attach_pack_telemetry`` is set and no ``silver``/``features`` were
+    supplied, the realised branch's emitted telemetry is round-tripped through
+    Bronze→Silver (:func:`silver_from_pack`), the pre-action slice becomes the
+    window features (so :func:`assert_no_leakage` *always* runs over a non-empty
+    context), and the three Gold URIs (``observational_context``,
+    ``realized_horizon``, ``counterfactual_pack``) are populated. The three URIs may
+    also be supplied directly by a caller that persisted the artifacts itself.
     """
     t0_ns = pre_action_state.ts_ns
+    if silver is None and attach_pack_telemetry:
+        silver = silver_from_pack(pack, pre_action_state=pre_action_state)
     if features is None and silver is not None:
         features = assemble_features(silver, t0_ns)
     if features is not None:
@@ -160,6 +292,9 @@ def build_window(
         state_hash=pack.state_hash,
         seed_bundle=pack.seed_bundle,
         candidate_action_ids=[b.action_id for b in pack.branches],
+        observational_context_uri=observational_context_uri,
+        realized_horizon_uri=realized_horizon_uri,
+        counterfactual_pack_uri=counterfactual_pack_uri,
         split=split,
         scenario_family=scenario_family,
         source_mix=source_mix,
@@ -169,6 +304,100 @@ def build_window(
     )
     labels = labels_from_pack(pack)
     return window, labels
+
+
+def persist_window_artifacts(
+    out_dir: str,
+    pack: CounterfactualPack,
+    pre_action_state: WorldState,
+    *,
+    decision_id: str | None = None,
+) -> tuple[str, str, str]:
+    """Persist the Silver context, realised horizon, and CF pack; return 3 URIs.
+
+    Writes three byte-stable JSON artifacts under ``out_dir`` and returns their
+    relative URIs in the order the Gold :class:`DecisionWindow` records them:
+    ``(observational_context_uri, realized_horizon_uri, counterfactual_pack_uri)``
+    (doc D Gold decision_window URIs). The observational context is the pre-``t0``
+    Silver slice (leak-free), the realised horizon is the at/after-``t0`` slice, and
+    the counterfactual pack is the full branch summary (KPIs/hazards/virtual-queue
+    features/IS estimates) — the persisted form of the paired pack the harness
+    re-reads for counterfactual training.
+    """
+    import json
+    import os
+
+    did = decision_id or pack.state_hash
+    silver = silver_from_pack(pack, pre_action_state=pre_action_state)
+    t0_ns = pre_action_state.ts_ns
+    feats = assemble_features(silver, t0_ns)
+    assert_no_leakage(feats)
+    realized = realized_horizon_frames(silver, t0_ns)
+
+    def _obs_payload(obs: Observation) -> dict:
+        return {
+            "entity_kind": obs.entity_kind,
+            "entity_id": obs.entity_id,
+            "family": obs.family.value,
+            "ts_event_ns": obs.ts_event_ns,
+            "channels": {
+                name: {
+                    "value": ch.value,
+                    "available": ch.available,
+                    "age_s": ch.age_s,
+                    "source_health": ch.source_health.value,
+                }
+                for name, ch in obs.channels.items()
+            },
+        }
+
+    ctx = {
+        "t0_ns": t0_ns,
+        "observations": [_obs_payload(o) for o in feats.all_observations()],
+    }
+    hor = {
+        "t0_ns": t0_ns,
+        "frames": [
+            {
+                "lane": fr.lane.value,
+                "ts_ns": fr.ts_ns,
+                "observations": [_obs_payload(o) for o in fr.observations],
+            }
+            for fr in realized
+        ],
+    }
+    cf = {
+        "state_hash": pack.state_hash,
+        "seed_bundle": pack.seed_bundle,
+        "horizon_s": pack.horizon_s,
+        "baseline_action_id": pack.baseline_action_id,
+        "branches": [
+            {
+                "action_id": b.action_id,
+                "type": b.action.type.value,
+                "feasible": b.feasible,
+                "blockers": list(b.blockers),
+                "kpis": dict(b.kpis),
+                "hazards": dict(b.hazards),
+                "vq_features": dict(b.vq_features),
+                "hazard_estimates": {k: dict(v) for k, v in b.hazard_estimates.items()},
+                "placed_domain": b.placed_domain,
+            }
+            for b in pack.branches
+        ],
+    }
+
+    os.makedirs(os.path.join(out_dir, "observational_context"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "realized_horizon"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "counterfactual_packs"), exist_ok=True)
+    ctx_uri = f"observational_context/{did}.json"
+    hor_uri = f"realized_horizon/{did}.json"
+    cf_uri = f"counterfactual_packs/{did}.json"
+    for rel, payload in ((ctx_uri, ctx), (hor_uri, hor), (cf_uri, cf)):
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+            fh.write("\n")
+    return ctx_uri, hor_uri, cf_uri
 
 
 def temporal_split(t0_ns: int, train_end_ns: int, val_end_ns: int) -> Split:
@@ -378,6 +607,9 @@ __all__ = [
     "derive_seed_bundle",
     "descriptor_from_window",
     "labels_from_pack",
+    "persist_window_artifacts",
+    "realized_horizon_frames",
     "severity_band",
+    "silver_from_pack",
     "temporal_split",
 ]

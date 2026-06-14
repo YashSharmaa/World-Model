@@ -46,8 +46,9 @@ paired-branch **action-separation** ratio ``A_h``. They are returned in the
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -62,24 +63,47 @@ from ..schema.entities import (
     Workload,
     WorkloadStatus,
 )
+from ..schema.kpis import HazardChannel, KPIChannel
 from ..schema.state import SymbolicState, WorldState
-from .architecture import ArchConfig, TensorState, kernel_state_summary
-from .backend import Backend, get_backend
+from .architecture import (
+    ArchConfig,
+    TensorState,
+    exact_field_targets,
+    kernel_state_summary,
+)
+from .backend import ArrayLike, Backend, get_backend
+from .heads import (
+    COMPETING_RISK_CHANNELS,
+    HAZARD_QUERY_ENTITY,
+    PARALLEL_BINARY_CHANNELS,
+)
 from .jepa import (
     LOSS_GROUPS,
     GroupLogVars,
     JEPAConfig,
     anti_collapse_loss,
+    apply_typed_mask,
     combined_objective,
+    cosine_collapse,
+    covariance_energy,
     ema_update,
     jepa_mask_loss,
+    ood_head_loss,
+    quantile_head_loss,
     rollout_branch_diff_loss,
+    rollout_consistency_loss,
     rollout_loss,
+    survival_head_loss,
 )
+from .mlx_backend import HAS_MLX as HAS_MLX_BACKEND
+from .mlx_backend import mlx_train_step
 from .serialization import save_checkpoint
 from .world_model import ResidualWorldModel
 
 # Optional MLX optimizer / autodiff (guarded — NumPy SPSA is the always-on path).
+# The real autodiff hot path (mlx.nn param tree + value_and_grad + AdamW +
+# mx.compile) lives in :mod:`.mlx_backend`; here we only detect availability so
+# :func:`train` can route the inner step. ``HAS_MLX_OPT`` stays the public flag.
 try:  # pragma: no cover - Apple-silicon only
     import mlx.core as _mx  # type: ignore
     import mlx.optimizers as _mopt  # type: ignore
@@ -241,11 +265,19 @@ def action_separation(
 
 @dataclass(slots=True)
 class DiagSnapshot:
-    """One collapse-diagnostic snapshot (doc J D1/D2/D5) at a training step."""
+    """One collapse-diagnostic snapshot (doc J D1–D5) at a training step.
+
+    Carries the doc J collapse diagnostics: per-type effective rank (D1),
+    minimum per-dimension variance (D2), cross-dimension covariance energy
+    ``c_off`` (D3), mean off-diagonal cosine similarity ``s_cos`` (D4), and the
+    paired-branch action-separation ratio ``A`` (D5).
+    """
 
     step: int
     effective_rank: dict[str, float] = field(default_factory=dict)
     min_dim_var: dict[str, float] = field(default_factory=dict)
+    cov_energy: dict[str, float] = field(default_factory=dict)
+    cosine_sim: dict[str, float] = field(default_factory=dict)
     action_separation: float = 1.0
     collapse_alarm: bool = False
 
@@ -256,12 +288,21 @@ def _diag_snapshot(
     batch: Sequence[DecisionWindow],
     step: int,
     cfg: TrainConfig,
+    target_model: ResidualWorldModel | None = None,
 ) -> DiagSnapshot:
-    """Compute per-type effective rank, min variance, and action separation."""
+    """Compute the D1–D5 collapse diagnostics for a step (doc J D1–D5).
+
+    ``target_model`` is the EMA teacher: when supplied, the D5 action-separation
+    ratio is computed against the teacher-encoded counterfactual branch futures
+    (the true ``A = ||Δẑ|| / ||Δz⁺||`` ratio); otherwise the denominator falls
+    back to 1 (raw predicted separation).
+    """
     be = model.be
     z = model.backbone.encode(ts, "hold")
     eff: dict[str, float] = {}
     mvar: dict[str, float] = {}
+    cov_e: dict[str, float] = {}
+    cos_s: dict[str, float] = {}
     alarm = False
     lat = model.backbone.cfg.latent.as_dict()
     lat["topology_domain"] = lat["rack"]
@@ -272,6 +313,8 @@ def _diag_snapshot(
             a = a[m] if m.ndim == 1 and m.shape[0] == a.shape[0] else a
         eff[t] = effective_rank(a)
         mvar[t] = min_dim_variance(a)
+        cov_e[t] = covariance_energy(a)  # D3 cross-dimension covariance energy
+        cos_s[t] = cosine_collapse(a)  # D4 mean off-diagonal cosine similarity
         d = lat.get(t, a.shape[-1] if a.ndim == 2 else 1)
         # The effective-rank and variance alarms only have statistical meaning
         # once the number of valid rows can plausibly fill the latent budget
@@ -284,9 +327,14 @@ def _diag_snapshot(
             alarm = True
         if n_rows >= d and collapsed_dim_fraction(a, cfg.var_floor) > 0.9:
             alarm = True
+        # D4 complete-collapse alarm: near-unit cosine over a filled latent budget
+        # (doc J D4: complete collapse drives s_cos → 1).
+        if n_rows >= max(4, d) and cos_s[t] > 0.98:
+            alarm = True
 
-    # action separation from the first paired window in the batch (doc J D5)
+    # D5 action separation from the first paired window (true ratio vs teacher).
     sep = 1.0
+    tgt_enc = target_model or model
     for w in batch:
         if w.branch_action is None:
             continue
@@ -298,7 +346,19 @@ def _diag_snapshot(
             k: np.asarray(be.to_numpy(v))
             for k, v in model.backbone.encode(ts, w.branch_action.type.value).items()
         }
-        sep = action_separation(zb, zbp, None, None)
+        # EMA-encoded counterfactual branch futures from the same pre-action
+        # hash/seed: z⁺ for branch b is its labelled future, for b' its branch
+        # future (doc J D7); these form the true A=||Δẑ||/||Δz⁺|| denominator.
+        if target_model is not None:
+            fb_state = w.future_state or w.state
+            fbp_state = w.branch_future_state or w.state
+            tgt_b = _encode_targets(tgt_enc, fb_state, w.action.type.value, None)
+            tgt_bp = _encode_targets(
+                tgt_enc, fbp_state, w.branch_action.type.value, None
+            )
+        else:
+            tgt_b = tgt_bp = None
+        sep = action_separation(zb, zbp, tgt_b, tgt_bp)
         if sep < 0.05:
             alarm = True
         break
@@ -306,6 +366,8 @@ def _diag_snapshot(
         step=step,
         effective_rank=eff,
         min_dim_var=mvar,
+        cov_energy=cov_e,
+        cosine_sim=cos_s,
         action_separation=sep,
         collapse_alarm=alarm,
     )
@@ -337,12 +399,29 @@ def _trainable_arrays(model: ResidualWorldModel) -> list[tuple[object, str]]:
         handles += [(d, "W"), (d, "b")]
     for d in bb.rel_gate.values():
         handles += [(d, "W"), (d, "b")]
+    # typed gated node update, hierarchical PNA pooling, and downward broadcast
+    # (doc Q D4 / Eq.2-5) — all used in the forward pass, so all must train.
+    for g in bb.relation_update.values():
+        handles += [(g, "Wz"), (g, "Wr"), (g, "Wh")]
+    for d in bb.pool_proj.values():
+        handles += [(d, "W"), (d, "b")]
+    for g in bb.broadcast_update.values():
+        handles += [(g, "Wz"), (g, "Wr"), (g, "Wh")]
+    # candidate attention (doc Q Eq.6-8), PNA global readout, and FiLM rebroadcast.
+    for d in (bb.attn_q, bb.attn_k, bb.attn_v, bb.global_readout, bb.film_gen):
+        handles += [(d, "W"), (d, "b")]
     handles.append((bb, "action_embed"))
     # world-transition predictor P_θ — the deployed recursive core (doc J D6).
     if bb.predictor is not None:
         for cell in bb.predictor.cells.values():
             handles += [(cell, "Wz"), (cell, "Wr"), (cell, "Wh")]
         for d in bb.predictor.psi_proj.values():
+            handles += [(d, "W"), (d, "b")]
+    # exact-state field decoders D_f for the consistency loss (doc J D11): they
+    # must be trained (and EMA-transferred) so L_cons can pin the residual into
+    # the kernel-null directions (doc J T3).
+    if bb.field_decoders is not None:
+        for d in bb.field_decoders.decoders.values():
             handles += [(d, "W"), (d, "b")]
     return handles
 
@@ -402,6 +481,260 @@ def _curriculum_horizon(
     return round(h0 + (h1 - h0) * frac)
 
 
+# Shortcut-prone exact-field entity types masked on the *online* context before
+# encode (doc J E1/E3 / C3: typed masking is the primary anti-collapse scaffold).
+# Masking these blocks the predictor from copying observed exact-bound values and
+# forces it to use the action + relational context (doc J Causal-JEPA).
+_MASK_TYPES: tuple[str, ...] = ("workload", "gpu", "node", "topology_domain")
+
+
+def _masked_online_encode(
+    model: ResidualWorldModel,
+    ts: TensorState,
+    action_name: str,
+    rng: np.random.Generator,
+    mask_prob: float,
+) -> dict[str, ArrayLike]:
+    """Encode the *typed-masked* online context (doc J A2/E1, Eqs. 1–3).
+
+    The online encoder consumes a typed-masked context ``M ⊙ x0`` while the EMA
+    target encoder sees the unmasked future (asymmetry is the primary
+    anti-collapse mechanism, doc J C3). The validity masks are unchanged so the
+    padding / pooling logic still holds; only feature *rows* are zeroed.
+    """
+    feats = apply_typed_mask(ts.features, _MASK_TYPES, rng, mask_prob, model.be)
+    masked_ts = replace(ts, features=feats)
+    return model.backbone.encode(masked_ts, action_name)
+
+
+def _field_target_traj(
+    state: WorldState,
+    order: dict[str, list[str]],
+    masks: dict[str, ArrayLike],
+    be: Backend,
+    horizon: int,
+) -> list[dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """Exact kernel field targets ``f(s^K_h)`` for every rollout step h=1..H.
+
+    The exact fields are read off the (counterfactual future) symbolic state, so
+    they are constant across the H steps of one window's rollout (the kernel
+    rollout ledger is hashed once per window); they are repeated per step so
+    :func:`jepa.rollout_consistency_loss` can pair ``D_f(ẑ_h)`` with ``f(s^K_h)``
+    at every step (doc J Eq. 18: ``Σ_{h=1..H}``).
+    """
+    tgt = exact_field_targets(state, order, masks, be)
+    return [tgt for _ in range(max(horizon, 0))]
+
+
+def _decode_field_traj(
+    model: ResidualWorldModel,
+    pred_traj: list[dict[str, ArrayLike]],
+) -> list[dict[str, ArrayLike]]:
+    """Decode ``D_f(ẑ_h)`` for each rolled latent in the trajectory (doc J D11)."""
+    fd = model.backbone.field_decoders
+    if fd is None:
+        return []
+    return [fd.decode(z, model.be) for z in pred_traj]
+
+
+def _kpi_delta_labels(
+    model: ResidualWorldModel,
+    window: DecisionWindow,
+) -> dict[tuple[str, int], float]:
+    """Realized KPI-delta labels ``y_{k,h}`` from the counterfactual future (H1).
+
+    KPI targets are *deltas vs. the baseline action* (typically ``hold``) at each
+    horizon (doc J A5). We read each channel's realized signal off the labelled
+    future symbolic state minus the pre-action state, normalized by a robust
+    scale (doc J R4), and broadcast it across the horizon grid. Windows without a
+    labelled future contribute no targets (the non-crossing penalty still runs).
+    """
+    from ..schema.kpis import HORIZONS_S
+
+    fut = window.future_state
+    if fut is None:
+        return {}
+    pre, post = window.state.symbolic, fut.symbolic
+
+    def _free_gpu(X) -> float:
+        return float(sum(d.free_gpu for d in X.domains.values()))
+
+    def _pending(X) -> float:
+        return float(
+            sum(
+                sum(ps.count * ps.gpu_req for ps in w.podsets)
+                for w in X.workloads.values()
+                if w.status in (WorkloadStatus.PENDING, WorkloadStatus.RESERVING)
+            )
+        )
+
+    def _hotspot(X) -> float:
+        ds = list(X.domains.values())
+        return float(sum(d.hotspot_score for d in ds) / max(len(ds), 1))
+
+    def _headroom(X) -> float:
+        ds = list(X.domains.values())
+        return float(sum(d.headroom_score for d in ds) / max(len(ds), 1))
+
+    # robust-scaled deltas per channel (doc J R4 normalize-before-pinball)
+    deltas: dict[KPIChannel, float] = {
+        KPIChannel.ADMITTED_GPU_HOURS_DELTA: (_free_gpu(pre) - _free_gpu(post)) / 16.0,
+        KPIChannel.QUEUE_WAIT_DELTA_S: (_pending(post) - _pending(pre)) / 16.0,
+        KPIChannel.TOPOLOGY_FRAGMENTATION_DELTA: (_hotspot(post) - _hotspot(pre)),
+        KPIChannel.CROSS_RACK_RATE: (_hotspot(post) - _hotspot(pre)),
+        KPIChannel.RACK_THERMAL_HEADROOM_C: (_headroom(post) - _headroom(pre)),
+        KPIChannel.SLOWDOWN: (_pending(post) - _pending(pre)) / 16.0,
+    }
+    out: dict[tuple[str, int], float] = {}
+    for ch, val in deltas.items():
+        for hz in HORIZONS_S:
+            out[(ch.value, hz)] = float(val)
+    return out
+
+
+def _query_pool(
+    be: Backend, h: ArrayLike, mask: ArrayLike | None
+) -> np.ndarray:
+    """Masked-mean pool an entity latent block into one query vector (doc Q V4)."""
+    a = np.asarray(be.to_numpy(h), dtype=np.float64)
+    if a.ndim == 1:
+        return a
+    if mask is None:
+        return a.mean(axis=0)
+    m = np.asarray(be.to_numpy(mask), dtype=np.float64).reshape(-1)
+    denom = max(float(m.sum()), 1.0)
+    return (a * m[:, None]).sum(axis=0) / denom
+
+
+def _survival_components(
+    model: ResidualWorldModel,
+    z_head: dict[str, ArrayLike],
+    masks: dict[str, ArrayLike],
+):
+    """Interval-level competing-risk probs and binary hazards from head weights.
+
+    Re-derives the per-interval distributions the public head smooths into
+    cumulative incidence, by applying the *public* head Dense weights
+    (``heads.hz_competing`` / ``heads.hz_binary``) to the masked-mean query
+    latent. This keeps the survival NLL exact (doc J Eq. 14–16) without touching
+    :mod:`heads`. Returns ``(competing_interval_probs, binary_interval_hazards)``.
+    """
+    from ..schema.kpis import HORIZONS_S
+
+    be = model.be
+    heads = model.heads
+    n_h = len(HORIZONS_S)
+
+    # ---- competing risks (workload-level): softmax over {survive, ...} ----- #
+    qw = _query_pool(be, z_head.get("workload"), masks.get("workload"))
+    cr_W = np.asarray(be.to_numpy(heads.hz_competing.W), dtype=np.float64)
+    cr_b = np.asarray(be.to_numpy(heads.hz_competing.b), dtype=np.float64)
+    cr_logits = (cr_W @ qw[: cr_W.shape[1]] + cr_b).reshape(n_h, -1)
+    competing: dict[str, list[np.ndarray]] = {
+        "workload": [_softmax_np(cr_logits[hi]) for hi in range(n_h)]
+    }
+
+    # ---- parallel-binary incidents: per-interval sigmoid hazards ----------- #
+    binary: dict[str, np.ndarray] = {}
+    for ch in PARALLEL_BINARY_CHANNELS:
+        ent = HAZARD_QUERY_ENTITY[ch]
+        d = heads.hz_binary.get(ch)
+        if d is None:
+            continue
+        q = _query_pool(be, z_head.get(ent), masks.get(ent))
+        W = np.asarray(be.to_numpy(d.W), dtype=np.float64)
+        b = np.asarray(be.to_numpy(d.b), dtype=np.float64)
+        logits = W @ q[: W.shape[1]] + b
+        binary[ch.value] = _sigmoid_np(logits)
+    return competing, binary
+
+
+def _survival_labels(window: DecisionWindow):
+    """Event / censoring labels for the survival head from the future state (H2).
+
+    Reads the realized competing-risk event (timeout / requeue) and parallel
+    binary incidents (xid, hotspot, headroom, node-failure) off the labelled
+    counterfactual future symbolic state. Returns
+    ``(competing_labels, binary_labels)`` keyed exactly as
+    :func:`jepa.survival_head_loss` expects. With no labelled future every
+    instance is right-censored (the honest no-event-observed default, doc J Eq. 16).
+    """
+    from ..schema.kpis import HORIZONS_S
+
+    n_h = len(HORIZONS_S)
+    fut = window.future_state
+    competing_labels: dict[str, tuple[int | None, int | None]] = {
+        "workload": (None, None)
+    }
+    binary_labels: dict[str, int | None] = {
+        ch.value: None for ch in PARALLEL_BINARY_CHANNELS
+    }
+    if fut is None:
+        return competing_labels, binary_labels
+    X = fut.symbolic
+    # competing risk: requeued / evicted workloads (class index per doc heads).
+    ec, ei = None, None
+    for w in X.workloads.values():
+        if w.status in (WorkloadStatus.REQUEUED, WorkloadStatus.EVICTED):
+            # class 0 = survive; competing classes are 1-based in head order.
+            try:
+                ci = list(COMPETING_RISK_CHANNELS).index(HazardChannel.REQUEUE) + 1
+            except ValueError:
+                ci = 1
+            ec, ei = ci, min(1, n_h - 1)
+            break
+    competing_labels["workload"] = (ec, ei)
+    # parallel-binary incidents observed in the future state.
+    xid = any(g.xid_code > 0 for g in X.gpus.values())
+    binary_labels[HazardChannel.XID_FAULT.value] = 0 if xid else None
+    hot = any(d.hotspot_score > 0.8 for d in X.domains.values())
+    binary_labels[HazardChannel.HOTSPOT.value] = 0 if hot else None
+    return competing_labels, binary_labels
+
+
+def _abstention_logits(
+    model: ResidualWorldModel,
+    z_head: dict[str, ArrayLike],
+    masks: dict[str, ArrayLike],
+) -> tuple[float, float]:
+    """Raw (epistemic, ood) abstention logits from the public head weights (H3)."""
+    be = model.be
+    heads = model.heads
+    g = _query_pool(be, z_head.get("global"), masks.get("global"))
+    tW = np.asarray(be.to_numpy(heads.abstain_trunk.W), dtype=np.float64)
+    tb = np.asarray(be.to_numpy(heads.abstain_trunk.b), dtype=np.float64)
+    trunk = np.tanh(tW @ g[: tW.shape[1]] + tb)
+    oW = np.asarray(be.to_numpy(heads.abstain_out.W), dtype=np.float64)
+    ob = np.asarray(be.to_numpy(heads.abstain_out.b), dtype=np.float64)
+    logits = oW @ trunk[: oW.shape[1]] + ob
+    return float(logits[0]), float(logits[1])
+
+
+def _ood_label(window: DecisionWindow) -> float:
+    """Held-out OOD indicator ``o_h`` (doc J H3).
+
+    Constructed from the held-out topology/flavor/fault/source-health detectors:
+    a rare-event or real (held-out source) window is the positive class, an
+    ordinary synthetic window the negative class.
+    """
+    return 1.0 if (window.is_rare_event or window.is_real) else 0.0
+
+
+def _softmax_np(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.clip(e.sum(), 1e-12, None)
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    out = np.empty_like(x, dtype=np.float64)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
+
+
 def stage_loss(
     model: ResidualWorldModel,
     batch: Sequence[DecisionWindow],
@@ -412,57 +745,71 @@ def stage_loss(
     target_model: ResidualWorldModel | None = None,
     step: int = 0,
     total_steps: int = 1,
+    mask_prob: float = 0.15,
 ) -> tuple[float, dict[str, float]]:
     """Total uncertainty-weighted loss for a micro-batch at ``stage`` (doc J Eq.19).
 
-    Builds the six coarse loss groups (doc J D13) appropriate to the stage:
-    warmup uses ``jepa`` + ``consistency`` (anti-collapse); rollout/rare-event
-    add the action-conditioned ``rollout`` group with the branch-difference term;
-    survival/quantile/abstention are folded in as light auxiliaries so the head
-    geometry is exercised. Returns ``(total, group_losses)``.
+    Builds the six coarse loss groups (doc J D13) faithfully:
 
-    The action-conditioned ``rollout`` group drives a **genuine free-running
-    recursion** through the transition predictor ``P_θ`` (:meth:`backbone.rollout`)
-    rather than replicating the one-step encoding: each step is conditioned on the
-    action embedding, the stop-gradient exact kernel-state summary ``ψ(s^K_{h+1})``
-    and the exogenous context ``u_h``, with truncated BPTT (detach every
-    ``cfg.bptt_detach_every`` slow steps) and a horizon curriculum H: 2→12
-    (doc J D6/Eq. 8–10, B1–B4). ``step``/``total_steps`` drive that curriculum.
+    * **G1 jepa** — masked-JEPA latent loss ``L_JEPA,mask`` *plus* the weak
+      per-type VICReg variance/covariance anti-collapse ``λ_var·L_var +
+      λ_cov·L_cov`` (doc J D13 G1). The online encoder consumes a typed-masked
+      context while the EMA target encodes the unmasked future (primary
+      anti-collapse, doc J C3).
+    * **G2 rollout** — free-running ``L_roll,abs + λ_Δ·L_roll,Δ`` over the
+      predictor ``P_θ`` recursion (doc J Eqs. 8–10), the branch-difference term
+      summed over every step ``h=1..H`` against EMA-encoded counterfactual branch
+      futures (doc J Eq. 9, see :data:`MODEL-BRANCH-DIFF-DIAGNOSTICS`).
+    * **G3 quantile** — pinball + non-crossing on realized KPI-delta labels
+      (doc J Eq. 11–13).
+    * **G4 survival** — competing-risk + parallel-binary hazard NLL on the
+      event / censoring labels (doc J Eq. 14–17).
+    * **G5 consistency** — the *mandatory* exact-state consistency loss
+      ``L_cons`` from the per-field decoders ``D_f(ẑ_h)`` against stop-gradient
+      kernel fields, summed over the rollout (doc J D11/Eq. 18).
+    * **G6 abstention** — (focal-)BCE OOD/topology/fault detector loss
+      (doc J H3 / Eq. 17).
 
-    ``target_model`` is the **EMA teacher** (doc J Eq. 1, ∇ξ = 0): the targets
-    are encoded by its frozen weights so the latent prediction loss has a genuine,
-    online-weight-independent target. When ``None`` the online model self-encodes
-    the targets (a valid but weaker warmup signal used by unit tests).
+    ``target_model`` is the **EMA teacher** (doc J Eq. 1, ∇ξ = 0). When ``None``
+    the online model self-encodes the targets (a valid but weaker warmup signal).
+    ``mask_prob`` is the typed-context masking probability.
     """
     be = model.be
     tgt_enc = target_model or model
     group: dict[str, float] = {g: 0.0 for g in LOSS_GROUPS}
     n = max(len(batch), 1)
+    # deterministic per-(step) masking RNG so the loss is reproducible / SPSA-safe
+    mask_rng = np.random.default_rng(cfg.seed * 1_000_003 + step * 7919 + 11)
+    quantiles = model.heads.cfg.quantiles
 
     horizon = _curriculum_horizon(stage, step, total_steps, cfg)
     for w in batch:
         caps = None
         ts = model.feature_builder.build(w.state, caps)
-        online = model.backbone.encode(ts, w.action.type.value)
+        # online encoder sees the *typed-masked* context (doc J A2/E1, primary
+        # anti-collapse); the EMA target encodes the *unmasked* future.
+        online = _masked_online_encode(
+            model, ts, w.action.type.value, mask_rng, mask_prob
+        )
 
-        # --- JEPA latent group G1 (doc J Eq. 2–3) ------------------------- #
+        # --- G1 JEPA + anti-collapse (doc J D13 G1, Eqs. 2–7) ------------- #
         target_state = w.future_state or w.state
         tgt = _encode_targets(tgt_enc, target_state, w.action.type.value, caps)
         tgt_be = {k: be.from_numpy(v) for k, v in tgt.items()}
         group["jepa"] += jepa_mask_loss(online, tgt_be, ts.masks, be)
+        # weak per-type VICReg variance/covariance moved into G1 (doc J D13 G1).
+        group["jepa"] += anti_collapse_loss(online, ts.masks, jcfg, be)
 
-        # --- anti-collapse (weak VICReg-lite) -> consistency group -------- #
-        group["consistency"] += anti_collapse_loss(online, ts.masks, jcfg, be)
-
-        # --- action-conditioned rollout group G2 (doc J Eqs. 8–10) -------- #
+        # --- G2 action-conditioned rollout (doc J Eqs. 8–10) ------------- #
+        # The predictor / consistency machinery is exercised once a free-running
+        # rollout exists (rollout / rare_event stages). The warmup stage trains G1
+        # only plus the head/consistency geometry on the single-step encoding so
+        # the heads stay anchored (doc J C1: G1 only, optional short-H G2).
+        psi = model.backbone.predictor and kernel_state_summary(target_state, be)
+        kstates = [be.stop_gradient(psi)] * horizon if psi is not None else None
+        uvec = _exogenous_vector(w, model.backbone.cfg.u_dim, be)
+        exo = [uvec] * horizon
         if stage in ("rollout", "rare_event"):
-            # Genuine free-running rollout: ẑ_1..ẑ_H are distinct, produced by the
-            # predictor P_θ recursing on its own output (doc J D6, no teacher
-            # forcing). Condition each step on the stop-grad exact kernel state.
-            psi = model.backbone.predictor and kernel_state_summary(target_state, be)
-            kstates = [be.stop_gradient(psi)] * horizon if psi is not None else None
-            uvec = _exogenous_vector(w, model.backbone.cfg.u_dim, be)
-            exo = [uvec] * horizon
             pred_traj = model.backbone.rollout(
                 online,
                 w.action.type.value,
@@ -475,9 +822,9 @@ def stage_loss(
             tgt_traj = [tgt_be for _ in range(horizon)]
             group["rollout"] += rollout_loss(pred_traj, tgt_traj, None, jcfg, be)
             if w.branch_action is not None:
+                # paired-branch free-running rollout for the action-fidelity term
                 bp0 = model.backbone.encode(ts, w.branch_action.type.value)
                 bf = w.branch_future_state or w.state
-                # paired-branch free-running rollouts for the action-fidelity term
                 bpsi = model.backbone.predictor and kernel_state_summary(bf, be)
                 bk = [be.stop_gradient(bpsi)] * horizon if bpsi is not None else None
                 bp_traj = model.backbone.rollout(
@@ -489,21 +836,72 @@ def stage_loss(
                     horizon=horizon,
                     detach_every=cfg.bptt_detach_every,
                 )
-                tb = [tgt_be for _ in range(horizon)]
+                # EMA-encoded counterfactual branch futures z_h^+ for BOTH branches
+                # from the same pre-action hash/seed (doc J D7/Eq. 9): the absolute
+                # branch target is the action branch's own counterfactual future,
+                # the paired target is the branch' future — so action_separation
+                # reads the true A = ||Δẑ|| / ||Δz⁺|| ratio (doc J D5).
+                tb_be = tgt_be
                 tbp_np = _encode_targets(tgt_enc, bf, w.branch_action.type.value, caps)
                 tbp_be = {k: be.from_numpy(v) for k, v in tbp_np.items()}
+                tb = [tb_be for _ in range(horizon)]
                 tbp = [tbp_be for _ in range(horizon)]
                 group["rollout"] += jcfg.lambda_delta * rollout_branch_diff_loss(
                     pred_traj, bp_traj, tb, tbp, be=be
                 )
 
-        # --- light survival / quantile / abstention auxiliaries ----------- #
-        if stage == "rare_event" and w.is_rare_event:
-            # upweight survival when a rare event is present (doc J C3)
-            group["survival"] += 1.0 * anti_collapse_loss(online, ts.masks, jcfg, be)
-            group["abstention"] += 0.5 * float(
-                np.mean([abs(v) for v in tgt.get("global", np.zeros(1)).ravel()])
+            # --- G5 consistency L_cons over the rollout (doc J Eq. 18) ---- #
+            field_pred_traj = _decode_field_traj(model, pred_traj)
+            field_tgt_traj = _field_target_traj(
+                target_state, ts.order, ts.masks, be, horizon
             )
+            if field_pred_traj:
+                group["consistency"] += rollout_consistency_loss(
+                    field_pred_traj,
+                    field_tgt_traj,
+                    model.backbone.field_decoders.spec,
+                    be=be,
+                )
+            z_head = pred_traj[-1] if pred_traj else online
+        else:
+            # warmup: anchor the head + consistency geometry on the encoded latent
+            # (single step, h=1), so the supervised heads are not cold-started when
+            # stage 2 begins (doc J C1 optional short-horizon term).
+            field_preds = (
+                model.backbone.field_decoders.decode(online, be)
+                if model.backbone.field_decoders is not None
+                else {}
+            )
+            field_tgts = exact_field_targets(target_state, ts.order, ts.masks, be)
+            if field_preds:
+                from .jepa import consistency_loss as _cons
+
+                group["consistency"] += _cons(
+                    field_preds, field_tgts, model.backbone.field_decoders.spec, be=be
+                )
+            z_head = online
+
+        # --- G3 quantile head loss (doc J Eq. 11–13) --------------------- #
+        q_forecasts = model.heads.quantile_forecasts(
+            z_head, ts.masks, model._query_row(ts, w.action)
+        )
+        q_labels = _kpi_delta_labels(model, w)
+        group["quantile"] += quantile_head_loss(
+            q_forecasts, q_labels, quantiles, jcfg.lambda_mono
+        )
+
+        # --- G4 survival head loss (doc J Eq. 14–17) --------------------- #
+        comp_probs, bin_haz = _survival_components(model, z_head, ts.masks)
+        comp_labels, bin_labels = _survival_labels(w)
+        group["survival"] += survival_head_loss(
+            comp_probs, bin_haz, comp_labels, bin_labels
+        )
+
+        # --- G6 abstention / OOD head loss (doc J H3 / Eq. 17) ----------- #
+        epi_logit, ood_logit = _abstention_logits(model, z_head, ts.masks)
+        group["abstention"] += ood_head_loss(
+            epi_logit, ood_logit, _ood_label(w), focal=True
+        )
 
     for g in group:
         group[g] /= n
@@ -676,8 +1074,23 @@ def train(
                     )
                     return val
 
-                if HAS_MLX_OPT and model.be.is_mlx:  # pragma: no cover
-                    step_loss += _mlx_step(model, _loss, lr, cfg)
+                if (
+                    HAS_MLX_OPT and HAS_MLX_BACKEND and model.be.is_mlx
+                ):  # pragma: no cover - Apple-silicon only
+                    # Real MLX autodiff: nn.value_and_grad + AdamW + mx.compile
+                    # over the predictor rollout + latent + consistency graph.
+                    step_loss += _mlx_step(
+                        model,
+                        mb,
+                        stage,
+                        cfg,
+                        jcfg,
+                        logvars,
+                        target_model,
+                        lr,
+                        global_step,
+                        total_steps,
+                    )
                 else:
                     step_loss += _spsa_step(
                         model,
@@ -700,7 +1113,9 @@ def train(
             if global_step % cfg.diag_every == 0:
                 ts = model.feature_builder.build(windows[0].state, None)
                 report.diagnostics.append(
-                    _diag_snapshot(model, ts, accum[0], global_step, cfg)
+                    _diag_snapshot(
+                        model, ts, accum[0], global_step, cfg, target_model
+                    )
                 )
             if cfg.verbose:
                 print(f"[{stage}] step {global_step} loss={step_loss:.5f} τ={tau:.4f}")
@@ -713,26 +1128,209 @@ def train(
     return report
 
 
-def _mlx_step(  # pragma: no cover - Apple-silicon only
-    model: ResidualWorldModel, loss_fn: Callable[[], float], lr: float, cfg: TrainConfig
-) -> float:
-    """MLX autodiff + AdamW inner step (doc E nn.value_and_grad pattern).
+def _mlx_differentiable_loss(  # pragma: no cover - Apple-silicon only
+    model: ResidualWorldModel,
+    batch: Sequence[DecisionWindow],
+    stage: str,
+    cfg: TrainConfig,
+    jcfg: JEPAConfig,
+    target_model: ResidualWorldModel | None,
+    step: int,
+    total_steps: int,
+):
+    """Build a pure-MLX differentiable loss over the trainable leaves (doc E).
 
-    The MLX path captures model + optimizer state explicitly and updates with
-    AdamW. Because the backbone here stores raw arrays (not an ``nn.Module``),
-    the production MLX trainer wraps them in a parameter tree; for the open-
-    source v1 we fall through to the SPSA estimator if that tree is not built,
-    so this branch stays import-clean on every platform.
+    Returns ``mlx_loss_fn(leaves) -> mx.array`` for
+    :func:`mlx_backend.mlx_train_step`. The closure writes the leaves back into
+    the backbone arrays, runs the MLX-native ``encode`` + free-running ``rollout``
+    forward, and computes the doc J objective entirely in ``mx`` ops so
+    ``nn.value_and_grad`` differentiates through it. The EMA targets and the
+    exact kernel summary enter through ``mx.stop_gradient`` (``∂K/∂θ = 0``,
+    doc J Eq. 22), so the supervised world-model gradient is exact.
+
+    Differentiable terms: G1 masked-JEPA latent L1 + per-type variance hinge,
+    G2 free-running absolute rollout match + branch-difference action fidelity,
+    and G5 exact-state consistency (BCE / Huber over the field decoders). The
+    head-supervision groups G3/G4/G6 read non-differentiable realized labels and
+    are folded in by the NumPy reference loss for logging; the autodiff step
+    optimizes the latent + consistency geometry that the MLX graph expresses.
     """
-    rng = np.random.default_rng(cfg.seed + 17)
-    return _spsa_step(
+    from .mlx_backend import mx  # local: only importable when HAS_MLX
+
+    be = model.be
+    handles = _trainable_arrays(model)
+    tgt_enc = target_model or model
+    horizon = _curriculum_horizon(stage, step, total_steps, cfg)
+    mask_rng = np.random.default_rng(cfg.seed * 1_000_003 + step * 7919 + 11)
+
+    def _sg(d: dict) -> dict:
+        return {k: mx.stop_gradient(v) for k, v in d.items()}
+
+    def _latent_l1(pred: dict, tgt: dict, masks: dict) -> Any:
+        acc = mx.array(0.0)
+        n = 0
+        for t, p in pred.items():
+            if t not in tgt:
+                continue
+            diff = mx.abs(be.layer_norm(p) - mx.stop_gradient(be.layer_norm(tgt[t])))
+            m = masks.get(t)
+            if m is not None:
+                diff = diff * m[:, None]
+                denom = mx.maximum(mx.sum(m) * p.shape[-1], 1.0)
+                acc = acc + mx.sum(diff) / denom
+            else:
+                acc = acc + mx.mean(diff)
+            n += 1
+        return acc / max(n, 1)
+
+    def _var_hinge(pred: dict, masks: dict) -> Any:
+        # masked per-type variance hinge Σ max(0, γ - std_B(q))² (doc J Eq. 5).
+        acc = mx.array(0.0)
+        n = 0
+        for t, q in pred.items():
+            m = masks.get(t)
+            if m is not None:
+                w = m[:, None]
+                cnt = mx.maximum(mx.sum(m), 1.0)
+                mean = mx.sum(q * w, axis=0) / cnt
+                var = mx.sum(((q - mean) ** 2) * w, axis=0) / cnt
+            else:
+                var = mx.var(q, axis=0)
+            std = mx.sqrt(var + 1e-6)
+            hinge = mx.maximum(0.0, jcfg.var_floor - std)
+            acc = acc + mx.mean(hinge * hinge)
+            n += 1
+        return acc / max(n, 1)
+
+    def mlx_loss_fn(leaves: list) -> Any:
+        # scatter the (live, differentiable) leaves back into the model arrays so
+        # the forward path is a function of the optimizer's parameters.
+        for (owner, attr), leaf in zip(handles, leaves, strict=True):
+            setattr(owner, attr, leaf)
+        loss = mx.array(0.0)
+        nb = max(len(batch), 1)
+        for w in batch:
+            ts = model.feature_builder.build(w.state, None)
+            feats = apply_typed_mask(
+                ts.features, _MASK_TYPES, mask_rng, 0.15, be
+            )
+            masked_ts = replace(ts, features=feats)
+            online = model.backbone.encode(masked_ts, w.action.type.value)
+            target_state = w.future_state or w.state
+            ts_t = tgt_enc.feature_builder.build(target_state, None)
+            tgt = _sg(tgt_enc.backbone.encode(ts_t, w.action.type.value))
+            # G1: masked-JEPA latent + weak variance anti-collapse
+            loss = loss + _latent_l1(online, tgt, ts.masks)
+            loss = loss + jcfg.lambda_var * _var_hinge(online, ts.masks)
+            if stage in ("rollout", "rare_event"):
+                psi = kernel_state_summary(target_state, be)
+                ks = [mx.stop_gradient(psi)] * horizon
+                uvec = _exogenous_vector(w, model.backbone.cfg.u_dim, be)
+                pred_traj = model.backbone.rollout(
+                    online,
+                    w.action.type.value,
+                    ts.masks,
+                    kernel_states=ks,
+                    exogenous=[uvec] * horizon,
+                    horizon=horizon,
+                    detach_every=cfg.bptt_detach_every,
+                )
+                # G2 absolute rollout match
+                for zh in pred_traj:
+                    loss = loss + _latent_l1(zh, tgt, ts.masks) / max(horizon, 1)
+                # G2 branch-difference action fidelity (doc J Eq. 9)
+                if w.branch_action is not None:
+                    bp0 = model.backbone.encode(masked_ts, w.branch_action.type.value)
+                    bf = w.branch_future_state or w.state
+                    bpsi = kernel_state_summary(bf, be)
+                    bp_traj = model.backbone.rollout(
+                        bp0,
+                        w.branch_action.type.value,
+                        ts.masks,
+                        kernel_states=[mx.stop_gradient(bpsi)] * horizon,
+                        exogenous=[uvec] * horizon,
+                        horizon=horizon,
+                        detach_every=cfg.bptt_detach_every,
+                    )
+                    ts_bp = tgt_enc.feature_builder.build(bf, None)
+                    tbp = _sg(
+                        tgt_enc.backbone.encode(ts_bp, w.branch_action.type.value)
+                    )
+                    for zh, zhp in zip(pred_traj, bp_traj, strict=False):
+                        for t in zh:
+                            if t in zhp and t in tgt and t in tbp:
+                                dq = zh[t] - zhp[t]
+                                dt = mx.stop_gradient(tgt[t] - tbp[t])
+                                loss = loss + jcfg.lambda_delta * mx.mean(
+                                    mx.abs(dq - dt)
+                                ) / max(horizon, 1)
+                # G5 exact-state consistency (doc J Eq. 18) over the rollout
+                fd = model.backbone.field_decoders
+                if fd is not None:
+                    targets = exact_field_targets(
+                        target_state, ts.order, ts.masks, be
+                    )
+                    flavor = {nm: fl for nm, _lt, _od, fl in fd.spec}
+                    for zh in pred_traj:
+                        preds = fd.decode(zh, be)
+                        for name, p in preds.items():
+                            if name not in targets:
+                                continue
+                            tt, valid = targets[name]
+                            y = mx.stop_gradient(be.from_numpy(tt))
+                            vm = mx.stop_gradient(be.from_numpy(valid))[:, None]
+                            if flavor.get(name) == "huber":
+                                r = p - y
+                                a = mx.abs(r)
+                                per = mx.where(
+                                    a <= 1.0, 0.5 * r * r, a - 0.5
+                                )
+                            else:  # bce-with-logits
+                                per = (
+                                    mx.maximum(p, 0.0)
+                                    - p * y
+                                    + mx.log1p(mx.exp(-mx.abs(p)))
+                                )
+                            denom = mx.maximum(mx.sum(vm) * per.shape[-1], 1.0)
+                            loss = loss + mx.sum(per * vm) / denom / max(horizon, 1)
+        return loss / nb
+
+    return handles, mlx_loss_fn
+
+
+def _mlx_step(  # pragma: no cover - Apple-silicon only
+    model: ResidualWorldModel,
+    batch: Sequence[DecisionWindow],
+    stage: str,
+    cfg: TrainConfig,
+    jcfg: JEPAConfig,
+    logvars: GroupLogVars,
+    target_model: ResidualWorldModel | None,
+    lr: float,
+    step: int,
+    total_steps: int,
+) -> float:
+    """MLX autodiff + AdamW inner step (doc E nn.value_and_grad + mx.compile).
+
+    Builds the pure-MLX differentiable loss over the predictor rollout + latent
+    + consistency geometry and runs one compiled ``value_and_grad`` + ``AdamW`` +
+    global-norm-clip update via :func:`mlx_backend.mlx_train_step` (which owns the
+    ``mlx.nn`` parameter tree, the captured optimizer / RNG state, and the
+    ``mx.compile``'d outer step). The trained leaves are written back into the
+    model arrays. The NumPy SPSA path is the always-on CI fallback; this branch
+    is only reached when MLX is genuinely importable and the backend is MLX.
+    """
+    handles, mlx_loss_fn = _mlx_differentiable_loss(
+        model, batch, stage, cfg, jcfg, target_model, step, total_steps
+    )
+    return mlx_train_step(
         model,
-        loss_fn,
-        lr,
-        cfg.spsa_c,
-        rng,
+        handles,
+        mlx_loss_fn,
+        lr=lr,
         weight_decay=cfg.weight_decay,
         grad_clip=cfg.grad_clip,
+        seed=cfg.seed + 17 + step,
     )
 
 

@@ -371,6 +371,199 @@ def binary_hazard_nll(
     return nll
 
 
+def quantile_head_loss(
+    forecasts,
+    targets: dict[tuple[str, int], float],
+    quantiles: tuple[float, ...],
+    lambda_mono: float = 1.0,
+) -> float:
+    """``L_quant + λ_mono·L_qmono`` over a quantile forecast list (doc J Eq. 11–13).
+
+    ``forecasts`` is a list of ``QuantileForecast`` (each carries a channel,
+    horizon, and ``{τ: q_τ}`` map). ``targets`` maps ``(channel_value, horizon_s)``
+    to the realized KPI-delta label ``y_{k,h}``; channels without a label
+    contribute only the non-crossing penalty so the head geometry is still
+    exercised. Returns the per-forecast mean.
+    """
+    if not forecasts:
+        return 0.0
+    total = 0.0
+    for qf in forecasts:
+        key = (qf.channel.value, qf.horizon_s)
+        pen = lambda_mono * noncrossing_penalty(qf.quantiles, quantiles)
+        if key in targets:
+            total += pinball_loss(qf.quantiles, targets[key], quantiles) + pen
+        else:
+            total += pen
+    return total / max(len(forecasts), 1)
+
+
+def survival_head_loss(
+    competing_interval_probs: dict[str, list[np.ndarray]],
+    binary_interval_hazards: dict[str, np.ndarray],
+    competing_labels: dict[str, tuple[int | None, int | None]],
+    binary_labels: dict[str, int | None],
+) -> float:
+    """``L_surv`` over competing-risk + parallel-binary channels (doc J Eq. 14–17).
+
+    ``competing_interval_probs[entity]`` is the per-interval class distribution
+    ``[survive, risk_1, ...]`` for that entity's competing-risk head;
+    ``competing_labels[entity]`` is ``(event_class, event_interval)`` (both
+    ``None`` for right-censoring). ``binary_interval_hazards[ch]`` is the
+    per-interval hazard for parallel-binary channel ``ch`` with label
+    ``binary_labels[ch]`` (event interval or ``None``). Returns the mean
+    per-instance NLL so the scale stays bounded across the group.
+    """
+    total = 0.0
+    n = 0
+    for ent, probs in competing_interval_probs.items():
+        ec, ei = competing_labels.get(ent, (None, None))
+        total += competing_risk_nll(probs, ec, ei)
+        n += 1
+    for ch, haz in binary_interval_hazards.items():
+        total += binary_hazard_nll(haz, binary_labels.get(ch))
+        n += 1
+    return total / max(n, 1)
+
+
+def ood_head_loss(
+    epistemic_logit: float,
+    ood_logit: float,
+    ood_label: float,
+    focal: bool = True,
+    gamma: float = 2.0,
+) -> float:
+    """``L_abst`` = (focal-)BCE on the OOD/topology/fault detector label (doc J H3).
+
+    ``ood_label`` is the held-out OOD indicator ``o_h`` (1 = OOD / held-out
+    topology-flavor-fault, 0 = in-distribution). The epistemic logit is included
+    as a weak BCE against the same label so the disagreement head is anchored;
+    focal-BCE is used by default because positives are rare (doc J H3 / Eq. 17).
+    """
+    logit = np.array([ood_logit], dtype=np.float64)
+    epi = np.array([epistemic_logit], dtype=np.float64)
+    y = np.array([ood_label], dtype=np.float64)
+    if focal:
+        l_ood = float(_focal_bce_with_logits(logit, y, gamma)[0])
+    else:
+        l_ood = float(_bce_with_logits(logit, y)[0])
+    l_epi = float(_bce_with_logits(epi, y)[0])
+    return l_ood + 0.5 * l_epi
+
+
+# --------------------------------------------------------------------------- #
+# Mandatory exact-state consistency loss L_cons (doc J D11/Eq. 18).
+# --------------------------------------------------------------------------- #
+def _bce_with_logits(logit: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Numerically-stable per-element BCE ``-[y·logσ + (1-y)·log(1-σ)]``."""
+    # = max(x,0) - x·y + log(1 + exp(-|x|))
+    return np.maximum(logit, 0.0) - logit * target + np.log1p(np.exp(-np.abs(logit)))
+
+
+def _focal_bce_with_logits(
+    logit: np.ndarray, target: np.ndarray, gamma: float = 2.0
+) -> np.ndarray:
+    """Focal-BCE ``(1 - p_t)^γ · BCE`` for rare positives (doc J H3 / Eq. 17)."""
+    # p_t = σ(x) if y=1 else 1-σ(x); stable logistic.
+    z = np.clip(logit, -30.0, 30.0)
+    p = 1.0 / (1.0 + np.exp(-z))
+    p_t = np.where(target > 0.5, p, 1.0 - p)
+    mod = np.power(np.clip(1.0 - p_t, 1e-8, 1.0), gamma)
+    return mod * _bce_with_logits(logit, target)
+
+
+def _huber(pred: np.ndarray, target: np.ndarray, delta: float = 1.0) -> np.ndarray:
+    """Per-element Huber (smooth-L1) for exact arithmetic counters (doc J Eq. 18)."""
+    r = pred - target
+    a = np.abs(r)
+    quad = 0.5 * r * r
+    lin = delta * (a - 0.5 * delta)
+    return np.where(a <= delta, quad, lin)
+
+
+def consistency_loss(
+    field_preds: dict[str, ArrayLike],
+    field_targets: dict[str, tuple[np.ndarray, np.ndarray]],
+    spec: tuple[tuple[str, str, int, str], ...],
+    field_weights: dict[str, float] | None = None,
+    be: Backend | None = None,
+) -> float:
+    """Exact-state consistency loss ``L_cons`` at one rollout step (doc J Eq. 18).
+
+    ``L_cons = Σ_f κ_f ℓ_f(D_f(ẑ_h), sg[f(s^K)])`` where ``ℓ_f`` is BCE for
+    binary masks / blocker bits and Huber for exact arithmetic counters
+    (categorical-id consistency is realized as presence BCE, see
+    :data:`architecture.FIELD_SPEC`). The kernel targets are stop-gradient (the
+    exact fields are constants in the gradient, ``∂K/∂θ = 0``, doc J T4), so this
+    only constrains the learned residual — it cannot improve loss by violating
+    exact symbolic semantics (doc J T3). Only valid (non-padding) rows count.
+
+    ``field_targets[name]`` is ``(target, valid_mask)`` from
+    :func:`architecture.exact_field_targets`; ``field_weights`` are the optional
+    per-field ``κ_f`` (default 1).
+    """
+    be = be or get_backend()
+    flavor = {name: fl for name, _lt, _od, fl in spec}
+    kappa = field_weights or {}
+    total = 0.0
+    n = 0
+    for name, pred in field_preds.items():
+        if name not in field_targets:
+            continue
+        target, valid = field_targets[name]
+        p = np.asarray(be.to_numpy(be.stop_gradient(pred)), dtype=np.float64)
+        t = np.asarray(target, dtype=np.float64)
+        if p.shape != t.shape:
+            continue
+        fl = flavor.get(name, "bce")
+        if fl == "huber":
+            per = _huber(p, t)
+        elif fl == "focal":
+            per = _focal_bce_with_logits(p, t)
+        else:  # "bce"
+            per = _bce_with_logits(p, t)
+        vmask = np.asarray(valid, dtype=np.float64).reshape(-1)
+        m2 = vmask[:, None] if per.ndim == 2 else vmask
+        denom = max(float(m2.sum()) * (per.shape[-1] if per.ndim == 2 else 1), 1.0)
+        field_l = float((per * m2).sum()) / denom
+        total += kappa.get(name, 1.0) * field_l
+        n += 1
+    return total / max(n, 1)
+
+
+def rollout_consistency_loss(
+    field_pred_traj: list[dict[str, ArrayLike]],
+    field_target_traj: list[dict[str, tuple[np.ndarray, np.ndarray]]],
+    spec: tuple[tuple[str, str, int, str], ...],
+    step_weights: list[float] | None = None,
+    field_weights: dict[str, float] | None = None,
+    be: Backend | None = None,
+) -> float:
+    """Sum ``L_cons`` over every rollout step ``h = 1..H`` (doc J Eq. 18).
+
+    ``field_pred_traj[h]`` are the decoded fields ``D_f(ẑ_h)`` and
+    ``field_target_traj[h]`` the matched exact kernel targets at step ``h``.
+    """
+    be = be or get_backend()
+    n = min(len(field_pred_traj), len(field_target_traj))
+    if n == 0:
+        return 0.0
+    weights = step_weights or [1.0] * n
+    total = 0.0
+    wsum = 0.0
+    for h in range(n):
+        w = weights[h] if h < len(weights) else 1.0
+        total += w * consistency_loss(
+            field_pred_traj[h],
+            field_target_traj[h],
+            spec,
+            field_weights=field_weights,
+            be=be,
+        )
+        wsum += w
+    return total / max(wsum, 1e-8)
+
+
 # --------------------------------------------------------------------------- #
 # Combined objective with group-wise homoscedastic uncertainty weighting.
 # --------------------------------------------------------------------------- #
@@ -408,6 +601,48 @@ def combined_objective(
         parts[g] = weighted
         total += weighted
     return total, parts
+
+
+# --------------------------------------------------------------------------- #
+# Collapse diagnostics D3 (covariance energy) and D4 (cosine) — doc J D3/D4.
+# --------------------------------------------------------------------------- #
+def covariance_energy(latent: np.ndarray, eps: float = 1e-8) -> float:
+    """Cross-dimension covariance energy ``c_off`` (doc J D3).
+
+    ``c_off = ||offdiag(Cov(norm(q)))||_F² / ||diag(Cov(norm(q)))||_F²``. High
+    ``c_off`` indicates dimensional collapse or redundant predictors. ``latent``
+    is ``(n_rows, d)`` over the valid (unmasked) rows; the rows are per-dimension
+    normalized first so the energy is scale-free.
+    """
+    x = np.asarray(latent, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 2:
+        return 0.0
+    sd = x.std(axis=0, keepdims=True)
+    xn = (x - x.mean(axis=0, keepdims=True)) / (sd + eps)
+    cov = (xn.T @ xn) / (x.shape[0] - 1)
+    diag = np.diag(cov)
+    off = cov - np.diag(diag)
+    off_e = float((off * off).sum())
+    diag_e = float((diag * diag).sum())
+    return off_e / (diag_e + eps)
+
+
+def cosine_collapse(latent: np.ndarray, eps: float = 1e-8) -> float:
+    """Mean off-diagonal cosine similarity ``s_cos`` (doc J D4).
+
+    ``s_cos = mean_{i≠j} cos(q_i, q_j)``. Complete collapse drives ``s_cos`` → 1;
+    partial collapse shows high within-batch cosine concentration. ``latent`` is
+    ``(n_rows, d)`` over the valid rows.
+    """
+    x = np.asarray(latent, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] < 2 or x.shape[1] < 1:
+        return 0.0
+    norm = np.linalg.norm(x, axis=1, keepdims=True)
+    xn = x / (norm + eps)
+    sim = xn @ xn.T
+    n = sim.shape[0]
+    off_sum = float(sim.sum() - np.trace(sim))
+    return off_sum / max(n * (n - 1), 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -449,14 +684,21 @@ __all__ = [
     "binary_hazard_nll",
     "combined_objective",
     "competing_risk_nll",
+    "consistency_loss",
+    "cosine_collapse",
+    "covariance_energy",
     "covariance_loss",
     "ema_update",
     "jepa_mask_loss",
     "latent_distance",
     "noncrossing_penalty",
+    "ood_head_loss",
     "pinball_loss",
+    "quantile_head_loss",
     "rollout_abs_loss",
     "rollout_branch_diff_loss",
+    "rollout_consistency_loss",
     "rollout_loss",
+    "survival_head_loss",
     "variance_loss",
 ]

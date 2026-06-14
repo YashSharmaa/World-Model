@@ -140,13 +140,24 @@ class HazardResidual:
 
 @dataclass(slots=True)
 class FaultEvent:
-    """A parent fault plus its coherent descendant bundle (doc R, Eq14)."""
+    """A parent fault plus its coherent descendant bundle (doc R, Eq14).
+
+    ``nominal_intensity`` / ``tilted_intensity`` are the parent hazard ``λ^P`` /
+    ``λ^Q`` at the parent time (doc R Eq22), recorded when the fault was sampled
+    under a tilt so the importance-sampling likelihood ratio (doc R Eq23) can be
+    reconstructed exactly. ``thermal_excess_c`` is the per-GPU thermal margin loss
+    that conditioned the intensity (Eq14 fault-parent thermal coupling); it is
+    ``0`` until populated by the rollout's realised thermal trace.
+    """
 
     gpu_id: str
     family: str
     t_parent_s: float
     xid_code: int
     descendants: list[tuple[str, float, float]] = field(default_factory=list)
+    nominal_intensity: float = 0.0
+    tilted_intensity: float = 0.0
+    thermal_excess_c: float = 0.0
 
 
 def parent_intensity(
@@ -204,11 +215,16 @@ def sample_fault_cluster(
     weights = weights / weights.sum()
     events: list[FaultEvent] = []
     for gid in gpu_ids:
+        excess = thermal_excess_c.get(gid, 0.0)
+        hstate = health_state.get(gid, "healthy")
+        # Nominal λ^P (rate_tilt = 1) and tilted proposal λ^Q (rate_tilt applied)
+        # parent intensities at this GPU (doc R Eq22). Both share the SAME
+        # health/thermal conditioning (Eq14) so the IS likelihood ratio is exact.
+        lam_nom = parent_intensity(
+            params.base_parent_rate_hz, hstate, excess, params
+        )
         lam = parent_intensity(
-            params.base_parent_rate_hz * rate_tilt,
-            health_state.get(gid, "healthy"),
-            thermal_excess_c.get(gid, 0.0),
-            params,
+            params.base_parent_rate_hz * rate_tilt, hstate, excess, params
         )
         if lam <= 0:
             continue
@@ -226,10 +242,62 @@ def sample_fault_cluster(
                     t_parent_s=t,
                     xid_code=xid,
                     descendants=list(_BUNDLE[fam]),
+                    nominal_intensity=lam_nom,
+                    tilted_intensity=lam,
+                    thermal_excess_c=excess,
                 )
             )
     events.sort(key=lambda e: e.t_parent_s)
     return events
+
+
+def realized_fault_intensities(
+    events: list[FaultEvent],
+    params: FaultParams,
+    *,
+    health_state: dict[str, str] | None = None,
+    thermal_excess_c: dict[str, float] | None = None,
+    rate_tilt: float = 1.0,
+    residual: HazardResidual | None = None,
+) -> list[FaultEvent]:
+    """Re-stamp each realised fault's nominal/tilted parent intensity (doc R Eq22).
+
+    After a rollout the *actual* per-GPU thermal excess (Eq14 fault-parent thermal
+    coupling) is known, so the parent intensities recorded at sample time can be
+    recomputed under that realised conditioning. Returns fresh
+    :class:`FaultEvent`s with ``nominal_intensity``/``tilted_intensity``/
+    ``thermal_excess_c`` set from the realised state — the inputs to the
+    point-process likelihood ratio (doc R Eq23). The event *times* and bundles are
+    unchanged (the realised path is fixed); only the intensities used for the IS
+    weight are refreshed.
+    """
+    if residual is not None and not residual.is_identity:
+        params = residual.apply(params)
+    health_state = health_state or {}
+    thermal_excess_c = thermal_excess_c or {}
+    out: list[FaultEvent] = []
+    for e in events:
+        excess = thermal_excess_c.get(e.gpu_id, e.thermal_excess_c)
+        hstate = health_state.get(e.gpu_id, "healthy")
+        lam_nom = parent_intensity(
+            params.base_parent_rate_hz, hstate, excess, params
+        )
+        lam_q = parent_intensity(
+            params.base_parent_rate_hz * rate_tilt, hstate, excess, params
+        )
+        out.append(
+            FaultEvent(
+                gpu_id=e.gpu_id,
+                family=e.family,
+                t_parent_s=e.t_parent_s,
+                xid_code=e.xid_code,
+                descendants=list(e.descendants),
+                nominal_intensity=lam_nom,
+                tilted_intensity=lam_q,
+                thermal_excess_c=excess,
+            )
+        )
+    return out
 
 
 def descendant_bundle(event: FaultEvent) -> dict[str, tuple[float, float]]:
@@ -265,5 +333,6 @@ __all__ = [
     "descendant_bundle",
     "fault_pressure_at",
     "parent_intensity",
+    "realized_fault_intensities",
     "sample_fault_cluster",
 ]

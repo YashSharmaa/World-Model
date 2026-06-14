@@ -20,11 +20,19 @@ import {
   Group,
   Line,
   Mesh,
+  MeshStandardMaterial,
   Vector3,
 } from "three";
 import type { WorkloadDTO } from "../api/client";
-import type { MaterialSet } from "./materials";
+import { PALETTE, type MaterialSet } from "./materials";
 import type { RackView } from "./racks";
+
+/**
+ * Fixed commit-tween duration (seconds). Queue-to-rack movement is a short
+ * segmented commit of 500-900 ms at the placement event — NOT continuous travel
+ * mapped to scene-cursor seconds (doc G animation_rules "Workload movement").
+ */
+export const COMMIT_TWEEN_S = 0.7; // 700 ms, inside the 500-900 ms band
 
 /** A spawned workload token with its lane home and current target. */
 export interface WorkloadToken {
@@ -32,6 +40,12 @@ export interface WorkloadToken {
   mesh: Mesh;
   lanePos: Vector3;
   gpuReq: number;
+  /** active wall-clock commit tween, or null when settled / idle. */
+  commit: {
+    rack: RackView;
+    /** wall-clock seconds elapsed since the tween was triggered. */
+    elapsed: number;
+  } | null;
 }
 
 export interface WorkloadResult {
@@ -83,7 +97,13 @@ export function buildWorkloads(
       (mesh.material as { transparent: boolean }).transparent = true;
     }
     queueLane.add(mesh);
-    tokens.set(wl.workload_uid, { workloadUid: wl.workload_uid, mesh, lanePos, gpuReq: wl.gpu_req });
+    tokens.set(wl.workload_uid, {
+      workloadUid: wl.workload_uid,
+      mesh,
+      lanePos,
+      gpuReq: wl.gpu_req,
+      commit: null,
+    });
   });
 
   return { root, queueLane, tokens, allocationPaths };
@@ -115,23 +135,68 @@ export function setAllocationPath(
 }
 
 /**
- * Animate a token's commit toward its placed rack as a fraction 0..1 of the
- * short commit window (the segmented move, not continuous travel).
+ * Emphasise the workloads named in a rollout's `highlight_workload_ids`
+ * scene-annotation (doc G scene_annotations): the highlighted tokens get a
+ * brighter emissive pulse so the decision target reads at a glance, while every
+ * other token is restored to its calm grounded emissive. `phase` is a 0..1
+ * animation phase for the pulse.
+ */
+export function applyWorkloadHighlight(
+  result: WorkloadResult,
+  highlightIds: string[],
+  phase = 0,
+): void {
+  const highlighted = new Set(highlightIds);
+  const pulse = 0.25 + 0.75 * Math.abs(Math.sin(phase * Math.PI * 2));
+  for (const token of result.tokens.values()) {
+    const mat = token.mesh.material as MeshStandardMaterial;
+    if (highlighted.has(token.workloadUid)) {
+      mat.emissive.copy(PALETTE.grounded).multiplyScalar(0.35 + 0.55 * pulse);
+    } else {
+      mat.emissive.copy(PALETTE.grounded).multiplyScalar(0.25);
+    }
+    mat.needsUpdate = true;
+  }
+}
+
+/**
+ * Trigger (or retarget) a token's FIXED-DURATION commit tween toward its placed
+ * rack. The actual easing happens in {@link updateCommitTweens} off a wall-clock
+ * delta, so the move always takes {@link COMMIT_TWEEN_S} regardless of the scene
+ * cursor speed (doc G workload movement: a 500-900 ms segmented commit, not
+ * continuous cursor-mapped travel). Passing `rack=null` parks the token back in
+ * its queue lane and cancels any tween.
  */
 export function commitToken(
   result: WorkloadResult,
   workloadUid: string,
   rack: RackView | null,
-  progress: number,
 ): void {
   const token = result.tokens.get(workloadUid);
   if (!token) return;
   if (!rack) {
+    token.commit = null;
     token.mesh.position.copy(token.lanePos);
     return;
   }
-  const p = Math.max(0, Math.min(1, progress));
-  // ease-out for a snappy commit
-  const eased = 1 - Math.pow(1 - p, 3);
-  token.mesh.position.lerpVectors(token.lanePos, rack.center, eased);
+  // (Re)start the tween only when the target rack changes or none is running.
+  if (!token.commit || token.commit.rack !== rack) {
+    token.commit = { rack, elapsed: 0 };
+  }
+}
+
+/**
+ * Advance every active commit tween by `dt` wall-clock seconds and ease the
+ * token from its lane home to its placed rack over a fixed {@link COMMIT_TWEEN_S}
+ * window. Tokens with no active tween are left at their lane home.
+ */
+export function updateCommitTweens(result: WorkloadResult, dt: number): void {
+  for (const token of result.tokens.values()) {
+    if (!token.commit) continue;
+    token.commit.elapsed += dt;
+    const p = Math.max(0, Math.min(1, token.commit.elapsed / COMMIT_TWEEN_S));
+    // ease-out cubic for a snappy, settled commit.
+    const eased = 1 - Math.pow(1 - p, 3);
+    token.mesh.position.lerpVectors(token.lanePos, token.commit.rack.center, eased);
+  }
 }

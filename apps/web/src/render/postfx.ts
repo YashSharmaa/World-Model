@@ -91,16 +91,13 @@ export function createPostFX(
 
   // Theme reactivity: a bright light background needs far less bloom and a much
   // softer vignette than the cinematic dark room, or accents wash out / glare.
+  // BloomEffect exposes a typed public `luminanceMaterial` accessor whose
+  // `threshold` setter drives the bloom cutoff, so we set it directly — no cast
+  // and no catch-and-ignore.
   const unsubscribe = onTheme((t) => {
-    try {
-      bloom.intensity = t.bloomIntensity;
-      const lum = (bloom as unknown as { luminanceMaterial?: { threshold: number } })
-        .luminanceMaterial;
-      if (lum) lum.threshold = t.bloomThreshold;
-      (vignette as unknown as { darkness: number }).darkness = t.vignetteDarkness;
-    } catch {
-      /* effect API drift — keep the configured defaults */
-    }
+    bloom.intensity = t.bloomIntensity;
+    bloom.luminanceMaterial.threshold = t.bloomThreshold;
+    vignette.darkness = t.vignetteDarkness;
   });
 
   return {

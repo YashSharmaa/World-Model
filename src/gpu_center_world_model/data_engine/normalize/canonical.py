@@ -241,7 +241,10 @@ def source_state_from_silver(frames: list[SilverFrame]) -> SourceState:
 
 
 def observations_to_metric_samples(
-    observations: list[Observation], origin: str = "sim"
+    observations: list[Observation],
+    origin: str = "sim",
+    *,
+    degrade_nonobserved: bool = False,
 ) -> list[MetricSample]:
     """Round-trip emitted :class:`Observation` streams back into Bronze rows.
 
@@ -249,6 +252,13 @@ def observations_to_metric_samples(
     pipeline as real telemetry, so synthetic and real share one canonical schema
     (doc D prioritized recommendation). Missingness is preserved via the quality
     mask.
+
+    When ``degrade_nonobserved`` is set, *any* non-``OBSERVED`` source health
+    (``STALE``/``DELAYED``/``DROPPED``) is flagged ``quality_mask = 0`` so that
+    incident-time staleness — not just hard drops — surfaces as degraded telemetry
+    in Bronze and travels as state through Silver (doc D correlation_rules #5; doc R
+    Eq20 missingness emitted jointly with values). The default (``False``) keeps the
+    byte-stable behaviour where only unavailable channels are masked.
     """
     rows: list[MetricSample] = []
     source = {
@@ -262,6 +272,9 @@ def observations_to_metric_samples(
     for obs in observations:
         src = source.get(obs.family, "otlp")
         for ch in obs.channels.values():
+            good = ch.available
+            if degrade_nonobserved and ch.source_health != SourceHealth.OBSERVED:
+                good = False
             rows.append(
                 MetricSample(
                     ts_event_ns=obs.ts_event_ns,
@@ -271,7 +284,7 @@ def observations_to_metric_samples(
                     entity_id=obs.entity_id,
                     metric_name=ch.name,
                     value=ch.value,
-                    quality_mask=1 if ch.available else 0,
+                    quality_mask=1 if good else 0,
                 )
             )
     return rows

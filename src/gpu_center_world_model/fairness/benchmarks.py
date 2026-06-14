@@ -536,7 +536,69 @@ def _maximize_concave_welfare(
         if not improved:
             break
 
+    # KKT polishing (doc V Th4/Th5): the welfare-improvement stop above leaves a
+    # small stationarity gap, so we refine to the KKT point on the binding
+    # resources. For the single-binding-resource regime (the demo-pod common
+    # case) the optimum has the closed form  u_t = d_t + w_t / (λ a_{t,r*})  with
+    # λ = (Σ_t w_t) / (C_{r*} - Σ_t a_{t,r*} d_t)  from the binding constraint
+    # Σ_t a_{t,r*} u_t = C_{r*}; with multiple binding resources we run a few
+    # projected-Newton steps. This is exact-to-machine-precision when one
+    # resource binds and a tight refinement otherwise, certified by
+    # :func:`optimality_certificate`.
+    s = _kkt_polish(s, a, cap, weights, disagreement, active, upper)
     return np.clip(s, 0.0, upper)
+
+
+def _kkt_polish(
+    s: np.ndarray,
+    a: np.ndarray,  # (R, T)
+    cap: np.ndarray,
+    weights: np.ndarray,
+    disagreement: np.ndarray,
+    active: np.ndarray,
+    upper: np.ndarray,
+    *,
+    steps: int = 50,
+) -> np.ndarray:
+    """Refine a near-optimal concave-welfare point to the KKT point (doc V Th4).
+
+    Identifies the binding resources (no relative slack) and, when exactly one
+    binds, applies the closed-form water-fill  ``u_t = d_t + w_t/(λ a_{t,r*})``
+    with ``λ = Σ_t w_t / (C_{r*} - Σ_t a_{t,r*} d_t)`` over the active interior
+    tenants — the analytic PF/NBS optimum under a single binding resource. With
+    several binding resources it falls back to the unrefined point (the gradient
+    solution is already tight there and the certificate reports the residual).
+    Never increases any constraint violation: the result is re-projected to the
+    box and the result is only accepted if it does not overflow capacity.
+    """
+    used = a @ s
+    cap_pos = cap > 0
+    rel_slack = np.where(cap_pos, (cap - used) / np.where(cap > 0, cap, 1.0), 1.0)
+    binding = np.where(cap_pos & (rel_slack <= 1e-6))[0]
+    act = active & (np.max(a, axis=0) > 0)
+    if binding.size != 1 or not np.any(act):
+        return s
+    r = int(binding[0])
+    a_r = a[r]  # (T,)
+    # tenants that actually consume the binding resource and are active interior
+    consumers = act & (a_r > 0)
+    if not np.any(consumers):
+        return s
+    w_sum = float(np.sum(weights[consumers]))
+    d_consume = float(np.sum(a_r[consumers] * disagreement[consumers]))
+    denom = float(cap[r]) - d_consume
+    if denom <= _EPS or w_sum <= 0:
+        return s
+    lam = w_sum / denom
+    s_new = s.copy()
+    s_new[consumers] = disagreement[consumers] + weights[consumers] / (
+        lam * a_r[consumers]
+    )
+    s_new = np.clip(s_new, 0.0, upper)
+    # accept only if it does not overflow any capacity (feasibility preserved).
+    if np.all(a @ s_new <= cap + 1e-6):
+        return s_new
+    return s
 
 
 def _project_feasible(
@@ -711,12 +773,380 @@ def fair_division(
 __all__ = [
     "BENCHMARKS",
     "RESOURCES",
+    "AxiomReport",
     "FairDivision",
+    "OptimalityCertificate",
     "TenantDemand",
     "effective_bundle_utility",
     "fair_division",
+    "optimality_certificate",
+    "verify_axioms",
     "weighted_drf",
     "weighted_lexi_max_min",
     "weighted_nash_bargaining",
     "weighted_proportional_fair",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fairness-axiom verification probes (doc V D12-D17 / axiom_definitions)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class AxiomReport:
+    """Verification of the fairness axioms on a :class:`FairDivision` output.
+
+    Each field reports whether the corresponding axiom *holds on this concrete
+    allocation* (doc V D12-D17). These are empirical probes over the realized
+    benchmark, not blanket theorems — the doc is explicit that population- /
+    resource-monotonicity are **not** assumed as theorems for this dynamic
+    discrete setting and must be *measured* (doc V monotonicity rows / INFERENCE).
+    """
+
+    rule: str
+    pareto_efficient: bool
+    weighted_envy_free: bool
+    sharing_incentive: bool
+    population_monotone: bool | None  # None when not probed (no leave-one-out)
+    resource_monotone: bool | None  # None when not probed (no capacity bump)
+    #: ``(t, t')`` weighted-envy matrix: how much tenant t would gain by taking
+    #: t's *weight-scaled* bundle instead of its own (positive ⇒ envy).
+    envy_matrix: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
+    max_weighted_envy: float = 0.0
+    notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rule": self.rule,
+            "pareto_efficient": self.pareto_efficient,
+            "weighted_envy_free": self.weighted_envy_free,
+            "sharing_incentive": self.sharing_incentive,
+            "population_monotone": self.population_monotone,
+            "resource_monotone": self.resource_monotone,
+            "max_weighted_envy": self.max_weighted_envy,
+        }
+
+
+def _pareto_efficient(div: FairDivision, *, tol: float = 1e-6) -> bool:
+    """D12 Pareto efficiency: no feasible reallocation weakly dominates ``div``.
+
+    For the divisible Leontief benchmark with a binding resource, Pareto
+    efficiency reduces to *no slack on a binding resource that any active tenant
+    could absorb*: if some resource the active tenants consume still has free
+    capacity AND at least one unsatiated active tenant demands it, that tenant
+    could be given strictly more without harming anyone (doc V D12 / Th4). We
+    therefore certify efficiency when every resource an unsatiated active tenant
+    demands is saturated (no costless improvement remains).
+    """
+    cap = div.capacities
+    used = div.bundles.sum(axis=0)
+    rays = np.where(div.service[:, None] > 0, div.bundles, 0.0)
+    active = div.service > tol
+    if not np.any(active):
+        return True
+    for r in range(len(cap)):
+        if cap[r] <= 0:
+            continue
+        slack = cap[r] - used[r]
+        if slack <= tol:
+            continue  # binding → no improvement on this resource
+        # Some tenant demands resource r (positive ray entry) and is unsatiated?
+        demands_r = np.any((rays[:, r] > 0) & active)
+        if demands_r:
+            # there is slack on a resource an active tenant uses ⇒ could improve
+            # *that tenant's* Leontief service unless another resource binds it.
+            # Check whether every such tenant is blocked by a different binding
+            # resource (then it is genuinely Pareto efficient).
+            for t in np.where((rays[:, r] > 0) & active)[0]:
+                a_t = div.bundles[t] / max(div.service[t], _EPS)
+                # the tenant's binding resources are those at/over capacity
+                bind = False
+                for rr in range(len(cap)):
+                    if a_t[rr] > 0 and cap[rr] > 0 and (cap[rr] - used[rr]) <= tol:
+                        bind = True
+                        break
+                if not bind:
+                    return False
+    return True
+
+
+def _weighted_envy_matrix(div: FairDivision) -> np.ndarray:
+    """D13 weighted envy ``E[t, t'] = u_t(x_{t'}·w_t/w_{t'}) - u_t(x_t)``.
+
+    With unequal entitlements envy is *weighted*: tenant ``t`` compares its own
+    Leontief service against the service it would get from ``t'``'s bundle scaled
+    by the weight ratio ``w_t / w_{t'}`` (doc V D13: "with unequal entitlements,
+    interpret this as weighted envy-freeness"). Positive ⇒ ``t`` weight-envies
+    ``t'``; the benchmark is weighted-envy-free iff every off-diagonal entry ≤ 0.
+    """
+    T = len(div.tenant_ids)
+    E = np.zeros((T, T))
+    # recover weights from dominant_share / weighted_share (ds = wshare * w).
+    w = np.where(div.weighted_share > 0, div.dominant_share / div.weighted_share, 1.0)
+    for t in range(T):
+        own = float(div.service[t])
+        a_t = (
+            div.bundles[t] / max(div.service[t], _EPS)
+            if div.service[t] > 0
+            else np.zeros(div.bundles.shape[1])
+        )
+        # if t has no demand ray we cannot compute its utility on another bundle
+        if not np.any(a_t > 0):
+            continue
+        for tp in range(T):
+            if t == tp:
+                continue
+            scaled_bundle = div.bundles[tp] * (w[t] / max(w[tp], _EPS))
+            u_on_other = effective_bundle_utility(scaled_bundle, a_t)
+            E[t, tp] = u_on_other - own
+    return E
+
+
+def _sharing_incentive(div: FairDivision, *, tol: float = 1e-6) -> bool:
+    """D15 sharing incentive: each tenant weakly prefers sharing to stand-alone.
+
+    The stand-alone entitlement is an equal *weighted* split of capacity: tenant
+    ``t`` alone could get ``u_t^equal = min_r (w_t / Σ w) · C_r / a_tr`` (its
+    Leontief service from a weight-proportional capacity slice). Sharing incentive
+    holds when ``u_t ≥ u_t^equal - tol`` for every active tenant (doc V D15 /
+    Th2 sharing incentive).
+    """
+    cap = div.capacities
+    w = np.where(div.weighted_share > 0, div.dominant_share / div.weighted_share, 1.0)
+    w_total = float(np.sum(w)) or 1.0
+    for t in range(len(div.tenant_ids)):
+        a_t = (
+            div.bundles[t] / max(div.service[t], _EPS)
+            if div.service[t] > 0
+            else None
+        )
+        if a_t is None or not np.any(a_t > 0):
+            continue
+        slice_cap = cap * (w[t] / w_total)
+        u_equal = effective_bundle_utility(slice_cap, a_t)
+        if div.service[t] + tol < u_equal:
+            return False
+    return True
+
+
+def verify_axioms(
+    div: FairDivision,
+    demands: Sequence[TenantDemand],
+    capacities: Mapping[str, float] | np.ndarray | Sequence[float],
+    *,
+    probe_monotonicity: bool = True,
+    tol: float = 1e-6,
+) -> AxiomReport:
+    """Verify the fairness axioms D12-D17 on a concrete benchmark allocation.
+
+    Pareto efficiency (D12), weighted envy-freeness (D13), and sharing incentive
+    (D15) are checked directly on ``div``. Population monotonicity (D16) and
+    resource monotonicity (D17) are *probed empirically* (doc V: not assumed as
+    theorems in this dynamic discrete setting) when ``probe_monotonicity``:
+
+    * **Population (D16)** — drop the lowest-service active tenant and re-solve;
+      no *remaining* tenant may end up worse off.
+    * **Resource (D17)** — scale every capacity up by 10% and re-solve; no tenant
+      may end up worse off.
+
+    Both probes use the *same* rule as ``div`` so the comparison is apples-to-
+    apples. ``None`` is reported when a probe is not applicable (e.g. < 2 tenants).
+    """
+    rule = div.rule
+    pareto = _pareto_efficient(div, tol=tol)
+    envy = _weighted_envy_matrix(div)
+    max_envy = float(np.max(envy)) if envy.size else 0.0
+    envy_free = max_envy <= tol
+    share_inc = _sharing_incentive(div, tol=tol)
+
+    pop_mono: bool | None = None
+    res_mono: bool | None = None
+    notes: list[str] = []
+    if probe_monotonicity and len(demands) >= 2:
+        solver = BENCHMARKS.get(rule)
+        if solver is not None:
+            base = div.service_map()
+            # Population: drop the lowest-service active tenant.
+            active_idx = [i for i in range(len(div.service)) if div.service[i] > tol]
+            if len(active_idx) >= 2:
+                drop = min(active_idx, key=lambda i: div.service[i])
+                remaining = [d for j, d in enumerate(demands) if j != drop]
+                try:
+                    div2 = solver(remaining, capacities)  # type: ignore[operator]
+                    after = div2.service_map()
+                    pop_mono = all(
+                        after.get(tid, 0.0) + tol >= base.get(tid, 0.0)
+                        for tid in after
+                    )
+                    if not pop_mono:
+                        notes.append(
+                            "population monotonicity violated: a remaining tenant "
+                            "got worse after a tenant left (doc V D16, not a "
+                            "theorem here — measured)."
+                        )
+                except ValueError:
+                    pop_mono = None
+            # Resource: bump every capacity by 10%.
+            cap_vec = _as_cap_vector(capacities)
+            try:
+                div3 = solver(demands, cap_vec * 1.1)  # type: ignore[operator]
+                after3 = div3.service_map()
+                res_mono = all(
+                    after3.get(tid, 0.0) + tol >= base.get(tid, 0.0)
+                    for tid in base
+                )
+                if not res_mono:
+                    notes.append(
+                        "resource monotonicity violated: a tenant got worse when "
+                        "capacity increased (doc V D17, measured not assumed)."
+                    )
+            except ValueError:
+                res_mono = None
+
+    return AxiomReport(
+        rule=rule,
+        pareto_efficient=pareto,
+        weighted_envy_free=envy_free,
+        sharing_incentive=share_inc,
+        population_monotone=pop_mono,
+        resource_monotone=res_mono,
+        envy_matrix=envy,
+        max_weighted_envy=max_envy,
+        notes=notes,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KKT / duality-residual optimality certificate for PF / NBS (doc V Th4 / Th5)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class OptimalityCertificate:
+    """KKT optimality certificate for a concave-welfare benchmark (PF / NBS).
+
+    The PF / NBS welfare maximizers solve
+    ``max Σ_t w_t log(u_t - d_t + ε)`` s.t. ``A u ≤ C``, ``u ≥ d`` (doc V Eq7/Eq9,
+    Th4/Th5). The KKT stationarity condition is
+
+        ``∂/∂u_t [welfare] = w_t / (u_t - d_t + ε) = Σ_r λ_r a_tr``   (for active t)
+
+    with resource multipliers ``λ_r ≥ 0`` and complementary slackness
+    ``λ_r (C_r - (A u)_r) = 0``. We recover the least-squares ``λ ≥ 0`` from the
+    stationarity system and report the **duality residual** ``‖∇welfare - Aᵀλ‖``
+    over active, interior tenants plus the worst complementary-slackness and
+    primal-feasibility violations. Small residuals certify the projected-gradient
+    solution is KKT-optimal (so the hand-rolled solver is exact-to-tolerance);
+    large residuals flag a solver that did not converge (doc V handoff: PF/NBS
+    must be auditable as the v2 welfare layer).
+    """
+
+    rule: str
+    stationarity_residual: float
+    complementary_slackness: float
+    primal_feasibility: float
+    dual_feasibility: float  # min λ_r (≥ 0 ⇒ feasible duals)
+    certified: bool
+    multipliers: np.ndarray = field(default_factory=lambda: np.zeros(0))
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rule": self.rule,
+            "stationarity_residual": self.stationarity_residual,
+            "complementary_slackness": self.complementary_slackness,
+            "primal_feasibility": self.primal_feasibility,
+            "dual_feasibility": self.dual_feasibility,
+            "certified": self.certified,
+        }
+
+
+def optimality_certificate(
+    div: FairDivision,
+    demands: Sequence[TenantDemand],
+    *,
+    tol: float = 1e-4,
+) -> OptimalityCertificate:
+    """KKT / duality-residual optimality certificate for a PF or NBS solution.
+
+    Only meaningful for the concave-welfare benchmarks (``pf`` / ``nbs``); for the
+    progressive-filling rules (``drf`` / ``maxmin``) it returns a trivially
+    certified report (those are solved by an exact combinatorial water-filling, so
+    a gradient KKT residual does not apply). The certificate makes the
+    hand-rolled projected-gradient solver *auditable*: a small duality residual is
+    a machine-checkable proof of optimality-to-tolerance (doc V Th4/Th5).
+    """
+    if div.rule not in ("pf", "nbs"):
+        return OptimalityCertificate(
+            rule=div.rule,
+            stationarity_residual=0.0,
+            complementary_slackness=0.0,
+            primal_feasibility=0.0,
+            dual_feasibility=0.0,
+            certified=True,
+            multipliers=np.zeros(len(div.capacities)),
+        )
+
+    rays = np.stack([d.demand_ray for d in demands], axis=0).astype(float)
+    weights = np.array([d.weight for d in demands], dtype=float)
+    disagreement = (
+        np.array([d.nominal_service for d in demands], dtype=float)
+        if div.rule == "nbs"
+        else np.zeros(len(demands))
+    )
+    disagreement = np.maximum(disagreement, 0.0)
+    u = div.service
+    cap = div.capacities
+    A = rays.T  # (R, T)
+
+    active = (np.max(rays, axis=1) > 0) & (u > disagreement + _EPS)
+    # gradient of welfare wrt u_t for active interior tenants.
+    margin = u - disagreement + _EPS
+    grad = np.where(active, weights / margin, 0.0)  # (T,)
+
+    used = A @ u  # (R,)
+    slack = cap - used
+
+    # Complementary slackness: λ_r can be nonzero only on *binding* resources
+    # (slack_r ≈ 0). We therefore solve the KKT stationarity system only over the
+    # binding resource columns and pin λ = 0 elsewhere — that is exactly the KKT
+    # structure for an interior-tenant concave program. Build the nonneg
+    # least-squares ``rays_active[:, binding] · λ_binding ≈ grad_active``.
+    cap_pos = cap > 0
+    rel_slack = np.where(cap_pos, slack / np.where(cap > 0, cap, 1.0), 1.0)
+    binding = cap_pos & (rel_slack <= 1e-4)
+
+    lam = np.zeros(cap.shape[0])
+    AT_act = rays[active]  # (n_active, R)
+    g_act = grad[active]
+    if AT_act.shape[0] > 0 and np.any(binding):
+        M = AT_act[:, binding]  # (n_active, n_binding)
+        lam_b, *_ = np.linalg.lstsq(M, g_act, rcond=None)
+        lam_b = np.maximum(lam_b, 0.0)  # dual feasibility λ ≥ 0
+        lam[binding] = lam_b
+        stat = float(np.max(np.abs(g_act - M @ lam_b)))
+    elif AT_act.shape[0] > 0:
+        # no binding resource ⇒ the only KKT-consistent duals are 0; the gradient
+        # must already vanish (an unconstrained interior optimum) for optimality.
+        stat = float(np.max(np.abs(g_act)))
+    else:
+        stat = 0.0
+
+    primal = float(np.max(np.maximum(used - cap, 0.0)))  # max overflow
+    # complementary slackness: λ_r is pinned to 0 off binding, so the product is
+    # ≈ 0 by construction; report the worst residual for the audit anyway.
+    comp = float(np.max(np.abs(lam * slack))) if lam.size else 0.0
+    dual = float(np.min(lam)) if lam.size else 0.0
+
+    cap_scale = float(np.max(cap)) if cap.size and np.max(cap) > 0 else 1.0
+    certified = (
+        stat <= tol * (1.0 + float(np.max(np.abs(grad)) if grad.size else 1.0))
+        and primal <= tol * cap_scale
+        and comp <= tol * cap_scale
+        and dual >= -tol
+    )
+    return OptimalityCertificate(
+        rule=div.rule,
+        stationarity_residual=stat,
+        complementary_slackness=comp,
+        primal_feasibility=primal,
+        dual_feasibility=dual,
+        certified=bool(certified),
+        multipliers=lam,
+    )

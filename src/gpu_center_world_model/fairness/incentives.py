@@ -36,12 +36,17 @@ Two things are provided:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from ..schema.policy import PolicyConfig
+
+#: ``base_payoff(tenant_id) -> payoff`` at the realized strategy profile (D28).
+PayoffFn = Callable[[str], float]
+#: ``deviations(tenant_id) -> iterable of (label, payoff)`` unilateral deviations.
+DeviationEnumerator = Callable[[str], Iterable[tuple[str, float]]]
 
 #: The restricted strategy-proofness conditions C1-C6 (doc V, D25), in order.
 SP_CONDITIONS: tuple[str, ...] = (
@@ -388,13 +393,128 @@ def aggregate_gaming(
 
 __all__ = [
     "SP_CONDITIONS",
+    "DeviationEnumerator",
+    "DeviationResult",
     "GamingDiagnostics",
+    "PayoffFn",
     "PriceOfAnarchy",
+    "ShareStabilityReport",
     "StrategyProofnessReport",
     "TenantBehavior",
     "aggregate_gaming",
+    "check_epsilon_share_stability",
     "check_strategy_proofness",
     "diagnose_gaming",
     "empirical_price_of_anarchy",
     "fairness_constrained_welfare",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Epsilon-share-stability: best-response / unilateral-deviation checker (D28)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class DeviationResult:
+    """One tenant's most-profitable unilateral deviation (doc V D28)."""
+
+    tenant_id: str
+    base_payoff: float
+    best_deviation: str | None
+    best_payoff: float
+    gain: float  # best_payoff - base_payoff
+    profitable: bool  # gain > epsilon
+
+
+@dataclass(slots=True)
+class ShareStabilityReport:
+    """Empirical ε-share-stability of a realized state (doc V D28).
+
+    A state is **ε-share-stable** when no tenant can obtain a strictly better
+    payoff (by more than ``epsilon``) via a unilateral deviation under the
+    configured share-based admission / preemption rule, with all other tenants'
+    strategies fixed (doc V D28). This complements the empirical replay PoA: PoA
+    measures the *efficiency* left on the table by the decentralized equilibrium,
+    while ε-share-stability checks whether the realized profile *is* an
+    (approximate) equilibrium at all.
+
+    The check is empirical and deviation-set-relative — no closed-form bound is
+    claimed for this Kueue-style game (gangs / topology / borrowing make the
+    strategy space domain-specific, doc V price_of_anarchy / D26).
+    """
+
+    epsilon: float
+    is_stable: bool
+    deviations: list[DeviationResult] = field(default_factory=list)
+    max_gain: float = 0.0
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "epsilon": self.epsilon,
+            "is_stable": self.is_stable,
+            "max_gain": self.max_gain,
+            "n_profitable_deviations": sum(
+                1 for d in self.deviations if d.profitable
+            ),
+        }
+
+
+def check_epsilon_share_stability(
+    tenants: Sequence[str],
+    base_payoff: PayoffFn,
+    deviations: DeviationEnumerator,
+    *,
+    epsilon: float = 0.0,
+) -> ShareStabilityReport:
+    """Best-response / unilateral-deviation ε-share-stability checker (doc V D28).
+
+    For every tenant ``t`` we evaluate its base payoff at the realized profile and
+    the payoff of each unilateral deviation in ``deviations(t)`` (others fixed),
+    keeping the most profitable. The state is ε-share-stable iff no tenant's best
+    deviation gain exceeds ``epsilon`` (doc V D28: "no tenant can obtain a
+    strictly better payoff by unilateral deviation under fixed others").
+
+    Parameters
+    ----------
+    tenants:
+        Tenant identities in the realized profile.
+    base_payoff:
+        ``base_payoff(t)`` → the tenant's realized payoff (e.g. its long-run
+        service ``U_t`` or weighted share) under the *current* strategy profile.
+    deviations:
+        ``deviations(t)`` → an iterable of ``(label, payoff)`` candidate unilateral
+        deviations for tenant ``t`` (priority inflation, queue hopping, job
+        splitting, burst timing — the manipulation surfaces D24/M1-M6), each with
+        the payoff the tenant would obtain *if it alone deviated*. The caller
+        supplies these from a replay or the share-based admission rule simulation
+        so the check stays grounded in the platform's actual mechanics.
+    epsilon:
+        The stability slack ``ε`` (doc V D28). ``0`` ⇒ exact best-response check.
+    """
+    results: list[DeviationResult] = []
+    max_gain = 0.0
+    for t in tenants:
+        base = float(base_payoff(t))
+        best_label: str | None = None
+        best_payoff = base
+        for label, payoff in deviations(t):
+            p = float(payoff)
+            if p > best_payoff:
+                best_payoff, best_label = p, label
+        gain = best_payoff - base
+        max_gain = max(max_gain, gain)
+        results.append(
+            DeviationResult(
+                tenant_id=t,
+                base_payoff=base,
+                best_deviation=best_label,
+                best_payoff=best_payoff,
+                gain=gain,
+                profitable=gain > epsilon,
+            )
+        )
+    return ShareStabilityReport(
+        epsilon=epsilon,
+        is_stable=max_gain <= epsilon,
+        deviations=results,
+        max_gain=max_gain,
+    )

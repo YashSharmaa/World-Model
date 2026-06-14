@@ -235,12 +235,126 @@ def cross_rack_rate(
     return crossing / len(commodities)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Placement-conditioned commodity construction (doc N D1/D2/D3, doc D rule #3)
+# ──────────────────────────────────────────────────────────────────────────────
+#: Per-comm-class fair-share weight ω_k and per-replica demand volume b_k. The
+#: weight orders the max-min fill (allreduce gangs contend hardest); the demand is
+#: the volume each replica injects toward the gang's collective root (doc N D2).
+#: **Uncalibrated priors** (doc D calibrated_bounds_only): qualitative class shape.
+_COMM_CLASS_PROFILE: dict[str, tuple[float, float]] = {
+    # comm_class: (fair_share_weight ω, per-replica demand volume b in Gb)
+    "none": (0.2, 0.0),
+    "light": (0.5, 4.0),
+    "allreduce_heavy": (2.0, 64.0),
+    "pipeline": (1.0, 24.0),
+}
+
+#: Intra-rack (ToR) and inter-rack (spine) link capacities in Gb/s (doc N D1).
+#: NVLink/ToR fabric is fat; the spine crossing a rack boundary is the scarce
+#: shared resource that creates the contention the planner must see (doc D #3).
+_TOR_CAP_GBPS: float = 400.0
+_SPINE_CAP_GBPS: float = 100.0
+
+
+def pod_links(rack_ids: list[str]) -> tuple[list[Link], dict[str, str]]:
+    """Build the two-tier routed link set for a pod (doc N D1 routed topology).
+
+    One intra-rack ToR link per rack (``tor:<rack>``) plus one shared spine link
+    (``spine``) every cross-rack path traverses. Returns the links and the
+    ``rack_of_link`` map (the spine has no single rack scope) used to score
+    cross-rack crossings (doc N D3 categorical attributes).
+    """
+    links = [Link(link_id=f"tor:{rid}", capacity=_TOR_CAP_GBPS) for rid in rack_ids]
+    links.append(Link(link_id="spine", capacity=_SPINE_CAP_GBPS, latency_s=2e-5))
+    rack_of_link = {f"tor:{rid}": rid for rid in rack_ids}
+    return links, rack_of_link
+
+
+def commodities_for_gang(
+    gpu_racks: list[str],
+    comm_class: str,
+    *,
+    workload_uid: str = "wl",
+) -> list[Commodity]:
+    """Build per-replica commodities for a placed gang (doc N D2/D3; doc D #3).
+
+    Each placed GPU is one replica injecting ``b_k`` of collective traffic toward
+    the gang's collective root (replica 0's rack). A replica co-located with the
+    root crosses only its ToR link; a replica on a different rack crosses *both*
+    its ToR link and the shared ``spine`` — so spreading a gang across racks loads
+    the scarce spine and changes the bottleneck, exactly the placement-conditioned
+    contention signal of doc D correlation_rule #3 (contention couples to
+    placement). ``comm_class`` sets the fair-share weight ω_k and demand volume
+    b_k via :data:`_COMM_CLASS_PROFILE`.
+    """
+    weight, demand = _COMM_CLASS_PROFILE.get(comm_class, _COMM_CLASS_PROFILE["light"])
+    if not gpu_racks or demand <= 0.0:
+        return []
+    root_rack = gpu_racks[0]
+    out: list[Commodity] = []
+    for i, rack in enumerate(gpu_racks):
+        if i == 0:
+            continue  # the root does not send to itself
+        if rack == root_rack:
+            path = [f"tor:{rack}"]
+        else:
+            path = [f"tor:{rack}", "spine", f"tor:{root_rack}"]
+        out.append(
+            Commodity(
+                commodity_id=f"{workload_uid}:r{i}",
+                demand=demand,
+                weight=weight,
+                paths=[path],
+            )
+        )
+    return out
+
+
+def hotspot_risk(alloc: NetworkAllocation) -> float:
+    """Network-hotspot hazard ∈ [0, 1] from the routine-tier allocation (doc N L3).
+
+    The hotspot risk rises with the *peak* link utilisation and the presence of a
+    saturated bottleneck link — the emergent switch-hotspot signal the doc-K Eq8
+    stress proxy / doc-N L3 residual target tracks. It is a smooth, monotone map of
+    the worst link utilisation (a convex penalty that climbs sharply as any link
+    approaches saturation) plus a floor whenever a bottleneck link is fully
+    saturated, so a gang spread across racks that saturates the shared spine
+    reports materially higher hotspot risk than a rack-local placement. Replaces
+    the old 0/1 cross-rack indicator with a contention-grounded continuous hazard.
+    """
+    if not alloc.link_util:
+        return 0.0
+    # A hotspot on the *shared inter-rack spine* is materially worse than one on a
+    # local ToR: the spine is the scarce resource every cross-rack gang contends
+    # for, so its utilisation is weighted higher (a cross-rack placement that jams
+    # the spine is the canonical switch-hotspot, doc N L3 / doc K Eq8). Intra-rack
+    # ToR saturation is a milder, contained hotspot.
+    def _weight(link_id: str) -> float:
+        return 1.0 if _is_spine(link_id) else 0.55
+
+    weighted = max(
+        _weight(lid) * u for lid, u in alloc.link_util.items()
+    )
+    # Convex climb in the (weighted) peak utilisation: 0 at u=0, → 1 as u → 1.
+    risk = weighted / (2.0 - min(weighted, 0.999))
+    return float(min(max(risk, 0.0), 1.0))
+
+
+def _is_spine(link_id: str) -> bool:
+    """True iff the link is an inter-rack spine crossing (vs an intra-rack ToR)."""
+    return link_id == "spine" or link_id.startswith("spine")
+
+
 __all__ = [
     "Commodity",
     "Link",
     "NetworkAllocation",
     "PacketTeacherCorrection",
     "allocate",
+    "commodities_for_gang",
     "cross_rack_rate",
+    "hotspot_risk",
+    "pod_links",
     "weighted_max_min_fair",
 ]

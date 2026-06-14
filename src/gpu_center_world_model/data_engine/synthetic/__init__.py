@@ -37,9 +37,11 @@ from ...schema.tensors import ShapeCaps
 from ...schema.topology import RELATION_ENDPOINTS, Relation, RelationType
 from .arrivals import (
     Arrival,
+    QueueSummary,
     RegimeChain,
     TenantClass,
     simulate_arrivals,
+    simulate_pending_queue,
 )
 from .counterfactual import (
     BranchOutcome,
@@ -52,8 +54,10 @@ from .counterfactual import (
     step,
 )
 from .faults import (
+    FaultEvent,
     FaultParams,
     HazardResidual,
+    realized_fault_intensities,
     sample_fault_cluster,
 )
 from .fidelity import (
@@ -67,7 +71,18 @@ from .fidelity import (
     mmd2_test,
     predecision_leakage_test,
 )
-from .network import Commodity, Link, allocate
+from .network import (
+    Commodity,
+    Link,
+    NetworkAllocation,
+    PacketTeacherCorrection,
+    allocate,
+    commodities_for_gang,
+    cross_rack_rate,
+    hotspot_risk,
+    pod_links,
+    weighted_max_min_fair,
+)
 from .power import (
     PowerParams,
     PowerResidual,
@@ -79,17 +94,24 @@ from .power import (
 from .rare_events import (
     RARE_EVENT_FAMILIES,
     RareEventEstimate,
+    SubsetLevel,
     build_tilt,
     importance_estimate,
     point_process_log_lr,
+    subset_simulation_probability,
 )
 from .scm import (
     OPERATOR_MODES,
     WORKLOAD_PHASES,
+    DLCEmitter,
     PodSpec,
     PodTopology,
     build_pod,
     calibrated_posterior,
+    emit_gpu_telemetry,
+    pi_obs_caution,
+    sample_operator_mode,
+    telemetry_emission,
 )
 from .sysid import (
     RANDOMIZATION_TIERS,
@@ -368,23 +390,29 @@ __all__ = [
     "CalibratedDraw",
     "Commodity",
     "CounterfactualPack",
+    "DLCEmitter",
     # faults / rare events
+    "FaultEvent",
     "FaultParams",
     # fidelity
     "FidelityReport",
     "HazardResidual",
     "JointPosterior",
     "Link",
+    "NetworkAllocation",
+    "PacketTeacherCorrection",
     "PodSpec",
     "PodTopology",
     "PowerParams",
     "PowerResidual",
     "PowerTrace",
+    "QueueSummary",
     "RareEventEstimate",
     "RareEventSpec",
     "RegimeChain",
     "ResidualBundle",
     "ScenarioConfig",
+    "SubsetLevel",
     # arrivals
     "TenantClass",
     "TestResult",
@@ -399,8 +427,11 @@ __all__ = [
     "build_tilt",
     "calibrated_posterior",
     "classifier_two_sample_test",
+    "commodities_for_gang",
+    "cross_rack_rate",
     "default_action_catalog",
     "effective_system",
+    "emit_gpu_telemetry",
     "energy_distance_test",
     "energy_residual",
     "exact_kernel_conformance",
@@ -411,22 +442,31 @@ __all__ = [
     # entrypoint
     "generate_pack",
     "generate_pod_state",
+    "hotspot_risk",
     "importance_estimate",
     "incident_bundle_test",
     "init_power_state",
     "lag_structure_test",
     "lyapunov_margin",
     "mmd2_test",
+    "pi_obs_caution",
+    "pod_links",
     "point_process_log_lr",
     "predecision_leakage_test",
     "rack_power_kw",
     "rare_event_spec_for",
+    "realized_fault_intensities",
     "sample_fault_cluster",
+    "sample_operator_mode",
     "sample_tier",
     "simulate_arrivals",
+    "simulate_pending_queue",
     "step",
     "step_power",
     "step_thermal",
+    "subset_simulation_probability",
+    "telemetry_emission",
+    "weighted_max_min_fair",
     "zero_power_residual",
     "zero_residual",
 ]

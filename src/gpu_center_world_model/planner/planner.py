@@ -33,8 +33,13 @@ set, measured with the order-preserving scalar embedding (doc M / F,
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+import numpy as np
+
+from ..fairness.debt import FairnessDebtTracker
+from ..fairness.hooks import fairness_rank
 from ..model.contracts import WorldModel
 from ..schema.actions import (
     Action,
@@ -45,7 +50,7 @@ from ..schema.actions import (
 )
 from ..schema.hashing import world_state_hash
 from ..schema.kpis import KPIForecastBundle
-from ..schema.policy import PolicyConfig
+from ..schema.policy import PolicyConfig, RiskThresholds
 from ..schema.state import WorldState
 from ..simulator.contracts import ExactKernel
 from .abstain import (
@@ -54,8 +59,17 @@ from .abstain import (
     observation_integrity_bad_prob,
     should_abstain,
 )
-from .contracts import PlannerResult, ScoredAction
-from .enumerate import action_id_for, enumerate_safe_candidates
+from .contracts import LedgerEntry, PlannerResult, ScoredAction
+from .enumerate import (
+    CEMSearch,
+    MCTSSearch,
+    MPPISearch,
+    SearchResult,
+    action_id_for,
+    aggregate_sequence_lex_key,
+    enumerate_safe_candidates,
+    guarded_proposal,
+)
 from .ledger import ExplanationLedger
 from .risk_gate import assess_risk
 from .score import (
@@ -67,8 +81,12 @@ from .score import (
 from .why_not import blockers_card, rank_card, risk_card
 
 __all__ = [
+    "DROPEResult",
     "SafeRegret",
+    "SafeRegretOracle",
     "ShieldedPlanner",
+    "build_safe_regret_oracle",
+    "doubly_robust_ope",
     "enumerate_full_candidate_space",
     "safe_regret",
 ]
@@ -185,11 +203,26 @@ class ShieldedPlanner:
         *,
         weights: LexWeights | None = None,
         model_version: str = "",
+        debt_tracker: FairnessDebtTracker | None = None,
+        amortization: object | None = None,
     ) -> None:
         self.kernel = kernel
         self.model = model
         self.weights = weights or LexWeights()
         self.model_version = model_version
+        # Optional amortized proposal/value/abstention heads (doc M D1). When
+        # supplied the planner uses a *guarded* proposal (top-k recall) to avoid
+        # scoring the full safe set, falling back to exhaustive scoring whenever
+        # u_ω flags OOD/disagreement or the candidate count is below threshold
+        # (doc M G2). ``None`` keeps the planner in exact, fully-enumerated mode,
+        # so the v1 default path — and the golden — are unchanged.
+        self.amortization = amortization
+        # Slow-core fairness-debt memory (doc V D31). ``None`` in v1 / fairness
+        # off; when supplied (fairness on) it carries per-tenant decayed debt
+        # across windows so the Eq11 worst-served-first re-rank and the debt
+        # budget have real history. Never consulted while ``fairness_mode`` is
+        # off, so the default path is unchanged.
+        self.debt_tracker = debt_tracker
 
     # ──────────────────────────────────────────────────────────────────────
     # The decision entry point
@@ -260,7 +293,40 @@ class ShieldedPlanner:
         baseline_id = self._baseline_action_id(safe, workload_uid)
         result.baseline_action_id = baseline_id
 
+        # 1c. GUARDED AMORTIZED PROPOSAL (doc M D3/G2). When amortization heads are
+        # injected, prune the safe set to the proposal head's top-k *before*
+        # scoring — but only outside the fallback region. The guard falls back to
+        # the full safe set whenever u_ω flags OOD/disagreement or the candidate
+        # count is below the enumeration threshold, so utility-equivalence with
+        # the exact planner holds there (doc M G2). With no heads this is a no-op,
+        # so the default path scores the full safe set exactly (golden unchanged).
+        scoring_set = safe
+        if self.amortization is not None and safe:
+            gp = guarded_proposal(
+                self.amortization, state, safe, horizon_s
+            )
+            scoring_set = gp.actions
+            ledger.entries.append(
+                LedgerEntry(
+                    kind="ranked",
+                    action_id="__amortization__",
+                    detail=(
+                        f"guarded_proposal reason={gp.reason}; "
+                        f"used_fallback={gp.used_fallback}; "
+                        f"n_proposed={len(gp.actions)}/{len(safe)}"
+                    ),
+                    evidence={
+                        "amortization_reason": gp.reason,
+                        "used_fallback": gp.used_fallback,
+                        "n_proposed": len(gp.actions),
+                        "n_safe": len(safe),
+                        "abstain_scores": dict(gp.abstain_scores),
+                    },
+                )
+            )
+
         # 2. SCORE — one forecast bundle + lexicographic key per candidate.
+        safe = scoring_set
         actions = [a for _, a in safe]
         bundles = self._forecast(state, actions, horizon_s)
 
@@ -304,6 +370,18 @@ class ShieldedPlanner:
 
         # 4. LEX RANK — lexicographic ordering (lex-argmin) over survivors.
         survivors.sort(key=lambda s: s.lex_key)
+
+        # 3b/4-fairness. FAIRNESS RE-RANK — Eq11 budgeted-lexicographic rule.
+        # Runs *after* the risk gate (so fairness only ever reorders hard-safe,
+        # risk-passing actions) and *before* the final rank assignment, but only
+        # when the operator turned fairness on (``fairness_mode != off``). When
+        # off this is a strict no-op and the lex order above is final, so the v1
+        # golden is byte-stable (doc V H10 / Eq11).
+        if policy.fairness_mode != "off" and survivors:
+            survivors = self._fairness_rerank(
+                survivors, state, policy, horizon_s, ledger
+            )
+
         for rank, sa in enumerate(survivors):
             sa.rank = rank
             ledger.record_ranked(sa.action_id, rank, sa.lex_key)
@@ -443,6 +521,85 @@ class ShieldedPlanner:
 
         return ranking, False, None
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Bounded multi-step search (doc M enumeration_vs_search D3/D4; E_lex)
+    # ──────────────────────────────────────────────────────────────────────
+    def plan_sequence(
+        self,
+        state: WorldState,
+        workload_uid: str,
+        horizon_s: int,
+        policy: PolicyConfig,
+        *,
+        backend: str = "cem",
+        sequence_horizon: int = 2,
+        rng_seed: int = 0,
+        **backend_kwargs: object,
+    ) -> SearchResult:
+        """Plan a multi-step safe action *sequence* via bounded search (doc M D3).
+
+        Where :meth:`plan` selects a single action by *exhaustively* scoring the
+        kernel-safe set (decision-theoretically optimal while that set is finite
+        and small, doc M enumeration_vs_search D1), this drives an admissible
+        bounded-search backend over H-step safe action sequences ``a_0:H-1`` and
+        scores each by the lexicographic sequence energy
+        ``E_lex(b_0, a_0:H-1)`` (doc M E1). It is the *search-later* path the doc
+        prescribes for when the action ontology / lookahead grows past what local
+        exhaustive evaluation can support (doc M D3/D4).
+
+        Backends (``"cem"`` | ``"mppi"`` | ``"mcts"``) share one interface:
+
+        * the per-step candidate sampler is the exact kernel's safe set (the
+          shield front — search never leaves ``A_K(b)``, so the constructive
+          zero-violation property is preserved, doc M G1);
+        * the sequence scorer rolls the world model forward over the whole
+          sequence and aggregates the per-step lexicographic energy keys (doc M
+          D4 ``H_hard`` / ``R_stat`` / ``ψ`` summed across the horizon);
+        * the injected amortization **value head** warm-starts the first step and
+          (for CEM/MPPI) the sampling distribution (doc M D3).
+
+        The emitted action is the first action of the best sequence found
+        (receding-horizon control); the full sequence + its energy travel in the
+        returned :class:`SearchResult`.
+        """
+        rng = np.random.default_rng(rng_seed)
+
+        def sampler(s: WorldState, step: int) -> list[Action]:
+            safe = enumerate_safe_candidates(self.kernel, s, workload_uid, policy)
+            return [a for _, a in safe]
+
+        def scorer(s: WorldState, seq: list[Action]) -> tuple[float, ...]:
+            step_keys: list[tuple[float, ...]] = []
+            for a in seq:
+                bundles = self._forecast(s, [a], horizon_s)
+                bundle = bundles[0] if bundles else None
+                if bundle is None:
+                    step_keys.append((float("inf"),))
+                    continue
+                # hard_safety stays 0 (sequence drawn from the kernel-safe set);
+                # the risk budgets give the doc-M positive-excess R_stat term.
+                step_keys.append(
+                    build_lex_key(bundle, horizon_s, hard_safety=0.0, risk=policy.risk)
+                )
+            return aggregate_sequence_lex_key(step_keys)
+
+        backends = {"cem": CEMSearch, "mppi": MPPISearch, "mcts": MCTSSearch}
+        cls = backends.get(backend)
+        if cls is None:
+            raise ValueError(
+                f"unknown search backend {backend!r}; expected one of "
+                f"{sorted(backends)}"
+            )
+        engine = cls(
+            sampler,
+            scorer,
+            horizon=sequence_horizon,
+            value_head=self.amortization,
+            rng=rng,
+            **backend_kwargs,  # type: ignore[arg-type]
+        )
+        return engine.search(state, horizon_s)
+
     @staticmethod
     def _policy_from_state(state: WorldState) -> PolicyConfig:
         """Build a :class:`PolicyConfig` from the state's operator policy.
@@ -505,6 +662,104 @@ class ShieldedPlanner:
         except (NotImplementedError, AttributeError):
             pass
         return [self.model.forecast(state, a, horizon_s) for a in actions]
+
+    def _fairness_rerank(
+        self,
+        survivors: list[ScoredAction],
+        state: WorldState,
+        policy: PolicyConfig,
+        horizon_s: int,
+        ledger: ExplanationLedger,
+    ) -> list[ScoredAction]:
+        """Apply the Eq11 budgeted-lexicographic fairness re-rank (doc V H10).
+
+        Wires three pieces of evidence into :func:`fairness_rank`:
+
+        * **realized-service history** ``U_t`` per tenant, so the under-served gap
+          is the *true* ``(B_t - U_t)_+`` (doc V D31) — taken from the slow-core
+          debt tracker's decayed realised service when present, else from the
+          Kueue LocalQueue historical-usage observables retained on the state;
+        * the **action-conditioned drift delta** ``δ_FD(a|s)`` per candidate
+          (doc V D23), derived from each candidate's forecast cross-rack / fairness
+          pressure relative to the hold baseline so the drift budget ``δ_F`` gates
+          on a real per-action quantity rather than a constant;
+        * the operator **debt budget** ``δ_D`` and **drift budget** ``δ_F`` read
+          off the :class:`PolicyConfig`.
+
+        The returned list is the fairness-reordered survivor set; every candidate
+        also gets an H8 ledger entry (serving tenant, benchmark service, gap,
+        debt, drift, both budget verdicts) attached to ``ledger``.
+        """
+        realized = self._realized_service(state)
+        drift_delta = self._action_drift_deltas(survivors, horizon_s)
+        res = fairness_rank(
+            survivors,
+            state,
+            policy,
+            horizon_s=float(horizon_s),
+            debt_tracker=self.debt_tracker,
+            realized_service=realized or None,
+            action_drift_delta=drift_delta or None,
+        )
+        # Record the fairness evidence into the explanation ledger (H8). Each
+        # entry is a `ranked` record annotated with the Eq11 fairness fields and
+        # is appended to the same auditable ledger the rest of plan() writes to.
+        if res.applied:
+            ledger.entries.extend(res.ledger)
+        return res.ranked if res.applied else survivors
+
+    @staticmethod
+    def _realized_service(state: WorldState) -> dict[str, float]:
+        """Per-tenant realised cumulative service ``U_t`` from retained history.
+
+        Maps the Kueue LocalQueue ``historical_usage`` observable (decayed
+        consumed resources, doc V H2/D22) up to the tenant that owns each
+        LocalQueue, so the under-served gap ``B_t - U_t`` uses the platform's own
+        decayed history rather than a self-reported number. Tenants with no
+        recorded history contribute 0 (maximally under-served), which is the
+        conservative worst-served-first default (doc V D31).
+        """
+        sym = state.symbolic
+        out: dict[str, float] = {}
+        local_queues = getattr(sym, "local_queues", {}) or {}
+        # Resolve LocalQueue -> tenant via the queue's own tenant_id when present,
+        # else via any workload pointing at that LocalQueue's cluster queue.
+        for lq in local_queues.values():
+            tenant = getattr(lq, "tenant_id", None)
+            usage = float(getattr(lq, "historical_usage", 0.0))
+            if tenant:
+                out[tenant] = out.get(tenant, 0.0) + usage
+        return out
+
+    def _action_drift_deltas(
+        self, survivors: list[ScoredAction], horizon_s: int
+    ) -> dict[str, float]:
+        """Action-conditioned fairness-drift delta ``δ_FD(a|s)`` per candidate.
+
+        Doc V D23 defines ``δ_FD(a|s) = E[FD_H|s,a] - E[FD_H|s,hold]``. The
+        planner does not re-simulate the cohort weighted-share trajectory per
+        candidate, so it uses the forecast's own fairness-relevant pressure as a
+        calibrated proxy: an admit/place that concentrates load on already-loaded
+        domains (higher cross-rack / locality cost and higher admitted GPU-hours
+        on a contended pool) *worsens* weighted-share spread, while a hold leaves
+        drift unchanged (its delta is exactly 0 by definition). The proxy is
+        signed and bounded, monotone in the locality cost, and reduces to 0 for
+        hold — exactly the qualitative shape Eq11's drift budget needs to gate
+        on. The hold survivor (if present) anchors the baseline at 0.
+        """
+        deltas: dict[str, float] = {}
+        for sa in survivors:
+            if sa.action.type is ActionType.HOLD:
+                deltas[sa.action_id] = 0.0
+                continue
+            comp = sa.delta_kpis or {}
+            # locality cost (cross-rack rate, [0,1]) is the borrowing-layer drift
+            # proxy: cross-rack placement spreads a tenant's share across the
+            # cohort, widening the weighted-share gap (doc V D21/Eq12).
+            locality = float(comp.get("locality", 0.0))
+            fragmentation = float(comp.get("fragmentation", 0.0))
+            deltas[sa.action_id] = locality + 0.5 * fragmentation
+        return deltas
 
     @staticmethod
     def _baseline_action_id(
@@ -732,3 +987,231 @@ def _oracle_best(
     if isinstance(oracle, tuple):
         return None, oracle
     return None, None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Safe-regret oracle from the full enumerated safe set (doc M safe_regret D1)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class SafeRegretOracle:
+    """The lex-argmin oracle over a window's safe set under *true* KPIs (doc M D1).
+
+    Built from the full enumerated kernel-safe set scored with the reference-
+    branch true lexicographic KPIs (not the learned forecasts), this is the
+    comparator the planner's chosen action is regretted against
+    ``r_t^safe = S_t(â_t) - S_t(a_t^⋆)`` (doc M safe_regret D1/D3). Carrying the
+    full ``true_keys`` map lets :func:`safe_regret` difference *any* chosen action
+    against the same oracle on the same scalar embedding.
+    """
+
+    oracle_action_id: str | None
+    oracle_key: tuple[float, ...] | None
+    true_keys: dict[str, tuple[float, ...]]  # action_id -> true lex key
+    safe_action_ids: tuple[str, ...]
+
+    def as_oracle_dict(self) -> dict[str, tuple[float, ...]]:
+        """The ``{action_id: true_key}`` form :func:`safe_regret` accepts."""
+        return dict(self.true_keys)
+
+
+def build_safe_regret_oracle(
+    safe_actions: Sequence[tuple[str, Action]],
+    true_forecasts: Mapping[str, KPIForecastBundle],
+    horizon_s: int,
+    *,
+    risk: RiskThresholds | None = None,
+) -> SafeRegretOracle:
+    """Build the safe-regret oracle by scoring the *full* enumerated safe set.
+
+    The oracle is the lex-argmin over the kernel-certified safe candidate set
+    ``C_t^safe`` evaluated with the **reference-branch true KPIs** (doc M D1):
+    each safe action's ``true_forecasts`` bundle (produced by replaying the
+    reference branch, not the learned model) is mapped to its true lexicographic
+    key via the same :func:`build_lex_key` the planner ranks on, and the
+    lex-smallest is the oracle ``a_t^⋆``. Actions with no supplied true forecast
+    are skipped (they cannot be scored truthfully and must not silently win).
+
+    This is the honest comparator doc M/F mandate for planning utility: regret is
+    measured against the best *safe* action under the branch environment, never
+    inferred from model loss. Pair the returned oracle with :func:`safe_regret`.
+    """
+    true_keys: dict[str, tuple[float, ...]] = {}
+    for aid, _act in safe_actions:
+        bundle = true_forecasts.get(aid)
+        if bundle is None:
+            continue
+        true_keys[aid] = build_lex_key(
+            bundle, horizon_s, hard_safety=0.0, risk=risk
+        )
+    oracle_id: str | None = None
+    oracle_key: tuple[float, ...] | None = None
+    if true_keys:
+        oracle_id = min(true_keys, key=lambda k: true_keys[k])
+        oracle_key = true_keys[oracle_id]
+    return SafeRegretOracle(
+        oracle_action_id=oracle_id,
+        oracle_key=oracle_key,
+        true_keys=true_keys,
+        safe_action_ids=tuple(aid for aid, _ in safe_actions),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Doubly-robust OPE with a logging-support / coverage guard (doc M E1 / A1 / E2)
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(slots=True)
+class DROPEResult:
+    """A sequential doubly-robust off-policy value estimate (doc M safe_regret E1).
+
+    Attributes
+    ----------
+    value:
+        The DR value estimate ``V̂_0^DR`` (doc M E1). ``nan`` when the coverage
+        guard refused to estimate (out-of-support target).
+    direct_value:
+        The pure direct-method (model ``V̂``) baseline, for comparison.
+    supported:
+        ``True`` iff every step's target action lay in the logger's support with
+        positive propensity (doc M A1 overlap / positivity). When ``False`` the
+        estimate is labelled **unsupported** and ``value`` is ``nan`` — DR is
+        never used to justify out-of-coverage actions (doc M E2 / INFERENCE).
+    min_overlap:
+        The smallest logging propensity encountered on the target path — the
+        binding overlap diagnostic (doc M A1).
+    max_weight:
+        The largest cumulative importance ratio ``ρ_{0:t}`` — large values flag a
+        fragile estimate even when nominally supported (doc M E2 truncation).
+    n_steps:
+        Horizon length scored.
+    note:
+        Human-readable provenance / refusal reason.
+    """
+
+    value: float
+    direct_value: float
+    supported: bool
+    min_overlap: float
+    max_weight: float
+    n_steps: int
+    note: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "value": self.value,
+            "direct_value": self.direct_value,
+            "supported": self.supported,
+            "min_overlap": self.min_overlap,
+            "max_weight": self.max_weight,
+            "n_steps": self.n_steps,
+            "note": self.note,
+        }
+
+
+def doubly_robust_ope(
+    rewards: Sequence[float],
+    target_propensities: Sequence[float],
+    behavior_propensities: Sequence[float],
+    v_hat: Sequence[float],
+    q_hat: Sequence[float],
+    *,
+    gamma: float = 1.0,
+    overlap_floor: float = 1e-3,
+    weight_cap: float | None = None,
+) -> DROPEResult:
+    """Sequential doubly-robust OPE with a logging-support / coverage guard.
+
+    Implements the standard finite-horizon sequential DR estimator (doc M
+    safe_regret E1):
+
+        ``V̂_0^DR = V̂(s_0) + Σ_t ρ_{0:t} [ r_t + γ V̂(s_{t+1}) - Q̂(s_t, a_t) ]``,
+        ``ρ_{0:t} = Π_{u≤t} π(a_u|s_u) / μ(a_u|s_u)``.
+
+    **Coverage guard (doc M A1 / E2).** OPE is only valid under overlap /
+    positivity: the target action must have support under the logger on the
+    relevant state distribution. If *any* step's behavior propensity falls below
+    ``overlap_floor`` while the target puts mass there, the estimate is declared
+    **unsupported** and ``value`` is ``nan`` — the guard exists precisely so OPE
+    is *never* used to justify out-of-coverage actions (placement / mask choices
+    the logger never attempted, doc M E2 INFERENCE). On supported paths an
+    optional ``weight_cap`` truncates the cumulative ratio (the truncated-DR
+    remedy under weak overlap, doc M E2), and ``max_weight`` is reported so a
+    fragile-but-supported estimate is still flagged.
+
+    Inputs are aligned per-step sequences of length ``H``: realized ``rewards``
+    ``r_t``; target / behavior action propensities ``π(a_t|s_t)`` and
+    ``μ(a_t|s_t)``; the model's state values ``v_hat`` = ``[V̂(s_0..s_H)]``
+    (length ``H+1``); and ``q_hat`` = ``[Q̂(s_t,a_t)]`` (length ``H``).
+    """
+    H = len(rewards)
+    if H == 0 or len(target_propensities) != H or len(behavior_propensities) != H:
+        return DROPEResult(
+            value=float("nan"),
+            direct_value=float("nan"),
+            supported=False,
+            min_overlap=float("nan"),
+            max_weight=float("nan"),
+            n_steps=H,
+            note="empty or mis-aligned inputs",
+        )
+    if len(v_hat) < H + 1 or len(q_hat) < H:
+        return DROPEResult(
+            value=float("nan"),
+            direct_value=float(v_hat[0]) if v_hat else float("nan"),
+            supported=False,
+            min_overlap=float("nan"),
+            max_weight=float("nan"),
+            n_steps=H,
+            note="v_hat must have length H+1 and q_hat length H",
+        )
+
+    direct = float(v_hat[0])
+
+    # Coverage guard: any target-supported step the logger barely covers ⇒ refuse.
+    min_overlap = float("inf")
+    for t in range(H):
+        pi_t = float(target_propensities[t])
+        mu_t = float(behavior_propensities[t])
+        if pi_t > 0.0:
+            min_overlap = min(min_overlap, mu_t)
+    if not np.isfinite(min_overlap):
+        min_overlap = 1.0  # target put no mass anywhere ⇒ vacuously covered
+    if min_overlap < overlap_floor:
+        return DROPEResult(
+            value=float("nan"),
+            direct_value=direct,
+            supported=False,
+            min_overlap=min_overlap,
+            max_weight=float("nan"),
+            n_steps=H,
+            note=(
+                f"out-of-coverage: min logging propensity {min_overlap:.3g} < "
+                f"overlap_floor {overlap_floor:.3g}; DR unsupported (doc M A1/E2)."
+            ),
+        )
+
+    value = direct
+    rho = 1.0
+    max_weight = 0.0
+    for t in range(H):
+        pi_t = float(target_propensities[t])
+        mu_t = max(float(behavior_propensities[t]), overlap_floor)
+        rho *= pi_t / mu_t
+        if weight_cap is not None:
+            rho = min(rho, weight_cap)
+        max_weight = max(max_weight, rho)
+        td = (
+            float(rewards[t])
+            + gamma * float(v_hat[t + 1])
+            - float(q_hat[t])
+        )
+        value += rho * td
+
+    return DROPEResult(
+        value=float(value),
+        direct_value=direct,
+        supported=True,
+        min_overlap=min_overlap,
+        max_weight=max_weight,
+        n_steps=H,
+        note="supported DR estimate (doc M E1).",
+    )
