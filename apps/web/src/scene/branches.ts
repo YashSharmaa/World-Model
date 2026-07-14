@@ -56,8 +56,12 @@ export interface BranchGhost {
  */
 export function branchUncertainty(c: CandidateResultDTO): number {
   const u = c.uncertainty;
-  const base = Math.min(1, u.epistemic_score + u.ood_score);
-  const q = u.quantiles[0]?.quantiles;
+  // Blocked candidates can carry an empty uncertainty payload (no learned
+  // forecast was computed), so every field access is guarded — a single missing
+  // field must never throw inside the rAF render loop.
+  if (!u) return 0;
+  const base = Math.min(1, (u.epistemic_score ?? 0) + (u.ood_score ?? 0));
+  const q = u.quantiles?.[0]?.quantiles;
   let spreadTerm = 0;
   if (q && q["0.05"] != null && q["0.5"] != null && q["0.95"] != null) {
     const median = Math.abs(q["0.5"]);

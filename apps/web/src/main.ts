@@ -41,31 +41,16 @@ import {
 } from "./scene/workloads";
 import { applyDomainAnnotations, setDomainLayerVisibility } from "./scene/overlays";
 import { rebuildBranches, updateBranches } from "./scene/branches";
-import { CameraDirector, createModeTabs } from "./routes/modes";
+import { CameraDirector } from "./routes/modes";
 import { installEnvironment, type EnvironmentHandle } from "./scene/environment";
 import { buildProAssets, type ProAssetsResult } from "./scene/proAssets";
 import { createLoaderArm } from "./scene/loaderArm";
-import { createCreditPlate } from "./scene/labels";
 import { createPostFX } from "./render/postfx";
 import { CinematicDirector, defaultGoldenPath } from "./anim/director";
 import { getSceneTheme, onTheme, type SceneTheme } from "./theme";
-import { el, injectStyles } from "./panels/dom";
-import {
-  createFooterCredit,
-  createLegend,
-  createProvenanceHeader,
-} from "./panels/legend";
-import {
-  createBeatCaption,
-  createQueueStrip,
-  createRecommendation,
-} from "./panels/recommendation";
-import { createWhyNotCard } from "./panels/whyNot";
-import { createTimeline, type TimelineHandle } from "./panels/timeline";
-import { createDeltaRibbon } from "./panels/deltaRibbon";
-import { createInspectDrawer } from "./panels/inspectDrawer";
-import { createReplayCalibration } from "./panels/replayCalibration";
-import { createControls, type DomainLayer } from "./panels/controls";
+import "./index.css";
+import { mountOverlay } from "./ui/mount";
+import type { DomainLayer, ReplayTrace, StudioBridge } from "./ui/studio-context";
 
 /** Playback speed: scene-seconds advanced per real second when playing. */
 const PLAYBACK_RATE = 120; // 2 min of horizon per real second (recordable pace)
@@ -73,7 +58,6 @@ const PLAYBACK_RATE = 120; // 2 min of horizon per real second (recordable pace)
 async function main(): Promise<void> {
   const canvas = document.getElementById("webgl-canvas") as HTMLCanvasElement;
   const overlay = document.getElementById("dom-overlay") as HTMLElement;
-  injectStyles();
 
   // ── renderer + camera ──────────────────────────────────────────────────
   // Pro look: postprocessing owns tone mapping (renderer = NoToneMapping),
@@ -163,55 +147,55 @@ async function main(): Promise<void> {
   /** action_id we last dramatised, so we trigger a place exactly once per commit. */
   let lastPlacedActionId: string | null = null;
 
-  // In-scene author credit plate (doc G attribution): a billboarded 3D plate
-  // floating above the pod so the recording carries the credit even on a frame
-  // grab, in addition to the persistent HTML footer. Non-interactive.
-  const creditPlate = createCreditPlate();
-  creditPlate.position.set(0, 7.2, -6.5);
-  scene.add(creditPlate);
+  // Author attribution travels with the persistent HTML footer credit
+  // (bottom-right) and the per-payload `credit` field; an in-scene 3D credit
+  // plate was removed because it projected over the centre of the pod and
+  // clashed with the "Current pod state" label and the scene itself.
 
-  // ── panels (HTML overlay layer) ─────────────────────────────────────────
-  const provenance = createProvenanceHeader(overlay);
-  const modeTabs = createModeTabs(overlay, store);
-  const legend = createLegend(overlay);
-  const queueStrip = createQueueStrip(overlay, store);
-  const recommendation = createRecommendation(overlay, store);
-  const whyNot = createWhyNotCard(overlay, store, apiClient);
-  const timeline: TimelineHandle = createTimeline(overlay, store);
-  const deltaRibbon = createDeltaRibbon(overlay, store);
-  const inspectDrawer = createInspectDrawer(overlay, store);
-  const replayCalibration = createReplayCalibration(overlay, store);
-  // Scene controls: horizon selector, replay picker, context-layer toggles. The
-  // layer toggle drives setDomainLayerVisibility on the LIVE scene graph; the
-  // chosen visibility is re-applied after every geometry rebuild below.
-  const controls = createControls(overlay, store, apiClient, (layer, visible) => {
+  // ── 2D overlay bridge (React owns the overlay; main owns the scene) ───────
+  // The React overlay (shadcn/ui + Tailwind) reads the same store and writes
+  // back through this bridge. Domain context-layer visibility is the scene's
+  // source of truth here; the React Controls panel mirrors it and calls
+  // setLayer() to mutate the live graph.
+  const layerVisible: Record<DomainLayer, boolean> = {
+    topology: true,
+    power: true,
+    cooling: true,
+  };
+  function setLayer(layer: DomainLayer, visible: boolean): void {
+    layerVisible[layer] = visible;
     setDomainLayerVisibility(sceneGraph.domains, layer, visible);
-  });
-  const beat = createBeatCaption(overlay);
-  const footer = createFooterCredit(overlay);
-
-  const panels = [
-    legend,
-    queueStrip,
-    recommendation,
-    whyNot,
-    timeline,
-    deltaRibbon,
-    inspectDrawer,
-    replayCalibration,
-    controls,
-    provenance,
-    footer,
-    beat,
-  ];
-
-  /** Re-apply the user's context-layer visibility after a geometry rebuild. */
+  }
+  /** Re-apply the operator's context-layer visibility after a geometry rebuild. */
   function reapplyLayerVisibility(): void {
-    const vis = controls.getLayerVisibility();
-    (Object.keys(vis) as DomainLayer[]).forEach((layer) =>
-      setDomainLayerVisibility(sceneGraph.domains, layer, vis[layer]),
+    (Object.keys(layerVisible) as DomainLayer[]).forEach((layer) =>
+      setDomainLayerVisibility(sceneGraph.domains, layer, layerVisible[layer]),
     );
   }
+
+  // Replay trace (predicted / realized / both) the render loop overlays; the
+  // React Timeline toggle writes it through setTrace().
+  let replayTrace: ReplayTrace = "both";
+  const setTrace = (t: ReplayTrace): void => {
+    replayTrace = t;
+  };
+
+  // Self-captioning beat text signal: written by BOTH the cinematic demo and the
+  // store-derived caption, read by the React <BeatCaption/> via useSyncExternalStore.
+  const beatListeners = new Set<() => void>();
+  let beatText: string | null = null;
+  function setBeat(text: string | null): void {
+    if (text === beatText) return;
+    beatText = text;
+    for (const l of beatListeners) l();
+  }
+  const beatSignal = {
+    get: () => beatText,
+    subscribe: (cb: () => void) => {
+      beatListeners.add(cb);
+      return () => beatListeners.delete(cb);
+    },
+  };
 
   // ── golden-path "Play demo" control + auto-start ──────────────────────────
   // The cinematic director runs the eight doc-G beats; each beat's onBegin
@@ -231,15 +215,25 @@ async function main(): Promise<void> {
     );
     cinematic.playGoldenPath(
       defaultGoldenPath(store, (text) => {
-        if (text) beat.set(text);
+        if (text) setBeat(text);
       }),
     );
   }
 
-  const demoBtn = el("button", "chip play-demo", "▶ Play demo") as HTMLButtonElement;
-  demoBtn.title = "Run the 8-beat golden-path demo (camera + decision narrative)";
-  demoBtn.addEventListener("click", () => playDemo());
-  overlay.appendChild(demoBtn);
+  // Mount the React 2D overlay (shadcn/ui + Tailwind) over the canvas. The
+  // bridge hands React the store, the API client, and the imperative scene
+  // callbacks main.ts owns (play demo, toggle a context layer, set replay trace,
+  // the beat-caption signal).
+  const bridge: StudioBridge = {
+    store,
+    api: apiClient,
+    playDemo,
+    setLayer,
+    initialLayers: { ...layerVisible },
+    setTrace,
+    beat: beatSignal,
+  };
+  mountOverlay(overlay, bridge);
 
   // ── raycasting (interaction_root) ────────────────────────────────────────
   const ndc = new Vector2();
@@ -306,30 +300,29 @@ async function main(): Promise<void> {
       );
     }
     director.goTo(s.mode);
-    modeTabs.update(s.mode);
     sceneGraph.highlight(s.selection);
-    for (const p of panels) p.update(s);
-    // While the golden-path demo runs, its per-beat caption owns the caption
-    // panel; otherwise the store-driven caption tracks the live state.
+    // While the golden-path demo runs, its per-beat caption owns the caption;
+    // otherwise the store-driven caption tracks the live state. (The React
+    // panels re-render themselves from the store via useSyncExternalStore.)
     if (!goldenPathActive) updateBeatCaption(s);
   });
 
   function updateBeatCaption(s: StoreState): void {
     // Self-captioning headline that tracks the demo's beats (doc G storyboard).
     if (s.mode === "replay-calibration" && s.replay) {
-      beat.set(s.cursorS >= 720 ? "Predicted vs realized — divergence" : "Replay: predicted branch");
+      setBeat(s.cursorS >= 720 ? "Predicted vs realized — divergence" : "Replay: predicted branch");
       return;
     }
     if (!s.compare) {
-      beat.set(s.focusedWorkload ? "Current pod state · pick an action" : null);
+      setBeat(s.focusedWorkload ? "Current pod state · pick an action" : null);
       return;
     }
     if (s.whyNotActionId) {
-      beat.set("Rejected for exact blockers and higher risk");
+      setBeat("Rejected for exact blockers and higher risk");
       return;
     }
     const rec = s.compare.candidates.find((c) => c.action_id === s.compare?.recommended_action_id);
-    beat.set(rec ? `Compare futures — recommended: ${rec.action_id}` : "Compare futures");
+    setBeat(rec ? `Compare futures — recommended: ${rec.action_id}` : "Compare futures");
   }
 
   // ── render loop ──────────────────────────────────────────────────────────
@@ -339,33 +332,41 @@ async function main(): Promise<void> {
 
   const clock = new Clock();
   function frame(): void {
-    const dt = clock.getDelta();
-    // Advance the shared time cursor (interpolation only — backend-authoritative).
-    store.advance(dt * PLAYBACK_RATE);
+    // The whole frame body is guarded so a single transient error (e.g. a
+    // malformed branch payload) can never kill the rAF loop and blank the scene;
+    // the reschedule in `finally` keeps the render loop alive regardless.
+    try {
+      const dt = clock.getDelta();
+      // Advance the shared time cursor (interpolation only, backend-authoritative).
+      store.advance(dt * PLAYBACK_RATE);
 
-    // Camera: the cinematic director may take over (golden-path / named shots);
-    // when it yields, the mode CameraDirector drives the limited-orbit preset.
-    if (!cinematic.update(dt)) {
-      director.tick(orbit);
+      // Camera: the cinematic director may take over (golden-path / named shots);
+      // when it yields, the mode CameraDirector drives the limited-orbit preset.
+      if (!cinematic.update(dt)) {
+        director.tick(orbit);
+      }
+      // When the golden-path beat sequence finishes, hand the caption back to the
+      // live store-driven caption.
+      if (goldenPathActive && !cinematic.isSequenceActive()) {
+        goldenPathActive = false;
+      }
+
+      applyRolloutToScene(currentState);
+
+      // Advance the fixed-duration workload commit tweens off wall-clock dt.
+      updateCommitTweens(sceneGraph.workloads, dt);
+
+      // Drive the rigged loader arm + the professional set dressing.
+      arm.update(dt);
+      proAssets.update(clock.elapsedTime, heatByRack, utilByRack);
+
+      // Render through the post-processing composer (ACES + bloom + SMAA + vignette).
+      postfx.render(dt);
+    } catch (err) {
+      console.error("[decision-studio] frame error (render loop kept alive):", err);
+    } finally {
+      requestAnimationFrame(frame);
     }
-    // When the golden-path beat sequence finishes, hand the caption back to the
-    // live store-driven caption.
-    if (goldenPathActive && !cinematic.isSequenceActive()) {
-      goldenPathActive = false;
-    }
-
-    applyRolloutToScene(currentState);
-
-    // Advance the fixed-duration workload commit tweens off wall-clock dt.
-    updateCommitTweens(sceneGraph.workloads, dt);
-
-    // Drive the rigged loader arm + the professional set dressing.
-    arm.update(dt);
-    proAssets.update(clock.elapsedTime, heatByRack, utilByRack);
-
-    // Render through the post-processing composer (ACES + bloom + SMAA + vignette).
-    postfx.render(dt);
-    requestAnimationFrame(frame);
   }
 
   /**
@@ -506,7 +507,7 @@ async function main(): Promise<void> {
 
     // 2) Replay overlay (predicted vs realized).
     if (replayMode && s.replay) {
-      const trace = timeline.getTrace();
+      const trace = replayTrace;
       const predPoint = sampleRollout(s.replay.predicted.points, cursor);
       const realPoint = sampleRollout(s.replay.realized.points, cursor);
 
@@ -593,6 +594,5 @@ main().catch((err) => {
     div.textContent = `Decision Studio failed to start: ${String(err)}`;
     overlay.appendChild(div);
   }
-  // eslint-disable-next-line no-console
   console.error(err);
 });

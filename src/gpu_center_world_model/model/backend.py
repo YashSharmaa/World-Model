@@ -171,6 +171,13 @@ def _mlx_backend() -> Backend:  # pragma: no cover - Apple-silicon only
             xhat = xhat + bias
         return xhat
 
+    def _mlx_stop_gradient(x: ArrayLike) -> ArrayLike:
+        # ``mx.stop_gradient`` requires an mlx array. The reference (float-
+        # returning) loss functions compute in NumPy and may pass raw ndarrays
+        # through the gradient-contract call before materializing; for those a
+        # host array carries no tape, so stop-gradient is a no-op pass-through.
+        return mx.stop_gradient(x) if isinstance(x, mx.array) else x
+
     return Backend(
         name="mlx",
         xp=mx,
@@ -178,7 +185,7 @@ def _mlx_backend() -> Backend:  # pragma: no cover - Apple-silicon only
         softmax=_mlx_softmax,
         sigmoid=mx.sigmoid,
         layer_norm=_mlx_layer_norm,
-        stop_gradient=mx.stop_gradient,
+        stop_gradient=_mlx_stop_gradient,
         to_numpy=lambda x: np.array(x),
         from_numpy=lambda x: mx.array(np.asarray(x, dtype=np.float32)),
     )

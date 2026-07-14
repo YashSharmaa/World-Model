@@ -34,6 +34,7 @@ from gpu_center_world_model.model.architecture import (
     RelationalWorldModel,
     exact_field_targets,
 )
+from gpu_center_world_model.model.backend import get_backend
 from gpu_center_world_model.model.jepa import (
     GroupLogVars,
     JEPAConfig,
@@ -303,8 +304,12 @@ def test_mlx_backend_imports_and_guards_without_mlx():
 
 
 def test_numpy_spsa_smoke_train_descends_and_stays_uncollapsed():
-    """The NumPy SPSA fallback trains end-to-end without collapse (HARD RULE 3)."""
-    report = smoke_train(cfg=TrainConfig(seed=1))
+    """The NumPy SPSA fallback trains end-to-end without collapse (HARD RULE 3).
+
+    Requests the NumPy backend explicitly so the always-on SPSA reference path is
+    exercised even when MLX is installed (the default backend on Apple silicon).
+    """
+    report = smoke_train(cfg=TrainConfig(seed=1), backend=get_backend("numpy"))
     assert report.backend == "numpy"
     assert report.steps > 0
     assert not report.collapsed()

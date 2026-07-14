@@ -128,15 +128,24 @@ else:  # pragma: no cover - Apple-silicon only
         def leaves(self) -> list[Any]:
             return [self.p[f"p{i}"] for i in range(len(self.p))]
 
-        def scatter_into(self, handles: list[tuple[object, str]]) -> None:
-            """Write the trained leaves back into ``handles`` as host NumPy arrays.
+        def scatter_into(
+            self,
+            handles: list[tuple[object, str]],
+            convert: Callable[[Any], Any] | None = None,
+        ) -> None:
+            """Write the trained leaves back into ``handles`` in the model backend.
 
-            The inference forward path stores raw arrays, so the compiled MLX
-            update is materialized to host ``float32`` (doc E: one model, two
-            backends — the trained tree round-trips into the served weights).
+            ``convert`` maps a trained ``mx.array`` leaf to the array type the
+            inference forward path expects. When the served model runs on MLX it
+            must stay MLX (``be.xp`` ops reject host ``ndarray``); the caller
+            therefore passes ``model.be.from_numpy`` so the trained tree
+            round-trips into backend-native served weights (doc E: one model, two
+            backends). The default cast to host ``float32`` is kept only for a
+            NumPy-backed model.
             """
+            conv = convert or (lambda a: np.asarray(a).astype(np.float32))
             for i, (owner, attr) in enumerate(handles):
-                setattr(owner, attr, np.asarray(self.p[f"p{i}"]).astype(np.float32))
+                setattr(owner, attr, conv(self.p[f"p{i}"]))
 
     # ------------------------------------------------------------------ #
     # Gradient clipping (doc E grad-clip).
@@ -212,16 +221,42 @@ else:  # pragma: no cover - Apple-silicon only
                 self.optimizer.update(module, grads)
                 return loss
 
+            self._raw_step = _step
             # compile the outer transition+loss+update step (doc E mx.compile),
             # capturing the module + optimizer state as the compiled graph inputs.
             self._compiled = mx.compile(_step)
+            # ``mx.compile`` fuses the whole value_and_grad + AdamW update into a
+            # single Metal kernel. The typed relational model has many small
+            # Dense/GRU parameter leaves, so for a large param tree the fused
+            # kernel can exhaust Metal's per-kernel argument buffers. We attempt
+            # the compiled step and fall back *permanently* to the eager step on
+            # that limit — still full GPU autodiff, just unfused (doc E compile is
+            # an optimization, not a correctness requirement).
+            self._use_compiled = True
 
         def set_lr(self, lr: float) -> None:
             self.optimizer.learning_rate = lr
 
+        @staticmethod
+        def _is_compile_limit(exc: Exception) -> bool:
+            msg = str(exc).lower()
+            return "compile" in msg or "argument buffer" in msg
+
         def run(self) -> float:
-            loss = self._compiled()
-            # force evaluation of the fused graph (params + optimizer state).
+            if self._use_compiled:
+                try:
+                    loss = self._compiled()
+                    # force evaluation of the fused graph (params + opt state).
+                    mx.eval(self.module.parameters(), self.optimizer.state)
+                    return float(loss)
+                except RuntimeError as exc:
+                    if not self._is_compile_limit(exc):
+                        raise
+                    # Metal kernel fusion exceeded the argument-buffer limit; the
+                    # failed eval committed nothing (MLX is lazy/functional), so a
+                    # fresh eager step recomputes the update with no double-apply.
+                    self._use_compiled = False
+            loss = self._raw_step()
             mx.eval(self.module.parameters(), self.optimizer.state)
             return float(loss)
 
@@ -271,5 +306,9 @@ else:  # pragma: no cover - Apple-silicon only
             module, _loss, lr, weight_decay, grad_clip, seed
         )
         loss = step.run()
-        module.scatter_into(handles)
+        # Write the trained leaves back in the model's own backend so the
+        # inference / diagnostic forward path (which runs ``be.xp`` ops) sees
+        # backend-native arrays. ``model.be`` is MLX whenever this entry point is
+        # reached, so ``from_numpy`` re-homes each materialized leaf to ``mx``.
+        module.scatter_into(handles, convert=model.be.from_numpy)
         return loss

@@ -39,12 +39,7 @@ export { createMaterials, PALETTE, branchGhostColor } from "./scene/materials";
 export type { MaterialSet } from "./scene/materials";
 
 // Modes + camera.
-export {
-  CameraDirector,
-  createModeTabs,
-  CAMERA_PRESETS,
-  MODE_TABS,
-} from "./routes/modes";
+export { CameraDirector, CAMERA_PRESETS } from "./routes/modes";
 export type { CameraPreset } from "./routes/modes";
 
 // Professional 3D upgrade surface (environment, dressing, rig, FX, director).

@@ -1,0 +1,150 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ *  GPU-Center World Model — three.js Decision Studio
+ *  Author: Yash Sharma · https://www.linkedin.com/in/yashsharmaa/
+ *  License: Apache-2.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *  Tailwind v4 (CSS-first) + the shadcn/ui design-token system. The React 2D
+ *  overlay is styled entirely with these utilities; three.js owns the canvas
+ *  underneath. Light is the default; dark is opt-in via `data-theme="dark"` on
+ *  <html> (driven by src/theme.ts, the single source of truth shared with the
+ *  3D scene). The app's semantic palette (grounded / predicted / alt / blocked /
+ *  safe / lowconf) is exposed as first-class Tailwind colors so the legend and
+ *  status chips read straight from the same tokens.
+ */
+
+@import "tailwindcss";
+
+/* Dark variant follows the shared `data-theme="dark"` attribute, not the OS. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ── Light theme (professional operator-dashboard default) ─────────────────── */
+:root {
+  --background: #eef2f8;
+  --foreground: #1f2733;
+  --card: #ffffff;
+  --card-foreground: #1f2733;
+  --popover: #ffffff;
+  --popover-foreground: #1f2733;
+  --primary: #2f6fed;
+  --primary-foreground: #ffffff;
+  --secondary: rgba(15, 23, 42, 0.05);
+  --secondary-foreground: #1f2733;
+  --muted: #f3f6fb;
+  --muted-foreground: #5b6676;
+  --accent: rgba(47, 111, 237, 0.12);
+  --accent-foreground: #1f2733;
+  --destructive: #e5484d;
+  --destructive-foreground: #ffffff;
+  --border: rgba(15, 23, 42, 0.1);
+  --input: rgba(15, 23, 42, 0.12);
+  --ring: #2f6fed;
+  --radius: 0.75rem;
+
+  /* frosted overlay-panel background + elevation */
+  --panel: rgba(255, 255, 255, 0.82);
+  --panel-strong: rgba(255, 255, 255, 0.94);
+  --shadow: 0 6px 24px rgba(15, 23, 42, 0.1), 0 1px 2px rgba(15, 23, 42, 0.06);
+
+  /* app semantic palette (same tokens the legend + scene use) */
+  --grounded: #2f6fed;
+  --predicted: #8b5cf6;
+  --alt: #c2790a;
+  --blocked: #e5484d;
+  --safe: #1a9c63;
+  --lowconf: #8a93a6;
+  --safe-bg: rgba(26, 156, 99, 0.14);
+  --blocked-bg: rgba(229, 72, 77, 0.12);
+
+  color-scheme: light;
+}
+
+/* ── Dark theme (opt-in via the ☀/☾ toggle) ──────────────────────────────── */
+[data-theme="dark"] {
+  --background: #0a0e16;
+  --foreground: #e8eef7;
+  --card: #111723;
+  --card-foreground: #e8eef7;
+  --popover: #0e1420;
+  --popover-foreground: #e8eef7;
+  --primary: #58c4ff;
+  --primary-foreground: #06121f;
+  --secondary: rgba(120, 150, 200, 0.14);
+  --secondary-foreground: #e8eef7;
+  --muted: rgba(20, 28, 42, 0.6);
+  --muted-foreground: #9fb0c8;
+  --accent: rgba(88, 196, 255, 0.18);
+  --accent-foreground: #e8eef7;
+  --destructive: #ff6b7a;
+  --destructive-foreground: #06121f;
+  --border: rgba(120, 150, 200, 0.22);
+  --input: rgba(120, 150, 200, 0.25);
+  --ring: #58c4ff;
+
+  --panel: rgba(17, 23, 35, 0.86);
+  --panel-strong: rgba(10, 14, 22, 0.82);
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+
+  --grounded: #58c4ff;
+  --predicted: #c9a4ff;
+  --alt: #ffcf6b;
+  --blocked: #ff6b7a;
+  --safe: #5fe3a1;
+  --lowconf: #8a93a6;
+  --safe-bg: rgba(95, 227, 161, 0.18);
+  --blocked-bg: rgba(255, 107, 122, 0.18);
+
+  color-scheme: dark;
+}
+
+/* ── Map the tokens into Tailwind's color/radius scales ───────────────────── */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-panel: var(--panel);
+  --color-grounded: var(--grounded);
+  --color-predicted: var(--predicted);
+  --color-alt: var(--alt);
+  --color-blocked: var(--blocked);
+  --color-safe: var(--safe);
+  --color-lowconf: var(--lowconf);
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+}
+
+/* Reusable frosted overlay-panel surface (one place so every panel matches). */
+@utility panel-surface {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  color: var(--foreground);
+}

@@ -37,6 +37,7 @@ from gpu_center_world_model.model.architecture import (
     FeatureBuilder,
     RelationalWorldModel,
 )
+from gpu_center_world_model.model.backend import get_backend
 from gpu_center_world_model.model.heads import ForecastHeads, latent_dims_of
 from gpu_center_world_model.model.jepa import (
     LOSS_GROUPS,
@@ -294,9 +295,14 @@ def test_smoke_train_runs_and_reports_real_diagnostics():
     """A real ``smoke_train`` runs all stages and returns D1–D5 diagnostics (doc E).
 
     The healthy run must finish with a finite loss, a diagnostic per cadence step,
-    and — for the well-conditioned default model — no collapse alarm.
+    and — for the well-conditioned default model — no collapse alarm. This case
+    pins the always-on NumPy SPSA reference path (HARD RULE 3), so it requests the
+    NumPy backend explicitly even when MLX is available (the MLX autodiff path has
+    its own end-to-end smoke coverage in ``test_model_predictor_rollout``).
     """
-    report = smoke_train(n_windows=8, cfg=TrainConfig(seed=0))
+    report = smoke_train(
+        n_windows=8, cfg=TrainConfig(seed=0), backend=get_backend("numpy")
+    )
     assert isinstance(report, TrainReport)
     assert report.backend == "numpy"
     assert report.steps > 0

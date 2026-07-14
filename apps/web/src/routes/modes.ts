@@ -20,8 +20,7 @@
 //  only, no free-fly that would interrupt the causal story — doc G).
 
 import { PerspectiveCamera, Vector3 } from "three";
-import type { Store, StudioMode } from "../state/store";
-import { el } from "../panels/dom";
+import type { StudioMode } from "../state/store";
 
 export interface CameraPreset {
   name: string;
@@ -52,43 +51,6 @@ export const CAMERA_PRESETS: Record<StudioMode, CameraPreset> = {
     target: new Vector3(-2, 2, 0),
   },
 };
-
-export const MODE_TABS: Array<{ id: StudioMode; label: string }> = [
-  { id: "decision-studio", label: "Decision Studio" },
-  { id: "counterfactual-compare", label: "Counterfactual Compare" },
-  { id: "replay-calibration", label: "Replay & Calibration" },
-  { id: "inspect-drawer", label: "Inspect" },
-];
-
-/** Build the mode-tab strip (top-center). */
-export function createModeTabs(parent: HTMLElement, store: Store): {
-  root: HTMLElement;
-  update(mode: StudioMode): void;
-} {
-  const root = el("div", "panel mode-tabs");
-  const buttons = new Map<StudioMode, HTMLButtonElement>();
-  for (const tab of MODE_TABS) {
-    const b = el("button", "mode-tab", tab.label) as HTMLButtonElement;
-    b.addEventListener("click", () => {
-      store.setMode(tab.id);
-      if (tab.id === "replay-calibration") {
-        // auto-load the first replay scenario on entry.
-        void store.loadReplay("golden-path-admit-a");
-      } else if (tab.id === "counterfactual-compare") {
-        if (!store.get().compare) void store.runCompare();
-      }
-    });
-    buttons.set(tab.id, b);
-    root.appendChild(b);
-  }
-  parent.appendChild(root);
-  return {
-    root,
-    update(mode: StudioMode) {
-      for (const [id, b] of buttons) b.classList.toggle("active", id === mode);
-    },
-  };
-}
 
 /**
  * Smoothly drive the camera toward the active mode's preset. Camera motion is

@@ -389,6 +389,308 @@ export type StreamEvent =
   | { type: "backend_health"; healthy: boolean; detail: string };
 
 // ──────────────────────────────────────────────────────────────────────────
+// Live-backend normalization (anti-corruption boundary)
+// ──────────────────────────────────────────────────────────────────────────
+//  The live FastAPI backend emits a slightly different wire shape than the
+//  canonical DTOs above: the planner serialises uncertainty as
+//  `{epistemic, ood, bands:{ch:{p05,p50,p95}}, hazards:{ch:{p,conformal_upper}}}`
+//  (dicts, not the `{epistemic_score, ood_score, quantiles[], hazards[]}` the
+//  panels read), the rollout points carry list-of-row sub-states
+//  (`rack_state`/`workload_state`/`queue_state`), per-candidate abstain is
+//  derived from the planner risk gate, and `credit` is not on the wire. These
+//  adapters map the live payloads into the canonical DTOs so the SAME panel +
+//  scene code runs on live data and on the deterministic mock. They are
+//  idempotent: a canonical payload (e.g. the mock) passes through unchanged.
+
+const LIVE_CREDIT =
+  "GPU-Center World Model · Built by Yash Sharma — linkedin.com/in/yashsharmaa";
+
+const asRecord = (v: unknown): Record<string, unknown> =>
+  v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+const num = (v: unknown, d = 0): number =>
+  typeof v === "number" && Number.isFinite(v) ? v : d;
+const str = (v: unknown, d = ""): string => (typeof v === "string" ? v : d);
+const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+const strArr = (v: unknown): string[] =>
+  arr(v).filter((x): x is string => typeof x === "string");
+const numRecord = (v: unknown): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const [k, val] of Object.entries(asRecord(v))) {
+    if (typeof val === "number" && Number.isFinite(val)) out[k] = val;
+  }
+  return out;
+};
+
+// kind -> (entities array key, id field) so we can de-index the live edge lists.
+const ENTITY_KEY: Record<string, string> = {
+  rack: "racks",
+  node: "nodes",
+  gpu: "gpus",
+  workload: "workloads",
+  queue: "queues",
+  topology_domain: "topology_domains",
+};
+const ID_FIELD: Record<string, string> = {
+  rack: "rack_id",
+  node: "node_uid",
+  gpu: "gpu_uuid",
+  workload: "workload_uid",
+  queue: "name",
+  topology_domain: "domain_id",
+};
+
+function idsForKind(entities: Record<string, unknown>, kind: string): string[] {
+  const key = ENTITY_KEY[kind];
+  if (!key) return [];
+  const idf = ID_FIELD[kind] ?? "id";
+  return arr(entities[key]).map((e) => str(asRecord(e)[idf]));
+}
+
+function normalizeRelations(raw: unknown, entities: Record<string, unknown>): RelationDTO[] {
+  return arr(raw).map((rel) => {
+    const r = asRecord(rel);
+    const type = str(r.type);
+    const src_kind = str(r.src_kind);
+    const dst_kind = str(r.dst_kind);
+    // canonical (mock) already carries id-paired `pairs`; pass it through.
+    if (Array.isArray(r.pairs)) {
+      return { type, src_kind, dst_kind, pairs: r.pairs as Array<[string, string]> };
+    }
+    // live: `edges` are [srcIndex, dstIndex] into the entity arrays — de-index.
+    const srcIds = idsForKind(entities, src_kind);
+    const dstIds = idsForKind(entities, dst_kind);
+    const pairs: Array<[string, string]> = [];
+    for (const e of arr(r.edges)) {
+      const pair = arr(e);
+      const sid = srcIds[num(pair[0], -1)];
+      const did = dstIds[num(pair[1], -1)];
+      if (sid != null && did != null) pairs.push([sid, did]);
+    }
+    return { type, src_kind, dst_kind, pairs };
+  });
+}
+
+function normalizeSnapshot(raw: unknown): StateSnapshotDTO {
+  const r = asRecord(raw);
+  const entities = asRecord(r.entities);
+  return {
+    ...(r as unknown as StateSnapshotDTO),
+    relations: normalizeRelations(r.relations, entities),
+    credit: str(r.credit) || LIVE_CREDIT,
+  };
+}
+
+function normalizeQuantiles(u: Record<string, unknown>, horizonS: number): QuantileForecastDTO[] {
+  if (Array.isArray(u.quantiles)) return u.quantiles as QuantileForecastDTO[];
+  const bands = asRecord(u.bands);
+  return Object.entries(bands).map(([channel, b]) => {
+    const bb = asRecord(b);
+    return {
+      channel: channel as KPIChannel,
+      horizon_s: horizonS,
+      quantiles: { "0.05": num(bb.p05), "0.5": num(bb.p50), "0.95": num(bb.p95) },
+    };
+  });
+}
+
+function normalizeHazards(u: Record<string, unknown>, horizonS: number): HazardForecastDTO[] {
+  if (Array.isArray(u.hazards)) return u.hazards as HazardForecastDTO[];
+  const h = asRecord(u.hazards);
+  return Object.entries(h).map(([channel, v]) => {
+    const hv = asRecord(v);
+    return {
+      channel: channel as HazardChannel,
+      horizon_s: horizonS,
+      probability: num(hv.probability ?? hv.p),
+      conformal_upper: num(hv.conformal_upper ?? hv.p),
+    };
+  });
+}
+
+function normalizeUncertainty(
+  rawC: Record<string, unknown>,
+  horizonS: number,
+  resultAbstainReason: string | null,
+): CandidateResultDTO["uncertainty"] {
+  const u = asRecord(rawC.uncertainty);
+  let abstain: boolean;
+  let abstain_reason: string | null;
+  if (typeof u.abstain === "boolean") {
+    abstain = u.abstain;
+    abstain_reason = typeof u.abstain_reason === "string" ? u.abstain_reason : null;
+  } else {
+    // live: a safe candidate that fails the planner risk gate is abstained.
+    abstain = rawC.safe === true && rawC.passes_risk_gate === false;
+    abstain_reason = abstain
+      ? (resultAbstainReason ?? "exceeds the uncertainty / risk gate")
+      : null;
+  }
+  return {
+    epistemic_score: num(u.epistemic_score ?? u.epistemic),
+    ood_score: num(u.ood_score ?? u.ood),
+    abstain,
+    abstain_reason,
+    quantiles: normalizeQuantiles(u, horizonS),
+    hazards: normalizeHazards(u, horizonS),
+  };
+}
+
+function normalizeAnnot(v: unknown): SceneAnnotations {
+  const a = asRecord(v);
+  return {
+    recommended_domain_ids: strArr(a.recommended_domain_ids),
+    blocked_domain_ids: strArr(a.blocked_domain_ids),
+    highlight_workload_ids: strArr(a.highlight_workload_ids),
+  };
+}
+
+function normalizeRolloutPoint(p: unknown, annot: SceneAnnotations): RolloutPoint {
+  const r = asRecord(p);
+  // canonical (mock) already keys rack_occupancy by id -> number.
+  if (r.rack_occupancy && !Array.isArray(r.rack_occupancy)) return r as unknown as RolloutPoint;
+  const rack_occupancy: Record<string, number> = {};
+  const rack_hotspot: Record<string, number> = {};
+  for (const row of arr(r.rack_state)) {
+    const rr = asRecord(row);
+    const id = str(rr.rack_id);
+    if (id) {
+      rack_occupancy[id] = num(rr.occupancy);
+      rack_hotspot[id] = num(rr.hotspot_score);
+    }
+  }
+  const workload_placement: Record<string, string> = {};
+  const dom = annot.recommended_domain_ids[0];
+  if (dom) {
+    for (const row of arr(r.workload_state)) {
+      const id = str(asRecord(row).workload_uid);
+      if (id) workload_placement[id] = dom;
+    }
+  }
+  const queue_depth = Array.isArray(r.queue_state)
+    ? r.queue_state.length
+    : num(r.queue_depth);
+  const u = asRecord(r.uncertainty);
+  return {
+    t_s: num(r.t_s),
+    rack_occupancy,
+    rack_hotspot,
+    workload_placement,
+    queue_depth,
+    events: arr(r.events) as RolloutEvent[],
+    uncertainty: { epistemic: num(u.epistemic), ood: num(u.ood) },
+  };
+}
+
+function normalizeRollout(ro: unknown): RolloutDTO | null {
+  if (!ro || typeof ro !== "object") return null;
+  const r = asRecord(ro);
+  const annot = normalizeAnnot(r.scene_annotations);
+  return {
+    branch_id: str(r.branch_id),
+    action_label: str(r.action_label),
+    timestep_s: num(r.timestep_s, 60),
+    points: arr(r.points).map((p) => normalizeRolloutPoint(p, annot)),
+    scene_annotations: annot,
+  };
+}
+
+function normalizeCandidate(
+  raw: unknown,
+  horizonS: number,
+  resultAbstainReason: string | null,
+): CandidateResultDTO {
+  const c = asRecord(raw);
+  return {
+    action_id: str(c.action_id),
+    safe: c.safe === true,
+    exact_blockers: strArr(c.exact_blockers),
+    rank: typeof c.rank === "number" ? c.rank : null,
+    delta_kpis: numRecord(c.delta_kpis) as Partial<Record<KPIChannel, number>>,
+    uncertainty: normalizeUncertainty(c, horizonS, resultAbstainReason),
+    rollout: normalizeRollout(c.rollout),
+  };
+}
+
+function normalizeCompare(raw: unknown, req: CompareRequest): CompareResultDTO {
+  const r = asRecord(raw);
+  const horizonS = num(r.horizon_s, req.horizon_s);
+  const abstainReason = typeof r.abstain_reason === "string" ? r.abstain_reason : null;
+  return {
+    state_hash: str(r.state_hash) || req.state_hash,
+    horizon_s: horizonS,
+    baseline_action_id: str(r.baseline_action_id),
+    recommended_action_id:
+      typeof r.recommended_action_id === "string" ? r.recommended_action_id : null,
+    abstain: r.abstain === true,
+    abstain_reason: abstainReason,
+    candidates: arr(r.candidates).map((c) =>
+      normalizeCandidate(c, horizonS, abstainReason),
+    ),
+    model_version: str(r.model_version),
+    policy_version: str(r.policy_version),
+    credit: str(r.credit) || LIVE_CREDIT,
+  };
+}
+
+function parseBlocker(b: unknown): BlockerDTO {
+  if (typeof b === "string") {
+    const i = b.indexOf(":");
+    const group = (i >= 0 ? b.slice(0, i) : "topology_rule").trim() as BlockerGroup;
+    const detail = (i >= 0 ? b.slice(i + 1) : b).trim();
+    return { group, detail, deficit: {} };
+  }
+  const o = asRecord(b);
+  return {
+    group: (str(o.group) || "topology_rule") as BlockerGroup,
+    detail: str(o.detail),
+    deficit: numRecord(o.deficit),
+  };
+}
+
+function normalizeWhyNot(raw: unknown, req: WhyNotRequest): WhyNotDTO {
+  const r = asRecord(raw);
+  const riskNotes = arr(r.risk_notes).map((n) =>
+    typeof n === "string" ? n : str(asRecord(n).note) || JSON.stringify(n),
+  );
+  return {
+    action_id: req.candidate_action.action_id,
+    safe: r.safe === true,
+    minimal_groups: strArr(r.minimal_groups) as BlockerGroup[],
+    exact_blockers: arr(r.exact_blockers).map(parseBlocker),
+    predicted_risks: strArr(r.predicted_risks),
+    rejected_domain_ids: strArr(r.rejected_domain_ids),
+    policy_reasons: r.policy_reasons ? strArr(r.policy_reasons) : riskNotes,
+    supporting_entities: strArr(r.supporting_entities),
+  };
+}
+
+function emptyRollout(): RolloutDTO {
+  return {
+    branch_id: "",
+    action_label: "",
+    timestep_s: 60,
+    points: [],
+    scene_annotations: {
+      recommended_domain_ids: [],
+      blocked_domain_ids: [],
+      highlight_workload_ids: [],
+    },
+  };
+}
+
+function normalizeReplay(raw: unknown): ReplayDTO {
+  const r = asRecord(raw);
+  return {
+    scenario_id: str(r.scenario_id),
+    title: str(r.title),
+    initial_state: normalizeSnapshot(r.initial_state),
+    predicted: normalizeRollout(r.predicted) ?? emptyRollout(),
+    realized: normalizeRollout(r.realized) ?? emptyRollout(),
+    decision_windows: arr(r.decision_windows) as DecisionWindowDTO[],
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Client implementation
 // ──────────────────────────────────────────────────────────────────────────
 export interface ClientOptions {
@@ -420,17 +722,27 @@ export class WorldModelClient {
 
   /** GET /api/v1/state/current — authoritative semantic snapshot for rendering. */
   async getCurrentState(): Promise<StateSnapshotDTO> {
-    return this.getOrMock("/state/current", () => buildMockSnapshot());
+    return this.getOrMock("/state/current", () => buildMockSnapshot(), normalizeSnapshot);
   }
 
   /** POST /api/v1/actions/compare — rank candidates + return branch rollouts. */
   async compareActions(req: CompareRequest): Promise<CompareResultDTO> {
-    return this.postOrMock("/actions/compare", req, () => buildMockCompare(req));
+    return this.postOrMock(
+      "/actions/compare",
+      req,
+      () => buildMockCompare(req),
+      (raw) => normalizeCompare(raw, req),
+    );
   }
 
   /** POST /api/v1/actions/why-not — exact blockers + predicted downside. */
   async whyNot(req: WhyNotRequest): Promise<WhyNotDTO> {
-    return this.postOrMock("/actions/why-not", req, () => buildMockWhyNot(req));
+    return this.postOrMock(
+      "/actions/why-not",
+      req,
+      () => buildMockWhyNot(req),
+      (raw) => normalizeWhyNot(raw, req),
+    );
   }
 
   /** GET /api/v1/replays — replay scenario catalog. */
@@ -443,6 +755,7 @@ export class WorldModelClient {
     return this.getOrMock(
       `/replays/${encodeURIComponent(scenarioId)}`,
       () => buildMockReplay(scenarioId),
+      normalizeReplay,
     );
   }
 
@@ -485,13 +798,20 @@ export class WorldModelClient {
   }
 
   // ── internals ───────────────────────────────────────────────────────────
-  private async getOrMock<T>(path: string, mock: () => T): Promise<T> {
+  // `normalize` maps the LIVE backend wire shape into the canonical DTO; the
+  // mock already returns the canonical shape, so it is never normalized.
+  private async getOrMock<T>(
+    path: string,
+    mock: () => T,
+    normalize?: (raw: unknown) => T,
+  ): Promise<T> {
     if (this.forceMock) return mock();
     try {
       const res = await this.fetchWithTimeout(`${this.baseUrl}${path}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       this.backendOnline = true;
-      return (await res.json()) as T;
+      const raw: unknown = await res.json();
+      return normalize ? normalize(raw) : (raw as T);
     } catch {
       this.backendOnline = false;
       return mock();
@@ -502,6 +822,7 @@ export class WorldModelClient {
     path: string,
     body: unknown,
     mock: () => T,
+    normalize?: (raw: unknown) => T,
   ): Promise<T> {
     if (this.forceMock) return mock();
     try {
@@ -512,7 +833,8 @@ export class WorldModelClient {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       this.backendOnline = true;
-      return (await res.json()) as T;
+      const raw: unknown = await res.json();
+      return normalize ? normalize(raw) : (raw as T);
     } catch {
       this.backendOnline = false;
       return mock();

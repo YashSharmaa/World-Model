@@ -20,6 +20,7 @@
 
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
+import reactHooks from "eslint-plugin-react-hooks";
 
 export default tseslint.config(
   // 0) global ignores — never lint generated / vendored trees.
@@ -33,9 +34,10 @@ export default tseslint.config(
   // 2) TypeScript recommended (non-type-checked: fast, no full program build).
   ...tseslint.configs.recommended,
 
-  // 3) project-specific rules for the app sources.
+  // 3) project-specific rules for the app sources (TS + the React overlay TSX).
   {
-    files: ["src/**/*.ts"],
+    files: ["src/**/*.{ts,tsx}"],
+    plugins: { "react-hooks": reactHooks },
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: "module",
@@ -82,6 +84,9 @@ export default tseslint.config(
       // must carry a comment; an entirely empty block is an error.
       "no-empty": ["error", { allowEmptyCatch: false }],
       "eqeqeq": ["error", "smart"],
+      // React hooks correctness for the .tsx overlay components.
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
     },
   },
 

@@ -11,7 +11,10 @@
 //  back to deterministic mock data (see src/api/client.ts), so `npm run dev`
 //  and `npm run build` work standalone.
 
+import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 /**
  * The backend serving layer (FastAPI, optional) defaults to localhost:8000.
@@ -22,6 +25,13 @@ const API_TARGET = process.env.VITE_API_TARGET ?? "http://127.0.0.1:8000";
 export default defineConfig({
   root: ".",
   base: "./",
+  // React owns the 2D overlay (shadcn/ui + Tailwind); three.js stays imperative
+  // on the canvas underneath. Tailwind v4 runs as a Vite plugin (CSS-first, no
+  // tailwind.config needed — automatic content detection).
+  plugins: [react(), tailwindcss()],
+  resolve: {
+    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
   build: {
     outDir: "dist",
     sourcemap: true,
